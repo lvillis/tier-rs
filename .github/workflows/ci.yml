@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Docs
+        run: cargo doc --workspace --no-deps --all-features --locked
+      - name: Publish Dry Run tier-derive
+        run: cargo publish --dry-run -p tier-derive --locked
+
+  feature-checks:
+    name: Check ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            command: cargo check --workspace --locked
+          - name: no-default-features
+            command: cargo check --workspace --no-default-features --locked
+          - name: all-features
+            command: cargo check --workspace --all-features --locked
+          - name: clap
+            command: cargo check --workspace --no-default-features --features clap --locked
+          - name: derive
+            command: cargo check --workspace --no-default-features --features derive --locked
+          - name: json
+            command: cargo check --workspace --no-default-features --features json --locked
+          - name: schema
+            command: cargo check --workspace --no-default-features --features schema --locked
+          - name: watch
+            command: cargo check --workspace --no-default-features --features watch --locked
+          - name: yaml
+            command: cargo check --workspace --no-default-features --features yaml --locked
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run check
+        run: ${{ matrix.command }}
+
+  feature-tests:
+    name: Test ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            command: cargo test --workspace --locked
+          - name: no-default-features
+            command: cargo test --workspace --no-default-features --locked
+          - name: all-features
+            command: cargo test --workspace --all-features --locked
+          - name: clap
+            command: cargo test --workspace --no-default-features --features clap --locked
+          - name: derive
+            command: cargo test --workspace --no-default-features --features derive --locked
+          - name: schema
+            command: cargo test --workspace --no-default-features --features schema --locked
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: ${{ matrix.command }}

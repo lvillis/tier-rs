@@ -1,0 +1,1016 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::{self, Display, Formatter};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use crate::report::normalize_path;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Structured metadata describing configuration fields.
+///
+/// `ConfigMetadata` is the manual metadata API behind `tier`'s higher-level
+/// derive support. It can describe:
+///
+/// - field-level behavior such as env names, aliases, secret paths, examples,
+///   merge policies, and declared validation rules
+/// - cross-field validation checks such as mutually exclusive or required-if
+///   relationships
+///
+/// # Examples
+///
+/// ```
+/// use tier::{ConfigMetadata, FieldMetadata};
+///
+/// let metadata = ConfigMetadata::from_fields([
+///     FieldMetadata::new("db.url").env("DATABASE_URL"),
+///     FieldMetadata::new("db.password").secret(),
+/// ])
+/// .required_with("tls.enabled", ["tls.cert", "tls.key"]);
+///
+/// assert_eq!(
+///     metadata.env_overrides().get("DATABASE_URL").map(String::as_str),
+///     Some("db.url")
+/// );
+/// assert_eq!(metadata.secret_paths(), vec!["db.password".to_owned()]);
+/// assert_eq!(metadata.checks().len(), 1);
+/// ```
+pub struct ConfigMetadata {
+    fields: Vec<FieldMetadata>,
+    checks: Vec<ValidationCheck>,
+}
+
+impl ConfigMetadata {
+    /// Creates an empty metadata set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates metadata from a list of field entries.
+    #[must_use]
+    pub fn from_fields<I>(fields: I) -> Self
+    where
+        I: IntoIterator<Item = FieldMetadata>,
+    {
+        let mut metadata = Self::default();
+        metadata.extend_fields(fields);
+        metadata
+    }
+
+    /// Returns all merged field metadata entries.
+    #[must_use]
+    pub fn fields(&self) -> &[FieldMetadata] {
+        &self.fields
+    }
+
+    /// Returns all normalized cross-field validation checks.
+    #[must_use]
+    pub fn checks(&self) -> &[ValidationCheck] {
+        &self.checks
+    }
+
+    /// Returns the metadata entry for a normalized configuration path.
+    #[must_use]
+    pub fn field(&self, path: &str) -> Option<&FieldMetadata> {
+        let normalized = normalize_path(path);
+        self.fields.iter().find(|field| field.path == normalized)
+    }
+
+    /// Returns metadata entries keyed by normalized path.
+    #[must_use]
+    pub fn fields_by_path(&self) -> BTreeMap<String, FieldMetadata> {
+        self.fields
+            .iter()
+            .cloned()
+            .map(|field| (field.path.clone(), field))
+            .collect()
+    }
+
+    /// Adds a field metadata entry and merges duplicates by path.
+    pub fn push(&mut self, field: FieldMetadata) {
+        self.fields.push(field);
+        self.normalize();
+    }
+
+    /// Extends the metadata with additional field entries.
+    pub fn extend_fields<I>(&mut self, fields: I)
+    where
+        I: IntoIterator<Item = FieldMetadata>,
+    {
+        self.fields.extend(fields);
+        self.normalize();
+    }
+
+    /// Extends the metadata with another metadata set.
+    pub fn extend(&mut self, other: Self) {
+        self.fields.extend(other.fields);
+        self.checks.extend(other.checks);
+        self.normalize();
+    }
+
+    /// Adds a cross-field validation check.
+    pub fn push_check(&mut self, check: ValidationCheck) {
+        self.checks.push(check);
+        self.normalize();
+    }
+
+    /// Extends the metadata with additional cross-field validation checks.
+    pub fn extend_checks<I>(&mut self, checks: I)
+    where
+        I: IntoIterator<Item = ValidationCheck>,
+    {
+        self.checks.extend(checks);
+        self.normalize();
+    }
+
+    /// Adds a cross-field validation check in builder style.
+    #[must_use]
+    pub fn check(mut self, check: ValidationCheck) -> Self {
+        self.push_check(check);
+        self
+    }
+
+    /// Requires that at least one of the given paths is configured.
+    #[must_use]
+    pub fn at_least_one_of<I, S>(self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.check(ValidationCheck::AtLeastOneOf {
+            paths: paths.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    /// Requires that exactly one of the given paths is configured.
+    #[must_use]
+    pub fn exactly_one_of<I, S>(self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.check(ValidationCheck::ExactlyOneOf {
+            paths: paths.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    /// Requires that at most one of the given paths is configured.
+    #[must_use]
+    pub fn mutually_exclusive<I, S>(self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.check(ValidationCheck::MutuallyExclusive {
+            paths: paths.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    /// Requires one or more paths whenever `path` is configured.
+    #[must_use]
+    pub fn required_with<I, S>(self, path: impl Into<String>, requires: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.check(ValidationCheck::RequiredWith {
+            path: path.into(),
+            requires: requires.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    /// Requires one or more paths whenever `path` equals `equals`.
+    #[must_use]
+    pub fn required_if<I, S, V>(self, path: impl Into<String>, equals: V, requires: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        V: Into<ValidationValue>,
+    {
+        self.check(ValidationCheck::RequiredIf {
+            path: path.into(),
+            equals: equals.into(),
+            requires: requires.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    /// Returns all normalized secret paths.
+    #[must_use]
+    pub fn secret_paths(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|field| field.secret)
+            .map(|field| field.path.clone())
+            .collect()
+    }
+
+    /// Returns explicit environment variable name overrides keyed by env name.
+    #[must_use]
+    pub fn env_overrides(&self) -> BTreeMap<String, String> {
+        self.fields
+            .iter()
+            .filter_map(|field| {
+                field
+                    .env
+                    .as_ref()
+                    .map(|env| (env.clone(), field.path.clone()))
+            })
+            .collect()
+    }
+
+    /// Returns explicit path aliases keyed by alias path.
+    #[must_use]
+    pub fn alias_overrides(&self) -> BTreeMap<String, String> {
+        let mut aliases = BTreeMap::new();
+        for field in &self.fields {
+            for alias in &field.aliases {
+                aliases.insert(alias.clone(), field.path.clone());
+            }
+        }
+        aliases
+    }
+
+    /// Returns field merge strategies keyed by normalized path.
+    #[must_use]
+    pub fn merge_strategies(&self) -> BTreeMap<String, MergeStrategy> {
+        self.fields
+            .iter()
+            .map(|field| (field.path.clone(), field.merge))
+            .collect()
+    }
+
+    fn normalize(&mut self) {
+        let mut merged = BTreeMap::<String, FieldMetadata>::new();
+        for mut field in self.fields.drain(..) {
+            field.path = normalize_path(&field.path);
+            field.aliases = field
+                .aliases
+                .into_iter()
+                .map(|alias| normalize_path(&alias))
+                .filter(|alias| !alias.is_empty() && alias != &field.path)
+                .collect();
+            field.aliases.sort();
+            field.aliases.dedup();
+            match merged.get_mut(&field.path) {
+                Some(existing) => existing.merge_from(field),
+                None => {
+                    merged.insert(field.path.clone(), field);
+                }
+            }
+        }
+        self.fields = merged.into_values().collect();
+        self.checks = normalize_checks(self.checks.drain(..));
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Metadata for a single configuration path.
+pub struct FieldMetadata {
+    /// Dot-delimited configuration path.
+    pub path: String,
+    /// Alternate dot-delimited paths accepted by serde during deserialization.
+    pub aliases: Vec<String>,
+    /// Whether values at this path should be treated as sensitive.
+    pub secret: bool,
+    /// Exact environment variable name to map to this path.
+    pub env: Option<String>,
+    /// Human-readable field documentation.
+    pub doc: Option<String>,
+    /// Example value rendered in generated docs.
+    pub example: Option<String>,
+    /// Deprecation note shown in generated docs and runtime warnings.
+    pub deprecated: Option<String>,
+    /// Whether the field accepts omission via `serde(default)`.
+    pub has_default: bool,
+    /// Strategy used when merging layered values into this field.
+    pub merge: MergeStrategy,
+    /// Declarative validation rules applied after normalization.
+    pub validations: Vec<ValidationRule>,
+}
+
+impl FieldMetadata {
+    /// Creates metadata for a single configuration path.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: normalize_path(&path.into()),
+            aliases: Vec::new(),
+            secret: false,
+            env: None,
+            doc: None,
+            example: None,
+            deprecated: None,
+            has_default: false,
+            merge: MergeStrategy::Merge,
+            validations: Vec::new(),
+        }
+    }
+
+    /// Adds an alternate serde path for this field.
+    #[must_use]
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.aliases.push(alias.into());
+        self
+    }
+
+    /// Marks this path as sensitive.
+    #[must_use]
+    pub fn secret(mut self) -> Self {
+        self.secret = true;
+        self
+    }
+
+    /// Overrides the environment variable name for this path.
+    #[must_use]
+    pub fn env(mut self, env: impl Into<String>) -> Self {
+        self.env = Some(env.into());
+        self
+    }
+
+    /// Adds human-readable field documentation.
+    #[must_use]
+    pub fn doc(mut self, doc: impl Into<String>) -> Self {
+        self.doc = Some(doc.into());
+        self
+    }
+
+    /// Adds an example value used by generated docs.
+    #[must_use]
+    pub fn example(mut self, example: impl Into<String>) -> Self {
+        self.example = Some(example.into());
+        self
+    }
+
+    /// Marks the field as deprecated with an optional note.
+    #[must_use]
+    pub fn deprecated(mut self, note: impl Into<String>) -> Self {
+        self.deprecated = Some(note.into());
+        self
+    }
+
+    /// Marks the field as accepting omission via `serde(default)`.
+    #[must_use]
+    pub fn defaulted(mut self) -> Self {
+        self.has_default = true;
+        self
+    }
+
+    /// Sets the field-level merge strategy.
+    #[must_use]
+    pub fn merge_strategy(mut self, merge: MergeStrategy) -> Self {
+        self.merge = merge;
+        self
+    }
+
+    /// Appends a declarative validation rule.
+    #[must_use]
+    pub fn validate(mut self, rule: ValidationRule) -> Self {
+        self.validations.push(rule);
+        self
+    }
+
+    /// Requires the field to be non-empty.
+    #[must_use]
+    pub fn non_empty(self) -> Self {
+        self.validate(ValidationRule::NonEmpty)
+    }
+
+    /// Requires the field to be greater than or equal to `min`.
+    #[must_use]
+    pub fn min(self, min: impl Into<ValidationNumber>) -> Self {
+        self.validate(ValidationRule::Min(min.into()))
+    }
+
+    /// Requires the field to be less than or equal to `max`.
+    #[must_use]
+    pub fn max(self, max: impl Into<ValidationNumber>) -> Self {
+        self.validate(ValidationRule::Max(max.into()))
+    }
+
+    /// Requires the field length to be greater than or equal to `min`.
+    #[must_use]
+    pub fn min_length(self, min: usize) -> Self {
+        self.validate(ValidationRule::MinLength(min))
+    }
+
+    /// Requires the field length to be less than or equal to `max`.
+    #[must_use]
+    pub fn max_length(self, max: usize) -> Self {
+        self.validate(ValidationRule::MaxLength(max))
+    }
+
+    /// Requires the field to match one of the provided scalar values.
+    #[must_use]
+    pub fn one_of<I, V>(self, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<ValidationValue>,
+    {
+        self.validate(ValidationRule::OneOf(
+            values.into_iter().map(Into::into).collect(),
+        ))
+    }
+
+    /// Requires the field to be a valid hostname.
+    #[must_use]
+    pub fn hostname(self) -> Self {
+        self.validate(ValidationRule::Hostname)
+    }
+
+    /// Requires the field to be a valid IP address.
+    #[must_use]
+    pub fn ip_addr(self) -> Self {
+        self.validate(ValidationRule::IpAddr)
+    }
+
+    /// Requires the field to be a valid socket address.
+    #[must_use]
+    pub fn socket_addr(self) -> Self {
+        self.validate(ValidationRule::SocketAddr)
+    }
+
+    /// Requires the field to be an absolute filesystem path.
+    #[must_use]
+    pub fn absolute_path(self) -> Self {
+        self.validate(ValidationRule::AbsolutePath)
+    }
+
+    fn merge_from(&mut self, other: Self) {
+        self.aliases.extend(other.aliases);
+        self.aliases.sort();
+        self.aliases.dedup();
+        self.secret |= other.secret;
+        if let Some(env) = other.env {
+            self.env = Some(env);
+        }
+        if let Some(doc) = other.doc {
+            self.doc = Some(doc);
+        }
+        if let Some(example) = other.example {
+            self.example = Some(example);
+        }
+        if let Some(deprecated) = other.deprecated {
+            self.deprecated = Some(deprecated);
+        }
+        self.has_default |= other.has_default;
+        self.merge = other.merge;
+        for rule in other.validations {
+            if !self.validations.contains(&rule) {
+                self.validations.push(rule);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Strategy applied when multiple layers write to the same configuration path.
+pub enum MergeStrategy {
+    /// Recursively merge objects and replace non-object values.
+    #[default]
+    Merge,
+    /// Replace the current value at this path with the overlay value.
+    Replace,
+    /// Append array overlays while still recursively merging nested objects.
+    Append,
+}
+
+impl Display for MergeStrategy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Merge => write!(f, "merge"),
+            Self::Replace => write!(f, "replace"),
+            Self::Append => write!(f, "append"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+/// Numeric bound used by declarative validation rules.
+pub struct ValidationNumber(pub serde_json::Number);
+
+impl ValidationNumber {
+    /// Returns the numeric value as `f64`, when representable.
+    #[must_use]
+    pub fn as_f64(&self) -> Option<f64> {
+        self.0.as_f64()
+    }
+}
+
+impl Display for ValidationNumber {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl From<i8> for ValidationNumber {
+    fn from(value: i8) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<i16> for ValidationNumber {
+    fn from(value: i16) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<i32> for ValidationNumber {
+    fn from(value: i32) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<i64> for ValidationNumber {
+    fn from(value: i64) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<isize> for ValidationNumber {
+    fn from(value: isize) -> Self {
+        Self(serde_json::Number::from(value as i64))
+    }
+}
+
+impl From<u8> for ValidationNumber {
+    fn from(value: u8) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<u16> for ValidationNumber {
+    fn from(value: u16) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<u32> for ValidationNumber {
+    fn from(value: u32) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<u64> for ValidationNumber {
+    fn from(value: u64) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<usize> for ValidationNumber {
+    fn from(value: usize) -> Self {
+        Self(serde_json::Number::from(value as u64))
+    }
+}
+
+impl From<f32> for ValidationNumber {
+    fn from(value: f32) -> Self {
+        Self(serde_json::Number::from_f64(value as f64).expect("validation numbers must be finite"))
+    }
+}
+
+impl From<f64> for ValidationNumber {
+    fn from(value: f64) -> Self {
+        Self(serde_json::Number::from_f64(value).expect("validation numbers must be finite"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+/// Scalar value used by declarative validation rules and conditions.
+pub struct ValidationValue(pub serde_json::Value);
+
+impl Display for ValidationValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            serde_json::Value::String(value) => write!(f, "{value:?}"),
+            value => Display::fmt(value, f),
+        }
+    }
+}
+
+impl From<bool> for ValidationValue {
+    fn from(value: bool) -> Self {
+        Self(serde_json::Value::Bool(value))
+    }
+}
+
+impl From<String> for ValidationValue {
+    fn from(value: String) -> Self {
+        Self(serde_json::Value::String(value))
+    }
+}
+
+impl From<&str> for ValidationValue {
+    fn from(value: &str) -> Self {
+        Self(serde_json::Value::String(value.to_owned()))
+    }
+}
+
+macro_rules! impl_validation_value_from_number {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl From<$ty> for ValidationValue {
+                fn from(value: $ty) -> Self {
+                    Self(serde_json::to_value(value).expect("validation values must serialize"))
+                }
+            }
+        )*
+    };
+}
+
+impl_validation_value_from_number!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Declarative validation rule applied to a single configuration path.
+pub enum ValidationRule {
+    /// The field must not be empty.
+    NonEmpty,
+    /// The field must be greater than or equal to the given numeric bound.
+    Min(ValidationNumber),
+    /// The field must be less than or equal to the given numeric bound.
+    Max(ValidationNumber),
+    /// The field length must be at least the given number of units.
+    MinLength(usize),
+    /// The field length must be at most the given number of units.
+    MaxLength(usize),
+    /// The field must equal one of the provided scalar values.
+    OneOf(Vec<ValidationValue>),
+    /// The field must be a valid hostname.
+    Hostname,
+    /// The field must be a valid IP address.
+    IpAddr,
+    /// The field must be a valid socket address.
+    SocketAddr,
+    /// The field must be an absolute filesystem path.
+    AbsolutePath,
+}
+
+impl ValidationRule {
+    /// Returns a stable machine-readable rule identifier.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NonEmpty => "non_empty",
+            Self::Min(_) => "min",
+            Self::Max(_) => "max",
+            Self::MinLength(_) => "min_length",
+            Self::MaxLength(_) => "max_length",
+            Self::OneOf(_) => "one_of",
+            Self::Hostname => "hostname",
+            Self::IpAddr => "ip_addr",
+            Self::SocketAddr => "socket_addr",
+            Self::AbsolutePath => "absolute_path",
+        }
+    }
+}
+
+impl Display for ValidationRule {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonEmpty => write!(f, "non_empty"),
+            Self::Min(value) => write!(f, "min={value}"),
+            Self::Max(value) => write!(f, "max={value}"),
+            Self::MinLength(value) => write!(f, "min_length={value}"),
+            Self::MaxLength(value) => write!(f, "max_length={value}"),
+            Self::OneOf(values) => write!(
+                f,
+                "one_of=[{}]",
+                values
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Hostname => write!(f, "hostname"),
+            Self::IpAddr => write!(f, "ip_addr"),
+            Self::SocketAddr => write!(f, "socket_addr"),
+            Self::AbsolutePath => write!(f, "absolute_path"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Cross-field declarative validation applied to the final normalized configuration.
+pub enum ValidationCheck {
+    /// Requires that at least one of the given paths is configured.
+    AtLeastOneOf { paths: Vec<String> },
+    /// Requires that exactly one of the given paths is configured.
+    ExactlyOneOf { paths: Vec<String> },
+    /// Requires that no more than one of the given paths is configured.
+    MutuallyExclusive { paths: Vec<String> },
+    /// Requires one or more paths whenever `path` is configured.
+    RequiredWith { path: String, requires: Vec<String> },
+    /// Requires one or more paths whenever `path` equals `equals`.
+    RequiredIf {
+        /// Path whose value is inspected.
+        path: String,
+        /// Value that triggers the requirement.
+        equals: ValidationValue,
+        /// Paths that must be configured when the condition matches.
+        requires: Vec<String>,
+    },
+}
+
+impl ValidationCheck {
+    /// Returns a stable machine-readable rule identifier.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::AtLeastOneOf { .. } => "at_least_one_of",
+            Self::ExactlyOneOf { .. } => "exactly_one_of",
+            Self::MutuallyExclusive { .. } => "mutually_exclusive",
+            Self::RequiredWith { .. } => "required_with",
+            Self::RequiredIf { .. } => "required_if",
+        }
+    }
+
+    fn normalize(self) -> Option<Self> {
+        match self {
+            Self::AtLeastOneOf { paths } => {
+                normalize_path_group(paths).map(|paths| Self::AtLeastOneOf { paths })
+            }
+            Self::ExactlyOneOf { paths } => {
+                normalize_path_group(paths).map(|paths| Self::ExactlyOneOf { paths })
+            }
+            Self::MutuallyExclusive { paths } => {
+                normalize_path_group(paths).map(|paths| Self::MutuallyExclusive { paths })
+            }
+            Self::RequiredWith { path, requires } => {
+                let path = normalize_path(&path);
+                let requires = normalize_path_group(requires)?;
+                (!path.is_empty()).then_some(Self::RequiredWith { path, requires })
+            }
+            Self::RequiredIf {
+                path,
+                equals,
+                requires,
+            } => {
+                let path = normalize_path(&path);
+                let requires = normalize_path_group(requires)?;
+                (!path.is_empty()).then_some(Self::RequiredIf {
+                    path,
+                    equals,
+                    requires,
+                })
+            }
+        }
+    }
+
+    fn prefixed(self, prefix: &str) -> Option<Self> {
+        let prefix = normalize_path(prefix);
+        if prefix.is_empty() {
+            return self.normalize();
+        }
+
+        let join = |path: String| {
+            if path.is_empty() {
+                prefix.clone()
+            } else {
+                format!("{prefix}.{path}")
+            }
+        };
+
+        match self {
+            Self::AtLeastOneOf { paths } => Some(Self::AtLeastOneOf {
+                paths: paths.into_iter().map(join).collect(),
+            })
+            .and_then(Self::normalize),
+            Self::ExactlyOneOf { paths } => Some(Self::ExactlyOneOf {
+                paths: paths.into_iter().map(join).collect(),
+            })
+            .and_then(Self::normalize),
+            Self::MutuallyExclusive { paths } => Some(Self::MutuallyExclusive {
+                paths: paths.into_iter().map(join).collect(),
+            })
+            .and_then(Self::normalize),
+            Self::RequiredWith { path, requires } => Some(Self::RequiredWith {
+                path: join(path),
+                requires: requires.into_iter().map(join).collect(),
+            })
+            .and_then(Self::normalize),
+            Self::RequiredIf {
+                path,
+                equals,
+                requires,
+            } => Some(Self::RequiredIf {
+                path: join(path),
+                equals,
+                requires: requires.into_iter().map(join).collect(),
+            })
+            .and_then(Self::normalize),
+        }
+    }
+}
+
+impl Display for ValidationCheck {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AtLeastOneOf { paths } => {
+                write!(f, "at_least_one_of({})", paths.join(", "))
+            }
+            Self::ExactlyOneOf { paths } => {
+                write!(f, "exactly_one_of({})", paths.join(", "))
+            }
+            Self::MutuallyExclusive { paths } => {
+                write!(f, "mutually_exclusive({})", paths.join(", "))
+            }
+            Self::RequiredWith { path, requires } => {
+                write!(f, "required_with({path} -> {})", requires.join(", "))
+            }
+            Self::RequiredIf {
+                path,
+                equals,
+                requires,
+            } => write!(
+                f,
+                "required_if({path} == {equals} -> {})",
+                requires.join(", ")
+            ),
+        }
+    }
+}
+
+/// Metadata produced for a configuration type.
+pub trait TierMetadata {
+    /// Returns metadata for the configuration type.
+    #[must_use]
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::default()
+    }
+
+    /// Returns configuration paths that should be treated as secrets.
+    #[must_use]
+    fn secret_paths() -> Vec<String> {
+        Self::metadata().secret_paths()
+    }
+}
+
+impl<T> TierMetadata for super::Secret<T> {}
+impl TierMetadata for String {}
+impl TierMetadata for bool {}
+impl TierMetadata for char {}
+impl TierMetadata for u8 {}
+impl TierMetadata for u16 {}
+impl TierMetadata for u32 {}
+impl TierMetadata for u64 {}
+impl TierMetadata for u128 {}
+impl TierMetadata for usize {}
+impl TierMetadata for i8 {}
+impl TierMetadata for i16 {}
+impl TierMetadata for i32 {}
+impl TierMetadata for i64 {}
+impl TierMetadata for i128 {}
+impl TierMetadata for isize {}
+impl TierMetadata for f32 {}
+impl TierMetadata for f64 {}
+impl TierMetadata for Duration {}
+impl TierMetadata for SystemTime {}
+impl TierMetadata for PathBuf {}
+impl TierMetadata for IpAddr {}
+impl TierMetadata for Ipv4Addr {}
+impl TierMetadata for Ipv6Addr {}
+impl TierMetadata for SocketAddr {}
+impl TierMetadata for SocketAddrV4 {}
+impl TierMetadata for SocketAddrV6 {}
+
+impl<T> TierMetadata for Option<T>
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        T::metadata()
+    }
+}
+
+impl<T> TierMetadata for Vec<T> {}
+impl<T, const N: usize> TierMetadata for [T; N] {}
+impl<T> TierMetadata for BTreeSet<T> {}
+impl<T> TierMetadata for HashSet<T> {}
+impl<K, V> TierMetadata for BTreeMap<K, V> {}
+impl<K, V, S> TierMetadata for HashMap<K, V, S> {}
+
+impl<T> TierMetadata for Box<T>
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        T::metadata()
+    }
+}
+
+impl<T> TierMetadata for Arc<T>
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        T::metadata()
+    }
+}
+
+/// Prefixes child metadata paths with a parent field name.
+#[must_use]
+pub fn prefixed_metadata(
+    prefix: &str,
+    prefix_aliases: Vec<String>,
+    metadata: ConfigMetadata,
+) -> ConfigMetadata {
+    let prefix = normalize_path(prefix);
+    if prefix.is_empty() {
+        return metadata;
+    }
+
+    let mut prefixed = ConfigMetadata::from_fields(metadata.fields.into_iter().map(|field| {
+        let canonical_suffix = field.path.clone();
+        let alias_suffixes = if field.aliases.is_empty() {
+            vec![canonical_suffix.clone()]
+        } else {
+            let mut suffixes = vec![canonical_suffix.clone()];
+            suffixes.extend(field.aliases.iter().cloned());
+            suffixes
+        };
+
+        let path = if canonical_suffix.is_empty() {
+            prefix.clone()
+        } else {
+            format!("{prefix}.{}", canonical_suffix)
+        };
+
+        let mut aliases = field
+            .aliases
+            .into_iter()
+            .map(|alias| {
+                if alias.is_empty() {
+                    prefix.clone()
+                } else {
+                    format!("{prefix}.{}", alias)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for prefix_alias in &prefix_aliases {
+            if canonical_suffix.is_empty() {
+                aliases.push(prefix_alias.clone());
+                continue;
+            }
+            for suffix in &alias_suffixes {
+                aliases.push(format!("{prefix_alias}.{suffix}"));
+            }
+        }
+
+        FieldMetadata {
+            path,
+            aliases,
+            ..field
+        }
+    }));
+    prefixed.extend_checks(
+        metadata
+            .checks
+            .into_iter()
+            .filter_map(|check| check.prefixed(&prefix)),
+    );
+    prefixed
+}
+
+impl IntoIterator for ConfigMetadata {
+    type Item = FieldMetadata;
+    type IntoIter = std::vec::IntoIter<FieldMetadata>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.into_iter()
+    }
+}
+
+fn normalize_checks<I>(checks: I) -> Vec<ValidationCheck>
+where
+    I: IntoIterator<Item = ValidationCheck>,
+{
+    let mut normalized = Vec::new();
+    for check in checks {
+        let Some(check) = check.normalize() else {
+            continue;
+        };
+        if !normalized.contains(&check) {
+            normalized.push(check);
+        }
+    }
+    normalized
+}
+
+fn normalize_path_group<I>(paths: I) -> Option<Vec<String>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut normalized = Vec::new();
+    for path in paths {
+        let path = normalize_path(&path);
+        if path.is_empty() || normalized.contains(&path) {
+            continue;
+        }
+        normalized.push(path);
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}

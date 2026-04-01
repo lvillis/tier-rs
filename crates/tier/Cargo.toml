@@ -1,0 +1,67 @@
+[package]
+name = "tier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust configuration library for layered TOML, env, and CLI settings"
+license = "Apache-2.0"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tier"
+keywords = ["config", "layered", "serde", "toml", "env"]
+include = [
+  "/src/**",
+  "/benches/**",
+  "/examples/**",
+  "/tests/**",
+  "/README.md",
+  "/Cargo.toml",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["toml"]
+clap = ["dep:clap"]
+derive = ["dep:tier-derive"]
+json = []
+schema = ["dep:schemars"]
+toml = ["dep:toml"]
+watch = ["dep:notify"]
+yaml = ["dep:serde_yaml"]
+
+[dependencies]
+clap = { workspace = true, optional = true }
+notify = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_ignored = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+serde_yaml = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tier-derive = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "core"
+harness = false
+
+[[example]]
+name = "derive"
+required-features = ["derive"]
+
+[[example]]
+name = "schema"
+required-features = ["derive", "schema", "toml"]
+
+[[example]]
+name = "clap"
+required-features = ["clap"]

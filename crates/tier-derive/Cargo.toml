@@ -1,0 +1,29 @@
+[package]
+name = "tier-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Derive macros for tier Rust configuration metadata"
+license = "Apache-2.0"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tier-derive"
+keywords = ["config", "derive", "serde", "macro", "tier"]
+include = [
+    "/src/**",
+    "/README.md",
+    "/Cargo.toml",
+]
+
+[lib]
+proc-macro = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

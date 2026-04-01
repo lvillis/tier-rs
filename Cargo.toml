@@ -1,0 +1,50 @@
+[workspace]
+members = ["crates/tier", "crates/tier-derive"]
+default-members = ["crates/tier"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+repository = "https://github.com/lvillis/tier-rs"
+homepage = "https://github.com/lvillis/tier-rs"
+
+[workspace.dependencies]
+# CLI and watcher integrations.
+clap = { version = "4.6.0", default-features = false, features = ["derive", "std"] }
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
+
+# Proc-macro toolchain.
+proc-macro2 = { version = "1.0.106", default-features = false, features = ["proc-macro"] }
+quote = { version = "1.0.45", default-features = false, features = ["proc-macro"] }
+syn = { version = "2.0.117", default-features = false, features = ["clone-impls", "derive", "extra-traits", "full", "parsing", "printing", "proc-macro"] }
+
+# Serialization, schema, and config formats.
+schemars = { version = "1.2.1", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_ignored = { version = "0.1.14", default-features = false }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
+serde_path_to_error = { version = "0.1.20", default-features = false }
+serde_yaml = { version = "0.9.34", default-features = false }
+toml = { version = "1.1.1", default-features = false, features = ["parse", "serde", "std"] }
+
+# Error handling.
+thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
+
+# Workspace crates.
+tier-derive = { path = "crates/tier-derive", version = "=0.1.0", default-features = false }
+
+# Test and benchmark support.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+tempfile = { version = "3.27.0", default-features = false, features = ["getrandom"] }
+
+[workspace.metadata.release]
+allow-branch = ["main"]
+publish = false
+shared-version = true
+tag-prefix = ""
+tag-name = "{{prefix}}{{version}}"
+tag-message = "chore: release version {{version}}"
+pre-release-commit-message = "chore: release version {{version}}"
+pre-release-hook = ["git", "cliff", "--workdir", "../../", "--output", "../../CHANGELOG.md", "--tag", "{{version}}"]
