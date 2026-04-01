@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.1
@@ -63,7 +63,7 @@ jobs:
           - name: yaml
             command: cargo check --workspace --no-default-features --features yaml --locked
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.1
@@ -92,7 +92,7 @@ jobs:
           - name: schema
             command: cargo test --workspace --no-default-features --features schema --locked
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.1
