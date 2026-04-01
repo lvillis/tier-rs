@@ -12,6 +12,7 @@ By default, `tier` only enables TOML support. `derive`, `clap`, `schema`,
 
 - Loads config from defaults, files, env, and CLI in a predictable order
 - Deserializes directly into typed Rust structs
+- Treats env and `--set` inputs as strings first, with primitive coercion at deserialize time
 - Tracks where each value came from and surfaces validation and warning output
 - Optionally adds derive metadata, schema/docs export, and runtime reload
 

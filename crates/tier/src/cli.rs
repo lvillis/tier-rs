@@ -76,6 +76,10 @@ pub struct TierCli {
     pub profile: Option<String>,
 
     /// Inline configuration overrides in `key=value` form.
+    ///
+    /// Bare values stay string-like until deserialization, where primitive
+    /// target types can be coerced. Use explicit JSON arrays or objects for
+    /// structured values.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     pub set: Vec<String>,
 

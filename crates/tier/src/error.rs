@@ -328,10 +328,15 @@ pub enum ConfigError {
     },
 
     /// Deserializing the merged intermediate value into the target type failed.
-    #[error("failed to deserialize merged configuration at {path}: {message}")]
+    #[error(
+        "failed to deserialize merged configuration at {path}: {message}{source_suffix}",
+        source_suffix = deserialize_source_suffix(provenance)
+    )]
     Deserialize {
-        /// Dot-delimited configuration path reported by serde.
+        /// Configuration path reported by serde.
         path: String,
+        /// Most recent source that contributed the failing value, when known.
+        provenance: Option<SourceTrace>,
         /// Human-readable deserialization failure.
         message: String,
     },
@@ -399,4 +404,10 @@ fn format_unknown_fields(fields: &[UnknownField]) -> String {
         .map(|field| format!("- {field}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn deserialize_source_suffix(provenance: &Option<SourceTrace>) -> String {
+    provenance
+        .as_ref()
+        .map_or_else(String::new, |source| format!(" from {source}"))
 }

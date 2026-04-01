@@ -487,93 +487,125 @@ impl Display for MergeStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
+#[serde(untagged)]
 /// Numeric bound used by declarative validation rules.
-pub struct ValidationNumber(pub serde_json::Number);
+pub enum ValidationNumber {
+    /// A finite JSON-compatible number.
+    Finite(serde_json::Number),
+    /// An invalid non-finite value such as `NaN` or `inf`.
+    Invalid(String),
+}
 
 impl ValidationNumber {
     /// Returns the numeric value as `f64`, when representable.
     #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
-        self.0.as_f64()
+        match self {
+            Self::Finite(number) => number.as_f64(),
+            Self::Invalid(_) => None,
+        }
+    }
+
+    /// Returns `true` when the bound is a finite JSON-compatible number.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        matches!(self, Self::Finite(_))
+    }
+
+    /// Returns the bound rendered as a JSON value.
+    #[must_use]
+    pub fn as_json_value(&self) -> serde_json::Value {
+        match self {
+            Self::Finite(number) => serde_json::Value::Number(number.clone()),
+            Self::Invalid(value) => serde_json::Value::String(value.clone()),
+        }
     }
 }
 
 impl Display for ValidationNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
+        match self {
+            Self::Finite(number) => Display::fmt(number, f),
+            Self::Invalid(value) => Display::fmt(value, f),
+        }
     }
 }
 
 impl From<i8> for ValidationNumber {
     fn from(value: i8) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<i16> for ValidationNumber {
     fn from(value: i16) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<i32> for ValidationNumber {
     fn from(value: i32) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<i64> for ValidationNumber {
     fn from(value: i64) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<isize> for ValidationNumber {
     fn from(value: isize) -> Self {
-        Self(serde_json::Number::from(value as i64))
+        Self::Finite(serde_json::Number::from(value as i64))
     }
 }
 
 impl From<u8> for ValidationNumber {
     fn from(value: u8) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<u16> for ValidationNumber {
     fn from(value: u16) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<u32> for ValidationNumber {
     fn from(value: u32) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<u64> for ValidationNumber {
     fn from(value: u64) -> Self {
-        Self(serde_json::Number::from(value))
+        Self::Finite(serde_json::Number::from(value))
     }
 }
 
 impl From<usize> for ValidationNumber {
     fn from(value: usize) -> Self {
-        Self(serde_json::Number::from(value as u64))
+        Self::Finite(serde_json::Number::from(value as u64))
     }
 }
 
 impl From<f32> for ValidationNumber {
     fn from(value: f32) -> Self {
-        Self(serde_json::Number::from_f64(value as f64).expect("validation numbers must be finite"))
+        match serde_json::Number::from_f64(value as f64) {
+            Some(number) => Self::Finite(number),
+            None => Self::Invalid(value.to_string()),
+        }
     }
 }
 
 impl From<f64> for ValidationNumber {
     fn from(value: f64) -> Self {
-        Self(serde_json::Number::from_f64(value).expect("validation numbers must be finite"))
+        match serde_json::Number::from_f64(value) {
+            Some(number) => Self::Finite(number),
+            None => Self::Invalid(value.to_string()),
+        }
     }
 }
 
@@ -609,6 +641,24 @@ impl From<&str> for ValidationValue {
     }
 }
 
+impl From<f32> for ValidationValue {
+    fn from(value: f32) -> Self {
+        match serde_json::Number::from_f64(value as f64) {
+            Some(number) => Self(serde_json::Value::Number(number)),
+            None => Self(serde_json::Value::String(value.to_string())),
+        }
+    }
+}
+
+impl From<f64> for ValidationValue {
+    fn from(value: f64) -> Self {
+        match serde_json::Number::from_f64(value) {
+            Some(number) => Self(serde_json::Value::Number(number)),
+            None => Self(serde_json::Value::String(value.to_string())),
+        }
+    }
+}
+
 macro_rules! impl_validation_value_from_number {
     ($($ty:ty),* $(,)?) => {
         $(
@@ -621,7 +671,7 @@ macro_rules! impl_validation_value_from_number {
     };
 }
 
-impl_validation_value_from_number!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+impl_validation_value_from_number!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// Declarative validation rule applied to a single configuration path.

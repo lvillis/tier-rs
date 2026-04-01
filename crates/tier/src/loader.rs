@@ -4,7 +4,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde::de::{DeserializeOwned, IntoDeserializer};
+use serde::de::{
+    self, DeserializeOwned, IntoDeserializer, MapAccess, SeqAccess, Visitor,
+    value::{Error as ValueDeError, MapAccessDeserializer},
+};
 use serde_json::{Map, Value};
 
 #[cfg(any(feature = "json", feature = "toml", feature = "yaml"))]
@@ -655,11 +658,18 @@ where
         let merge_strategies = metadata.merge_strategies();
 
         let mut report = ConfigReport::new(defaults_value.clone(), self.secret_paths.clone());
+        let mut string_coercion_paths = BTreeSet::new();
 
         let mut merged = defaults_value;
         ensure_root_object(&merged)?;
 
         for layer in layers {
+            if matches!(
+                layer.trace.kind,
+                SourceKind::Environment | SourceKind::Arguments
+            ) {
+                collect_coercion_paths(&layer.value, "", &mut string_coercion_paths);
+            }
             report.record_source(layer.trace.clone());
             record_layer_steps(&mut report, &layer, &self.secret_paths);
             record_deprecation_warnings(&mut report, &layer, &metadata);
@@ -668,10 +678,16 @@ where
             }
         }
 
-        let mut config = deserialize_with_path(merged.clone())?;
+        let mut config = deserialize_with_path(&merged, &report, &string_coercion_paths)?;
         let known_paths = collect_known_paths(&config)?;
+        let suggestion_paths = collect_suggestion_paths(&metadata, &known_paths);
         if !matches!(unknown_field_policy, UnknownFieldPolicy::Allow) {
-            let unknown_fields = collect_unknown_fields::<T>(&merged, &known_paths, &report)?;
+            let unknown_fields = collect_unknown_fields::<T>(
+                &merged,
+                &suggestion_paths,
+                &report,
+                &string_coercion_paths,
+            )?;
             if !unknown_fields.is_empty() {
                 match unknown_field_policy {
                     UnknownFieldPolicy::Allow => {}
@@ -784,7 +800,7 @@ impl EnvSource {
                 continue;
             }
 
-            let value = parse_string_value(&raw_value);
+            let value = parse_override_value(&raw_value);
             let segments = path.split('.').collect::<Vec<_>>();
             insert_path(&mut root, &segments, value).map_err(|message| {
                 ConfigError::InvalidEnv {
@@ -1184,6 +1200,14 @@ fn validate_declared_rule(
                 validation_error(path, actual, rule, secret_paths, "must not be empty", None)
             })
         }
+        ValidationRule::Min(min) if !min.is_finite() => Some(validation_error(
+            path,
+            actual,
+            rule,
+            secret_paths,
+            &format!("declared minimum bound must be finite, got {min}"),
+            Some(min.as_json_value()),
+        )),
         ValidationRule::Min(min) => match actual.as_f64() {
             Some(value) if value >= min.as_f64().unwrap_or(f64::INFINITY) => None,
             Some(_) => Some(validation_error(
@@ -1192,7 +1216,7 @@ fn validate_declared_rule(
                 rule,
                 secret_paths,
                 &format!("must be >= {min}"),
-                Some(Value::Number(min.0.clone())),
+                Some(min.as_json_value()),
             )),
             None => Some(validation_error(
                 path,
@@ -1200,9 +1224,17 @@ fn validate_declared_rule(
                 rule,
                 secret_paths,
                 "must be a numeric value",
-                Some(Value::Number(min.0.clone())),
+                Some(min.as_json_value()),
             )),
         },
+        ValidationRule::Max(max) if !max.is_finite() => Some(validation_error(
+            path,
+            actual,
+            rule,
+            secret_paths,
+            &format!("declared maximum bound must be finite, got {max}"),
+            Some(max.as_json_value()),
+        )),
         ValidationRule::Max(max) => match actual.as_f64() {
             Some(value) if value <= max.as_f64().unwrap_or(f64::NEG_INFINITY) => None,
             Some(_) => Some(validation_error(
@@ -1211,7 +1243,7 @@ fn validate_declared_rule(
                 rule,
                 secret_paths,
                 &format!("must be <= {max}"),
-                Some(Value::Number(max.0.clone())),
+                Some(max.as_json_value()),
             )),
             None => Some(validation_error(
                 path,
@@ -1219,7 +1251,7 @@ fn validate_declared_rule(
                 rule,
                 secret_paths,
                 "must be a numeric value",
-                Some(Value::Number(max.0.clone())),
+                Some(max.as_json_value()),
             )),
         },
         ValidationRule::MinLength(min) => {
@@ -1586,7 +1618,7 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
         }
 
         let segments = path.split('.').collect::<Vec<_>>();
-        insert_path(&mut root, &segments, parse_string_value(raw_value)).map_err(|message| {
+        insert_path(&mut root, &segments, parse_override_value(raw_value)).map_err(|message| {
             ConfigError::InvalidArg {
                 arg: format!("--set {path}={raw_value}"),
                 message,
@@ -1693,21 +1725,51 @@ where
     Ok(paths.into_iter().collect())
 }
 
+fn collect_suggestion_paths(
+    metadata: &ConfigMetadata,
+    known_paths: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut candidates = BTreeMap::new();
+
+    for field in metadata.fields() {
+        candidates.insert(field.path.clone(), field.path.clone());
+        for alias in &field.aliases {
+            candidates.insert(alias.clone(), field.path.clone());
+        }
+    }
+
+    if candidates.is_empty() {
+        for path in known_paths {
+            candidates.insert(path.clone(), path.clone());
+        }
+    } else {
+        for path in known_paths {
+            candidates
+                .entry(path.clone())
+                .or_insert_with(|| path.clone());
+        }
+    }
+
+    candidates
+}
+
 fn collect_unknown_fields<T>(
     value: &Value,
-    known_paths: &BTreeSet<String>,
+    suggestion_paths: &BTreeMap<String, String>,
     report: &ConfigReport,
+    string_coercion_paths: &BTreeSet<String>,
 ) -> Result<Vec<UnknownField>, ConfigError>
 where
     T: DeserializeOwned,
 {
     let mut ignored = Vec::new();
-    let deserializer = value.clone().into_deserializer();
-    let result: Result<T, serde_json::Error> = serde_ignored::deserialize(deserializer, |path| {
-        ignored.push(normalize_path(&path.to_string()))
+    let deserializer = CoercingDeserializer::new(value, "", string_coercion_paths);
+    let result: Result<T, ValueDeError> = serde_ignored::deserialize(deserializer, |path| {
+        ignored.push(normalize_external_path(&path.to_string()))
     });
     result.map_err(|error| ConfigError::Deserialize {
         path: "<unknown>".to_owned(),
+        provenance: None,
         message: error.to_string(),
     })?;
 
@@ -1718,7 +1780,7 @@ where
         .into_iter()
         .map(|path| {
             let source = find_source_for_unknown_path(report, &path);
-            let suggestion = best_path_suggestion(&path, known_paths);
+            let suggestion = best_path_suggestion(&path, suggestion_paths);
             UnknownField::new(path)
                 .with_source(source)
                 .with_suggestion(suggestion)
@@ -1727,7 +1789,7 @@ where
 }
 
 fn find_source_for_unknown_path(report: &ConfigReport, path: &str) -> Option<SourceTrace> {
-    let mut current = Some(path.to_owned());
+    let mut current = Some(normalize_external_path(path));
     while let Some(candidate) = current {
         if let Some(source) = report.latest_source_for(&candidate) {
             return Some(source);
@@ -1740,18 +1802,18 @@ fn find_source_for_unknown_path(report: &ConfigReport, path: &str) -> Option<Sou
     None
 }
 
-fn best_path_suggestion(path: &str, known_paths: &BTreeSet<String>) -> Option<String> {
-    if known_paths.is_empty() {
+fn best_path_suggestion(path: &str, suggestion_paths: &BTreeMap<String, String>) -> Option<String> {
+    if suggestion_paths.is_empty() {
         return None;
     }
 
-    let normalized = normalize_path(path);
+    let normalized = normalize_external_path(path);
     let (parent, leaf) = normalized
         .rsplit_once('.')
         .map_or(("", normalized.as_str()), |(parent, leaf)| (parent, leaf));
 
     let mut sibling_best: Option<(usize, String)> = None;
-    for candidate in known_paths {
+    for (candidate, canonical) in suggestion_paths {
         let (candidate_parent, candidate_leaf) = candidate
             .rsplit_once('.')
             .map_or(("", candidate.as_str()), |(parent, leaf)| (parent, leaf));
@@ -1763,9 +1825,9 @@ fn best_path_suggestion(path: &str, known_paths: &BTreeSet<String>) -> Option<St
         match &mut sibling_best {
             Some((best_distance, best_candidate)) if distance < *best_distance => {
                 *best_distance = distance;
-                *best_candidate = candidate.clone();
+                *best_candidate = canonical.clone();
             }
-            None => sibling_best = Some((distance, candidate.clone())),
+            None => sibling_best = Some((distance, canonical.clone())),
             _ => {}
         }
     }
@@ -1777,14 +1839,14 @@ fn best_path_suggestion(path: &str, known_paths: &BTreeSet<String>) -> Option<St
     }
 
     let mut best: Option<(usize, String)> = None;
-    for candidate in known_paths {
+    for (candidate, canonical) in suggestion_paths {
         let distance = levenshtein(&normalized, candidate);
         match &mut best {
             Some((best_distance, best_candidate)) if distance < *best_distance => {
                 *best_distance = distance;
-                *best_candidate = candidate.clone();
+                *best_candidate = canonical.clone();
             }
-            None => best = Some((distance, candidate.clone())),
+            None => best = Some((distance, canonical.clone())),
             _ => {}
         }
     }
@@ -2013,16 +2075,26 @@ fn offset_to_line_column(input: &str, offset: usize) -> LineColumn {
     LineColumn { line, column }
 }
 
-fn deserialize_with_path<T>(value: Value) -> Result<T, ConfigError>
+fn deserialize_with_path<T>(
+    value: &Value,
+    report: &ConfigReport,
+    string_coercion_paths: &BTreeSet<String>,
+) -> Result<T, ConfigError>
 where
     T: DeserializeOwned,
 {
-    let deserializer = value.into_deserializer();
-    let result: Result<T, serde_path_to_error::Error<serde_json::Error>> =
+    let deserializer = CoercingDeserializer::new(value, "", string_coercion_paths);
+    let result: Result<T, serde_path_to_error::Error<ValueDeError>> =
         serde_path_to_error::deserialize(deserializer);
-    result.map_err(|error| ConfigError::Deserialize {
-        path: error.path().to_string(),
-        message: error.to_string(),
+    result.map_err(|error| {
+        let path = error.path().to_string();
+        let lookup_path = normalize_external_path(&path);
+        let source = find_source_for_unknown_path(report, &lookup_path);
+        ConfigError::Deserialize {
+            path,
+            provenance: source,
+            message: error.inner().to_string(),
+        }
     })
 }
 
@@ -2092,23 +2164,562 @@ fn merge_values(
     }
 }
 
-fn parse_string_value(raw: &str) -> Value {
+fn collect_coercion_paths(value: &Value, current: &str, paths: &mut BTreeSet<String>) {
+    if !current.is_empty() {
+        paths.insert(current.to_owned());
+    }
+
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let next = join_path(current, key);
+                collect_coercion_paths(child, &next, paths);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                let next = join_path(current, &index.to_string());
+                collect_coercion_paths(child, &next, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_external_path(path: &str) -> String {
+    if path == "." {
+        return String::new();
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = path.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '.' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            '[' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                let mut index = String::new();
+                for next in chars.by_ref() {
+                    if next == ']' {
+                        break;
+                    }
+                    index.push(next);
+                }
+                if !index.is_empty() {
+                    segments.push(index);
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+
+    normalize_path(&segments.join("."))
+}
+
+fn parse_override_value(raw: &str) -> Value {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Value::String(String::new());
     }
 
-    let looks_like_json_scalar_or_container = matches!(
-        trimmed.chars().next(),
-        Some('{') | Some('[') | Some('"') | Some('-') | Some('0'..='9')
-    ) || matches!(trimmed, "true" | "false" | "null");
+    let uses_explicit_json_syntax =
+        matches!(trimmed.chars().next(), Some('{') | Some('[') | Some('"'));
 
-    if looks_like_json_scalar_or_container && let Ok(value) = serde_json::from_str::<Value>(trimmed)
-    {
+    if uses_explicit_json_syntax && let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return value;
     }
 
     Value::String(raw.to_owned())
+}
+
+fn unexpected_value(value: &Value) -> de::Unexpected<'_> {
+    match value {
+        Value::Null => de::Unexpected::Unit,
+        Value::Bool(value) => de::Unexpected::Bool(*value),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                de::Unexpected::Signed(value)
+            } else if let Some(value) = number.as_u64() {
+                de::Unexpected::Unsigned(value)
+            } else if let Some(value) = number.as_f64() {
+                de::Unexpected::Float(value)
+            } else {
+                de::Unexpected::Other("number")
+            }
+        }
+        Value::String(value) => de::Unexpected::Str(value),
+        Value::Array(_) => de::Unexpected::Other("array"),
+        Value::Object(_) => de::Unexpected::Other("object"),
+    }
+}
+
+struct CoercingDeserializer<'a> {
+    value: &'a Value,
+    path: String,
+    string_coercion_paths: &'a BTreeSet<String>,
+}
+
+impl<'a> CoercingDeserializer<'a> {
+    fn new(
+        value: &'a Value,
+        path: impl Into<String>,
+        string_coercion_paths: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            value,
+            path: path.into(),
+            string_coercion_paths,
+        }
+    }
+
+    fn coercible_string(&self) -> Option<&'a str> {
+        match self.value {
+            Value::String(value) if self.string_coercion_paths.contains(&self.path) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn invalid_type<'de, V>(&self, visitor: &V) -> ValueDeError
+    where
+        V: Visitor<'de>,
+    {
+        de::Error::invalid_type(unexpected_value(self.value), visitor)
+    }
+
+    fn invalid_string_type<'de, V>(&self, raw: &str, visitor: &V) -> ValueDeError
+    where
+        V: Visitor<'de>,
+    {
+        de::Error::invalid_type(de::Unexpected::Str(raw), visitor)
+    }
+}
+
+macro_rules! deserialize_integer_from_value {
+    ($method:ident, $visit:ident, $ty:ty) => {
+        fn $method<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            if let Some(raw) = self.coercible_string() {
+                return raw
+                    .trim()
+                    .parse::<$ty>()
+                    .map_err(|_| self.invalid_string_type(raw, &visitor))
+                    .and_then(|value| visitor.$visit(value));
+            }
+
+            match self.value {
+                Value::Number(number) => number
+                    .to_string()
+                    .parse::<$ty>()
+                    .map_err(|_| self.invalid_type(&visitor))
+                    .and_then(|value| visitor.$visit(value)),
+                _ => Err(self.invalid_type(&visitor)),
+            }
+        }
+    };
+}
+
+macro_rules! deserialize_float_from_value {
+    ($method:ident, $visit:ident, $ty:ty) => {
+        fn $method<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            if let Some(raw) = self.coercible_string() {
+                return raw
+                    .trim()
+                    .parse::<$ty>()
+                    .map_err(|_| self.invalid_string_type(raw, &visitor))
+                    .and_then(|value| visitor.$visit(value));
+            }
+
+            match self.value {
+                Value::Number(number) => number
+                    .to_string()
+                    .parse::<$ty>()
+                    .map_err(|_| self.invalid_type(&visitor))
+                    .and_then(|value| visitor.$visit(value)),
+                _ => Err(self.invalid_type(&visitor)),
+            }
+        }
+    };
+}
+
+impl<'de, 'a> de::Deserializer<'de> for CoercingDeserializer<'a>
+where
+    'a: 'de,
+{
+    type Error = ValueDeError;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::Null => visitor.visit_unit(),
+            Value::Bool(value) => visitor.visit_bool(*value),
+            Value::Number(number) => {
+                if let Some(value) = number.as_i64() {
+                    visitor.visit_i64(value)
+                } else if let Some(value) = number.as_u64() {
+                    visitor.visit_u64(value)
+                } else if let Some(value) = number.as_f64() {
+                    visitor.visit_f64(value)
+                } else {
+                    Err(self.invalid_type(&visitor))
+                }
+            }
+            Value::String(value) => visitor.visit_borrowed_str(value),
+            Value::Array(values) => visitor.visit_seq(CoercingSeqAccess::new(
+                values.iter().enumerate(),
+                self.path,
+                self.string_coercion_paths,
+            )),
+            Value::Object(map) => visitor.visit_map(CoercingMapAccess::new(
+                map.iter(),
+                self.path,
+                self.string_coercion_paths,
+            )),
+        }
+    }
+
+    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        if let Some(raw) = self.coercible_string() {
+            return match raw.trim() {
+                "true" => visitor.visit_bool(true),
+                "false" => visitor.visit_bool(false),
+                _ => Err(self.invalid_string_type(raw, &visitor)),
+            };
+        }
+
+        match self.value {
+            Value::Bool(value) => visitor.visit_bool(*value),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    deserialize_integer_from_value!(deserialize_i8, visit_i8, i8);
+    deserialize_integer_from_value!(deserialize_i16, visit_i16, i16);
+    deserialize_integer_from_value!(deserialize_i32, visit_i32, i32);
+    deserialize_integer_from_value!(deserialize_i64, visit_i64, i64);
+    deserialize_integer_from_value!(deserialize_i128, visit_i128, i128);
+    deserialize_integer_from_value!(deserialize_u8, visit_u8, u8);
+    deserialize_integer_from_value!(deserialize_u16, visit_u16, u16);
+    deserialize_integer_from_value!(deserialize_u32, visit_u32, u32);
+    deserialize_integer_from_value!(deserialize_u64, visit_u64, u64);
+    deserialize_integer_from_value!(deserialize_u128, visit_u128, u128);
+    deserialize_float_from_value!(deserialize_f32, visit_f32, f32);
+    deserialize_float_from_value!(deserialize_f64, visit_f64, f64);
+
+    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        let Value::String(value) = self.value else {
+            return Err(self.invalid_type(&visitor));
+        };
+        let mut chars = value.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch), None) => visitor.visit_char(ch),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(value) => visitor.visit_borrowed_str(value),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(value) => visitor.visit_string(value.clone()),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(value) => visitor.visit_borrowed_bytes(value.as_bytes()),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(value) => visitor.visit_byte_buf(value.as_bytes().to_vec()),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        if matches!(self.value, Value::Null) {
+            return visitor.visit_none();
+        }
+
+        if let Some(raw) = self.coercible_string()
+            && raw.trim() == "null"
+        {
+            return visitor.visit_none();
+        }
+
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        if matches!(self.value, Value::Null) {
+            return visitor.visit_unit();
+        }
+
+        if let Some(raw) = self.coercible_string()
+            && raw.trim() == "null"
+        {
+            return visitor.visit_unit();
+        }
+
+        Err(self.invalid_type(&visitor))
+    }
+
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_unit(visitor)
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::Array(values) => visitor.visit_seq(CoercingSeqAccess::new(
+                values.iter().enumerate(),
+                self.path,
+                self.string_coercion_paths,
+            )),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::Object(map) => visitor.visit_map(CoercingMapAccess::new(
+                map.iter(),
+                self.path,
+                self.string_coercion_paths,
+            )),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_map(visitor)
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(value) => visitor.visit_enum(value.as_str().into_deserializer()),
+            Value::Object(map) => visitor.visit_enum(MapAccessDeserializer::new(
+                CoercingMapAccess::new(map.iter(), self.path, self.string_coercion_paths),
+            )),
+            _ => Err(self.invalid_type(&visitor)),
+        }
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_string(visitor)
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_any(visitor)
+    }
+}
+
+struct CoercingSeqAccess<'a, I> {
+    iter: I,
+    parent_path: String,
+    string_coercion_paths: &'a BTreeSet<String>,
+}
+
+impl<'a, I> CoercingSeqAccess<'a, I> {
+    fn new(iter: I, parent_path: String, string_coercion_paths: &'a BTreeSet<String>) -> Self {
+        Self {
+            iter,
+            parent_path,
+            string_coercion_paths,
+        }
+    }
+}
+
+impl<'de, 'a, I> SeqAccess<'de> for CoercingSeqAccess<'a, I>
+where
+    'a: 'de,
+    I: Iterator<Item = (usize, &'a Value)>,
+{
+    type Error = ValueDeError;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        let Some((index, value)) = self.iter.next() else {
+            return Ok(None);
+        };
+        let path = join_path(&self.parent_path, &index.to_string());
+        seed.deserialize(CoercingDeserializer::new(
+            value,
+            path,
+            self.string_coercion_paths,
+        ))
+        .map(Some)
+    }
+}
+
+struct CoercingMapAccess<'a, I> {
+    iter: I,
+    current: Option<(&'a str, &'a Value)>,
+    parent_path: String,
+    string_coercion_paths: &'a BTreeSet<String>,
+}
+
+impl<'a, I> CoercingMapAccess<'a, I> {
+    fn new(iter: I, parent_path: String, string_coercion_paths: &'a BTreeSet<String>) -> Self {
+        Self {
+            iter,
+            current: None,
+            parent_path,
+            string_coercion_paths,
+        }
+    }
+}
+
+impl<'de, 'a, I> MapAccess<'de> for CoercingMapAccess<'a, I>
+where
+    'a: 'de,
+    I: Iterator<Item = (&'a String, &'a Value)>,
+{
+    type Error = ValueDeError;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: de::DeserializeSeed<'de>,
+    {
+        let Some((key, value)) = self.iter.next() else {
+            return Ok(None);
+        };
+        self.current = Some((key.as_str(), value));
+        seed.deserialize(key.as_str().into_deserializer()).map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        let (key, value) = self
+            .current
+            .take()
+            .expect("map value requested before key was deserialized");
+        let path = join_path(&self.parent_path, key);
+        seed.deserialize(CoercingDeserializer::new(
+            value,
+            path,
+            self.string_coercion_paths,
+        ))
+    }
 }
 
 fn insert_path(root: &mut Value, segments: &[&str], value: Value) -> Result<(), String> {

@@ -26,6 +26,12 @@ Use `tier` when you want:
 - `json`: JSON file parsing
 - `yaml`: YAML file parsing
 
+## Input Semantics
+
+- Env values and `--set key=value` overrides are string-first inputs
+- Primitive targets such as `bool`, integers, floats, and `Option<T>` are coerced during deserialization
+- Use explicit JSON syntax for arrays, objects, or quoted strings when you need structured inline values
+
 ## Quick Start
 
 The smallest useful setup is defaults plus a TOML file:

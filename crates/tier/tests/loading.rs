@@ -47,6 +47,22 @@ struct MergeTls {
     key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StringValueConfig {
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PortOnlyConfig {
+    port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct OptionalTokenConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -74,6 +90,20 @@ impl Default for MergeConfig {
                 },
             },
         }
+    }
+}
+
+impl Default for StringValueConfig {
+    fn default() -> Self {
+        Self {
+            value: "default".to_owned(),
+        }
+    }
+}
+
+impl Default for PortOnlyConfig {
+    fn default() -> Self {
+        Self { port: 3000 }
     }
 }
 
@@ -241,6 +271,58 @@ fn validation_errors_are_returned_with_context() {
 }
 
 #[test]
+fn deserialize_errors_include_the_last_source() {
+    let error = ConfigLoader::new(PortOnlyConfig::default())
+        .env(EnvSource::from_pairs([("APP_PORT", "abc")]).prefix("APP"))
+        .load()
+        .expect_err("deserialization must fail");
+
+    let ConfigError::Deserialize {
+        path,
+        provenance,
+        message,
+    } = &error
+    else {
+        panic!("expected deserialize error");
+    };
+
+    assert_eq!(path, "port");
+    assert_eq!(
+        provenance.as_ref().map(ToString::to_string),
+        Some("env(APP_PORT)".to_owned())
+    );
+    assert!(message.contains("invalid type"));
+    assert!(error.to_string().contains("from env(APP_PORT)"));
+}
+
+#[test]
+fn env_and_args_keep_string_inputs_but_still_coerce_numeric_targets() {
+    let string_from_env = ConfigLoader::new(StringValueConfig::default())
+        .env(EnvSource::from_pairs([("APP_VALUE", "false")]).prefix("APP"))
+        .load()
+        .expect("string env override should load");
+    assert_eq!(string_from_env.value, "false");
+
+    let string_from_args = ConfigLoader::new(StringValueConfig::default())
+        .args(ArgsSource::from_args(["app", "--set", "value=false"]))
+        .load()
+        .expect("string CLI override should load");
+    assert_eq!(string_from_args.value, "false");
+
+    let port_from_env = ConfigLoader::new(PortOnlyConfig::default())
+        .env(EnvSource::from_pairs([("APP_PORT", "9000")]).prefix("APP"))
+        .load()
+        .expect("numeric env override should still coerce");
+    assert_eq!(port_from_env.port, 9000);
+
+    let port_from_args = ConfigLoader::new(PortOnlyConfig::default())
+        .args(ArgsSource::from_args(["app", "--set", "port=9100"]))
+        .load()
+        .expect("numeric CLI override should still coerce");
+    assert_eq!(port_from_args.port, 9100);
+}
+
+#[test]
 fn declared_validation_rules_return_structured_errors_and_redact_secrets() {
     let metadata = ConfigMetadata::from_fields([
         FieldMetadata::new("server.host").non_empty(),
@@ -301,6 +383,30 @@ fn declared_validation_rules_return_structured_errors_and_redact_secrets() {
     assert_eq!(
         password.actual.as_ref().and_then(|value| value.as_str()),
         Some("***redacted***")
+    );
+}
+
+#[test]
+fn invalid_declarative_numeric_bounds_return_structured_errors() {
+    let error = ConfigLoader::new(PortOnlyConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("port").min(f64::NAN)
+        ]))
+        .load()
+        .expect_err("invalid bounds must fail without panicking");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    assert_eq!(errors.len(), 1);
+    let error = errors.iter().next().expect("validation error");
+    assert_eq!(error.path, "port");
+    assert_eq!(error.rule.as_deref(), Some("min"));
+    assert!(error.message.contains("must be finite"));
+    assert_eq!(
+        error.expected.as_ref().and_then(|value| value.as_str()),
+        Some("NaN")
     );
 }
 
@@ -570,6 +676,19 @@ fn warns_on_unknown_fields_with_suggestions() {
     let doctor = loaded.report().doctor();
     assert!(doctor.contains("Warnings: 1"));
     assert!(doctor.contains("server.posrt"));
+}
+
+#[test]
+fn unknown_field_suggestions_prefer_metadata_over_runtime_shape() {
+    let error = ConfigLoader::new(OptionalTokenConfig::default())
+        .env(EnvSource::from_pairs([("APP_TOKNE", "\"secret\"")]).prefix("APP"))
+        .metadata(ConfigMetadata::from_fields([FieldMetadata::new("token")]))
+        .load()
+        .expect_err("unknown fields should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("tokne"));
+    assert!(message.contains("token"));
 }
 
 #[test]
