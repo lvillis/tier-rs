@@ -1,8 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::{JsonSchema, MergeStrategy, TierMetadata, ValidationRule, json_schema_for};
+use crate::{
+    ConfigMetadata, FieldMetadata, JsonSchema, MergeStrategy, TierMetadata, ValidationRule,
+    json_schema_for, schema::required_contains_additional_items_for_docs,
+};
 
 /// Stable version tag for machine-readable environment documentation payloads.
 pub const ENV_DOCS_FORMAT_VERSION: u32 = 1;
@@ -13,6 +16,10 @@ pub struct EnvDocEntry {
     /// Dot-delimited configuration path.
     pub path: String,
     /// Environment variable name corresponding to the path.
+    ///
+    /// Collection segments are rendered as placeholder tokens such as `{item}`.
+    /// Replace them with a concrete index or key when setting an actual
+    /// environment variable.
     pub env: String,
     /// Human-readable schema type summary.
     pub ty: String,
@@ -86,7 +93,10 @@ impl EnvDocOptions {
     /// Sets the separator placed between path segments.
     #[must_use]
     pub fn separator(mut self, separator: impl Into<String>) -> Self {
-        self.separator = separator.into();
+        let separator = separator.into();
+        if !separator.is_empty() {
+            self.separator = separator;
+        }
         self
     }
 
@@ -98,13 +108,20 @@ impl EnvDocOptions {
     }
 
     /// Converts a dot-delimited configuration path into an environment variable name.
+    ///
+    /// Collection segments are rendered as placeholder tokens so generated docs
+    /// describe a template rather than the internal wildcard syntax.
     #[must_use]
     pub fn env_name(&self, path: &str) -> String {
         let segments = path
             .split('.')
             .filter(|segment| !segment.is_empty())
             .map(|segment| {
-                if self.uppercase {
+                if segment == "*" {
+                    "{item}".to_owned()
+                } else if segment.starts_with('{') && segment.ends_with('}') {
+                    segment.to_owned()
+                } else if self.uppercase {
                     segment.to_ascii_uppercase()
                 } else {
                     segment.to_owned()
@@ -114,11 +131,35 @@ impl EnvDocOptions {
         let body = segments.join(&self.separator);
         match &self.prefix {
             Some(prefix) if !prefix.is_empty() => {
-                format!("{}{}{}", prefix.trim_end_matches('_'), self.separator, body)
+                let prefix = normalize_env_prefix(prefix, &self.separator);
+                if prefix.is_empty() {
+                    body
+                } else if body.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}{}{}", self.separator, body)
+                }
             }
             _ => body,
         }
     }
+}
+
+fn normalize_env_prefix(prefix: &str, separator: &str) -> String {
+    if prefix.is_empty() {
+        return String::new();
+    }
+
+    let mut normalized = prefix.to_owned();
+    if !separator.is_empty() {
+        while normalized.ends_with(separator) {
+            normalized.truncate(normalized.len() - separator.len());
+        }
+    }
+    if separator != "_" {
+        normalized = normalized.trim_end_matches('_').to_owned();
+    }
+    normalized
 }
 
 /// Generates environment variable documentation rows from a configuration schema.
@@ -129,10 +170,18 @@ where
 {
     let schema = json_schema_for::<T>();
     let mut docs = Vec::new();
-    collect_env_docs(&schema, &schema, "", true, &mut docs, &mut BTreeSet::new());
-    let metadata = T::metadata().fields_by_path();
+    collect_env_docs(
+        &schema,
+        &schema,
+        "",
+        true,
+        &mut docs,
+        &mut BTreeSet::new(),
+        None,
+    );
+    let metadata = T::metadata();
     docs.sort_by(|left, right| left.path.cmp(&right.path));
-    docs.dedup_by(|left, right| left.path == right.path);
+    docs = merge_duplicate_env_docs(docs);
 
     for entry in &mut docs {
         apply_field_metadata(entry, &metadata, options);
@@ -252,14 +301,20 @@ where
 
 fn apply_field_metadata(
     entry: &mut EnvDocEntry,
-    metadata: &BTreeMap<String, crate::FieldMetadata>,
+    metadata: &ConfigMetadata,
     options: &EnvDocOptions,
 ) {
-    if let Some(field) = metadata.get(&entry.path) {
+    let fields = matching_field_metadata_for_path(metadata, &entry.path);
+    if fields.is_empty() {
+        entry.env = options.env_name(&entry.path);
+        return;
+    }
+
+    entry.env = options.env_name(&entry.path);
+
+    for field in fields {
         if let Some(env) = &field.env {
             entry.env = env.clone();
-        } else {
-            entry.env = options.env_name(&entry.path);
         }
         entry.secret |= field.secret;
         if let Some(doc) = &field.doc {
@@ -271,16 +326,128 @@ fn apply_field_metadata(
         if let Some(deprecated) = &field.deprecated {
             entry.deprecated = Some(deprecated.clone());
         }
-        entry.aliases = field.aliases.clone();
-        entry.has_default = field.has_default;
-        entry.merge = field.merge;
-        entry.validations = field.validations.clone();
+        for alias in &field.aliases {
+            if !entry.aliases.contains(alias) {
+                entry.aliases.push(alias.clone());
+            }
+        }
+        entry.has_default |= field.has_default;
+        if field.merge != MergeStrategy::Merge {
+            entry.merge = field.merge;
+        }
+        for rule in &field.validations {
+            if !entry.validations.contains(rule) {
+                entry.validations.push(rule.clone());
+            }
+        }
         if field.has_default {
             entry.required = false;
         }
-    } else {
-        entry.env = options.env_name(&entry.path);
     }
+
+    if entry.secret && entry.example.is_some() {
+        entry.example = Some("<secret>".to_owned());
+    }
+}
+
+fn merge_duplicate_env_docs(entries: Vec<EnvDocEntry>) -> Vec<EnvDocEntry> {
+    let mut merged = Vec::<EnvDocEntry>::new();
+
+    for entry in entries {
+        if let Some(existing) = merged.last_mut()
+            && existing.path == entry.path
+        {
+            merge_env_doc_entry(existing, entry);
+        } else {
+            merged.push(entry);
+        }
+    }
+
+    merged
+}
+
+fn merge_env_doc_entry(existing: &mut EnvDocEntry, incoming: EnvDocEntry) {
+    existing.required |= incoming.required;
+    existing.secret |= incoming.secret;
+    existing.has_default |= incoming.has_default;
+
+    existing.ty = merge_env_doc_types(&existing.ty, &incoming.ty);
+    if existing.description.is_none() {
+        existing.description = incoming.description;
+    }
+    if existing.example.is_none() {
+        existing.example = incoming.example;
+    }
+    if existing.deprecated.is_none() {
+        existing.deprecated = incoming.deprecated;
+    }
+    if existing.aliases.is_empty() {
+        existing.aliases = incoming.aliases;
+    } else {
+        for alias in incoming.aliases {
+            if !existing.aliases.contains(&alias) {
+                existing.aliases.push(alias);
+            }
+        }
+    }
+    if existing.merge == MergeStrategy::Merge && incoming.merge != MergeStrategy::Merge {
+        existing.merge = incoming.merge;
+    }
+    for rule in incoming.validations {
+        if !existing.validations.contains(&rule) {
+            existing.validations.push(rule);
+        }
+    }
+}
+
+fn merge_env_doc_types(existing: &str, incoming: &str) -> String {
+    if existing == incoming {
+        return existing.to_owned();
+    }
+
+    let mut merged = Vec::<String>::new();
+    for ty in [existing, incoming]
+        .into_iter()
+        .flat_map(|value| value.split(" | "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !merged.iter().any(|existing| existing == ty) {
+            merged.push(ty.to_owned());
+        }
+    }
+
+    if merged.is_empty() {
+        "unknown".to_owned()
+    } else {
+        merged.join(" | ")
+    }
+}
+
+fn metadata_sort_key(path: &str) -> (usize, usize) {
+    let segments = path.split('.').filter(|segment| !segment.is_empty());
+    let total = segments.clone().count();
+    let specificity = segments.filter(|segment| *segment != "*").count();
+    (specificity, total)
+}
+
+fn matching_field_metadata_for_path<'a>(
+    metadata: &'a ConfigMetadata,
+    path: &str,
+) -> Vec<&'a FieldMetadata> {
+    let mut fields = metadata
+        .fields()
+        .iter()
+        .filter(|field| {
+            field.path == path || crate::report::path_matches_pattern(path, &field.path)
+        })
+        .collect::<Vec<_>>();
+    fields.sort_by(|left, right| {
+        metadata_sort_key(&left.path)
+            .cmp(&metadata_sort_key(&right.path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    fields
 }
 
 fn collect_env_docs(
@@ -290,11 +457,20 @@ fn collect_env_docs(
     required: bool,
     docs: &mut Vec<EnvDocEntry>,
     visited_refs: &mut BTreeSet<String>,
+    scope_reserved_keys: Option<&BTreeSet<String>>,
 ) {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         if visited_refs.insert(reference.to_owned()) {
-            if let Some(target) = resolve_schema_ref(root, reference) {
-                collect_env_docs(target, root, path, required, docs, visited_refs);
+            if let Some(inlined) = inlined_schema_ref(schema, root) {
+                collect_env_docs(
+                    &inlined,
+                    root,
+                    path,
+                    required,
+                    docs,
+                    visited_refs,
+                    scope_reserved_keys,
+                );
             }
             visited_refs.remove(reference);
         }
@@ -320,9 +496,38 @@ fn collect_env_docs(
         }
         return;
     };
+    let reserved_keys = merged_object_level_property_names(schema, root, scope_reserved_keys);
+
+    let mut traversed_combinator = false;
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(children) = object.get(keyword).and_then(Value::as_array) {
+            traversed_combinator = true;
+            for child in children {
+                let is_null = child
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| ty == "null");
+                if !is_null {
+                    let branch_required = if keyword == "allOf" { required } else { false };
+                    collect_env_docs(
+                        child,
+                        root,
+                        path,
+                        branch_required,
+                        docs,
+                        visited_refs,
+                        Some(&reserved_keys),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut traversed_children = traversed_combinator;
 
     let properties = object.get("properties").and_then(Value::as_object);
     if let Some(properties) = properties {
+        traversed_children = true;
         let required_properties = object
             .get("required")
             .and_then(Value::as_array)
@@ -345,10 +550,169 @@ fn collect_env_docs(
                 child_schema,
                 root,
                 &next,
-                required_properties.contains(key),
+                required && required_properties.contains(key),
                 docs,
                 visited_refs,
+                None,
             );
+        }
+    }
+
+    if let Some(items) = object.get("prefixItems").and_then(Value::as_array) {
+        traversed_children = true;
+        for (index, child) in items.iter().enumerate() {
+            let next = if path.is_empty() {
+                index.to_string()
+            } else {
+                format!("{path}.{index}")
+            };
+            collect_env_docs(
+                child,
+                root,
+                &next,
+                required && array_item_is_required(object, index),
+                docs,
+                visited_refs,
+                None,
+            );
+        }
+    }
+
+    if let Some(items) = object.get("items").and_then(Value::as_array) {
+        traversed_children = true;
+        for (index, child) in items.iter().enumerate() {
+            let next = if path.is_empty() {
+                index.to_string()
+            } else {
+                format!("{path}.{index}")
+            };
+            collect_env_docs(
+                child,
+                root,
+                &next,
+                required && array_item_is_required(object, index),
+                docs,
+                visited_refs,
+                None,
+            );
+        }
+    }
+
+    if let Some(items) = object.get("items").filter(|value| value.is_object()) {
+        let fixed_item_count = object
+            .get("prefixItems")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            .max(
+                object
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            );
+        if allows_additional_array_items(object, fixed_item_count) {
+            traversed_children = true;
+            let next = if path.is_empty() {
+                "*".to_owned()
+            } else {
+                format!("{path}.*")
+            };
+            collect_env_docs(
+                items,
+                root,
+                &next,
+                required && required_additional_array_items(object, fixed_item_count) > 0,
+                docs,
+                visited_refs,
+                None,
+            );
+        }
+    }
+
+    if let Some(additional) = object
+        .get("additionalProperties")
+        .filter(|value| value.is_object())
+    {
+        traversed_children = true;
+        let placeholder = dynamic_object_placeholder(&reserved_keys);
+        let segment = if placeholder == "{item}" {
+            "*".to_owned()
+        } else {
+            placeholder
+        };
+        let next = if path.is_empty() {
+            segment
+        } else {
+            format!("{path}.{segment}")
+        };
+        collect_env_docs(additional, root, &next, false, docs, visited_refs, None);
+    }
+
+    if let Some(additional) = object
+        .get("additionalItems")
+        .filter(|value| value.is_object())
+    {
+        let fixed_item_count = object
+            .get("prefixItems")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            .max(
+                object
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            );
+        if allows_additional_array_items(object, fixed_item_count) {
+            traversed_children = true;
+            let next = if path.is_empty() {
+                "*".to_owned()
+            } else {
+                format!("{path}.*")
+            };
+            collect_env_docs(
+                additional,
+                root,
+                &next,
+                required && required_additional_array_items(object, fixed_item_count) > 0,
+                docs,
+                visited_refs,
+                None,
+            );
+        }
+    }
+
+    if let Some(contains) = object.get("contains").filter(|value| value.is_object()) {
+        let fixed_item_count = object
+            .get("prefixItems")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            .max(
+                object
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            );
+        if fixed_item_count == 0 || allows_additional_array_items(object, fixed_item_count) {
+            traversed_children = true;
+            let next = if path.is_empty() {
+                "*".to_owned()
+            } else {
+                format!("{path}.*")
+            };
+            collect_env_docs(
+                contains,
+                root,
+                &next,
+                required && required_contains_additional_items_for_docs(object, root) > 0,
+                docs,
+                visited_refs,
+                None,
+            );
+        }
+    }
+
+    if traversed_children {
+        if traversed_combinator {
+            apply_local_schema_entry_overrides(path, required, object, docs);
         }
         return;
     }
@@ -381,6 +745,134 @@ fn collect_env_docs(
     }
 }
 
+fn dynamic_object_placeholder(reserved: &BTreeSet<String>) -> String {
+    for candidate in ["{item}", "{key}", "{entry}", "{value}"] {
+        if !reserved.contains(candidate) {
+            return candidate.to_owned();
+        }
+    }
+
+    let mut index = 0usize;
+    loop {
+        let candidate = format!("{{item_{index}}}");
+        if !reserved.contains(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn array_item_is_required(object: &serde_json::Map<String, Value>, index: usize) -> bool {
+    object
+        .get("minItems")
+        .and_then(Value::as_u64)
+        .is_some_and(|min_items| index < min_items as usize)
+}
+
+fn allows_additional_array_items(
+    object: &serde_json::Map<String, Value>,
+    fixed_item_count: usize,
+) -> bool {
+    object
+        .get("maxItems")
+        .and_then(Value::as_u64)
+        .is_none_or(|max_items| fixed_item_count < max_items as usize)
+}
+
+fn required_additional_array_items(
+    object: &serde_json::Map<String, Value>,
+    fixed_item_count: usize,
+) -> usize {
+    object
+        .get("minItems")
+        .and_then(Value::as_u64)
+        .map_or(0, |min_items| {
+            min_items.saturating_sub(fixed_item_count as u64) as usize
+        })
+}
+
+fn merged_object_level_property_names(
+    schema: &Value,
+    root: &Value,
+    inherited: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let mut reserved = BTreeSet::new();
+    collect_object_level_property_names(schema, root, &mut reserved, &mut BTreeSet::new());
+    if let Some(inherited) = inherited {
+        reserved.extend(inherited.iter().cloned());
+    }
+    reserved
+}
+
+fn collect_object_level_property_names(
+    schema: &Value,
+    root: &Value,
+    reserved: &mut BTreeSet<String>,
+    visited_refs: &mut BTreeSet<String>,
+) {
+    let Some(object) = schema.as_object() else {
+        return;
+    };
+
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        if visited_refs.insert(reference.to_owned()) {
+            if let Some(inlined) = inlined_schema_ref(schema, root) {
+                collect_object_level_property_names(&inlined, root, reserved, visited_refs);
+            }
+            visited_refs.remove(reference);
+        }
+        return;
+    }
+
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        reserved.extend(properties.keys().cloned());
+    }
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(children) = object.get(keyword).and_then(Value::as_array) {
+            for child in children {
+                collect_object_level_property_names(child, root, reserved, visited_refs);
+            }
+        }
+    }
+}
+
+fn apply_local_schema_entry_overrides(
+    path: &str,
+    required: bool,
+    object: &serde_json::Map<String, Value>,
+    docs: &mut [EnvDocEntry],
+) {
+    if path.is_empty() {
+        return;
+    }
+
+    let description = object
+        .get("description")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let secret = object
+        .get("writeOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || object
+            .get("x-tier-secret")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+    if !required && !secret && description.is_none() {
+        return;
+    }
+
+    for entry in docs.iter_mut().filter(|entry| entry.path == path) {
+        entry.required |= required;
+        entry.secret |= secret;
+        if let Some(description) = &description {
+            entry.description = Some(description.clone());
+        }
+    }
+}
+
 fn schema_type(object: &serde_json::Map<String, Value>) -> String {
     match object.get("type") {
         Some(Value::String(ty)) => ty.clone(),
@@ -389,13 +881,148 @@ fn schema_type(object: &serde_json::Map<String, Value>) -> String {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
             .join(" | "),
+        _ if object.contains_key("const") => object
+            .get("const")
+            .map_or_else(|| "object".to_owned(), infer_type_from_value),
         _ if object.contains_key("enum") => "enum".to_owned(),
-        _ if object.contains_key("items") => "array".to_owned(),
+        _ if object.contains_key("items") || object.contains_key("prefixItems") => {
+            "array".to_owned()
+        }
         _ => "object".to_owned(),
+    }
+}
+
+fn infer_type_from_value(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(_) => "boolean".to_owned(),
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                "integer".to_owned()
+            } else {
+                "number".to_owned()
+            }
+        }
+        Value::String(_) => "string".to_owned(),
+        Value::Array(_) => "array".to_owned(),
+        Value::Object(_) => "object".to_owned(),
     }
 }
 
 fn resolve_schema_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
     let pointer = reference.strip_prefix('#')?;
     root.pointer(pointer)
+}
+
+fn inlined_schema_ref(schema: &Value, root: &Value) -> Option<Value> {
+    let reference = schema.get("$ref").and_then(Value::as_str)?;
+    let target = resolve_schema_ref(root, reference)?;
+    let mut inlined = target.clone();
+    if let (Some(inlined_object), Some(reference_object)) =
+        (inlined.as_object_mut(), schema.as_object())
+    {
+        for (key, value) in reference_object {
+            if key != "$ref" {
+                merge_schema_keyword(inlined_object, key, value);
+            }
+        }
+    }
+    Some(inlined)
+}
+
+fn merge_schema_keyword(target: &mut serde_json::Map<String, Value>, key: &str, overlay: &Value) {
+    match key {
+        "required" => {
+            let mut merged = target
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(values) = overlay.as_array() {
+                for value in values {
+                    if !merged.contains(value) {
+                        merged.push(value.clone());
+                    }
+                }
+            } else {
+                target.insert(key.to_owned(), overlay.clone());
+                return;
+            }
+            target.insert(key.to_owned(), Value::Array(merged));
+        }
+        "prefixItems" | "items" if overlay.is_array() => {
+            let mut merged = target
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(values) = overlay.as_array() {
+                merge_schema_arrays(&mut merged, values);
+                target.insert(key.to_owned(), Value::Array(merged));
+            } else {
+                target.insert(key.to_owned(), overlay.clone());
+            }
+        }
+        "allOf" | "anyOf" | "oneOf" => {
+            let mut merged = target
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(values) = overlay.as_array() {
+                merged.extend(values.iter().cloned());
+                target.insert(key.to_owned(), Value::Array(merged));
+            } else {
+                target.insert(key.to_owned(), overlay.clone());
+            }
+        }
+        _ => match (target.get_mut(key), overlay) {
+            (Some(Value::Object(existing)), Value::Object(overlay_map)) => {
+                merge_schema_objects(existing, overlay_map);
+            }
+            _ => {
+                target.insert(key.to_owned(), overlay.clone());
+            }
+        },
+    }
+}
+
+fn merge_schema_objects(
+    target: &mut serde_json::Map<String, Value>,
+    overlay: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in overlay {
+        merge_schema_keyword(target, key, value);
+    }
+}
+
+fn merge_schema_arrays(target: &mut Vec<Value>, overlay: &[Value]) {
+    for (index, value) in overlay.iter().enumerate() {
+        if value.is_null() {
+            continue;
+        }
+        if let Some(existing) = target.get_mut(index) {
+            merge_schema_value(existing, value);
+        } else {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn merge_schema_value(target: &mut Value, overlay: &Value) {
+    match overlay {
+        Value::Object(overlay_map) if target.is_object() => {
+            let Value::Object(existing) = target else {
+                unreachable!("checked object target")
+            };
+            merge_schema_objects(existing, overlay_map);
+        }
+        Value::Array(overlay_items) if target.is_array() => {
+            let Value::Array(existing) = target else {
+                unreachable!("checked array target")
+            };
+            merge_schema_arrays(existing, overlay_items);
+        }
+        _ => *target = overlay.clone(),
+    }
 }

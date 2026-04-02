@@ -28,7 +28,7 @@ default = ["toml"]
 clap = ["dep:clap"]
 derive = ["dep:tier-derive"]
 json = []
-schema = ["dep:schemars"]
+schema = ["dep:regex", "dep:schemars"]
 toml = ["dep:toml"]
 watch = ["dep:notify"]
 yaml = ["dep:serde_yaml"]
@@ -36,6 +36,7 @@ yaml = ["dep:serde_yaml"]
 [dependencies]
 clap = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_ignored = { workspace = true }

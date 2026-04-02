@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 
-use crate::report::{collect_diff_paths, get_value_at_path};
+use crate::report::collect_diff_paths;
 use crate::{ConfigError, ConfigReport, LoadedConfig};
 
 type LoaderFn<T> = dyn Fn() -> Result<LoadedConfig<T>, ConfigError> + Send + Sync + 'static;
@@ -691,16 +691,34 @@ fn map_watch_io_error(error: std::io::Error) -> ConfigError {
 }
 
 fn collect_mtimes(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<SystemTime>> {
-    paths
-        .iter()
-        .cloned()
-        .map(|path| {
-            let mtime = std::fs::metadata(&path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok());
-            (path, mtime)
-        })
-        .collect()
+    let mut mtimes = BTreeMap::new();
+    for path in paths {
+        collect_mtimes_recursive(path, &mut mtimes);
+    }
+    mtimes
+}
+
+fn collect_mtimes_recursive(path: &PathBuf, mtimes: &mut BTreeMap<PathBuf, Option<SystemTime>>) {
+    let metadata = std::fs::symlink_metadata(path).ok();
+    let mtime = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok());
+    mtimes.insert(path.clone(), mtime);
+
+    let is_dir = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_dir());
+    if !is_dir {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        collect_mtimes_recursive(&entry.path(), mtimes);
+    }
 }
 
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -738,8 +756,8 @@ fn build_reload_summary(
     let changes = changed_paths
         .iter()
         .map(|path| {
-            let before_value = get_value_at_path(before_redacted, path).cloned();
-            let after_value = get_value_at_path(after_redacted, path).cloned();
+            let before_value = redacted_value_at_path(before_redacted, path);
+            let after_value = redacted_value_at_path(after_redacted, path);
             let redacted = before_value.as_ref().is_some_and(is_redacted_value)
                 || after_value.as_ref().is_some_and(is_redacted_value);
             ConfigChange {
@@ -758,6 +776,36 @@ fn build_reload_summary(
     }
 }
 
+fn redacted_value_at_path(value: &Value, path: &str) -> Option<Value> {
+    if path.is_empty() {
+        return Some(value.clone());
+    }
+
+    let mut current = value;
+    for segment in path.split('.') {
+        match current {
+            Value::String(text) if text == "***redacted***" => {
+                return Some(Value::String(text.clone()));
+            }
+            Value::Object(map) => {
+                current = map.get(segment)?;
+            }
+            Value::Array(values) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = values.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(current.clone())
+}
+
 fn is_redacted_value(value: &Value) -> bool {
-    matches!(value, Value::String(text) if text == "***redacted***")
+    match value {
+        Value::String(text) => text == "***redacted***",
+        Value::Array(values) => values.iter().any(is_redacted_value),
+        Value::Object(map) => map.values().any(is_redacted_value),
+        _ => false,
+    }
 }

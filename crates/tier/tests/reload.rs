@@ -170,6 +170,27 @@ fn reload_detailed_reports_redacted_changes_and_emits_events() {
     );
     assert!(password_change.redacted);
 
+    let db_change = summary
+        .changes
+        .iter()
+        .find(|change| change.path == "db")
+        .expect("db change");
+    assert!(db_change.redacted);
+    assert_eq!(
+        db_change
+            .before
+            .as_ref()
+            .and_then(|value| value["password"].as_str()),
+        Some("***redacted***")
+    );
+    assert_eq!(
+        db_change
+            .after
+            .as_ref()
+            .and_then(|value| value["password"].as_str()),
+        Some("***redacted***")
+    );
+
     match events
         .recv_timeout(Duration::from_secs(1))
         .expect("reload event")
@@ -179,6 +200,67 @@ fn reload_detailed_reports_redacted_changes_and_emits_events() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+#[test]
+fn reload_detailed_marks_nested_changes_when_parent_path_is_secret() {
+    let dir = tempdir().expect("temporary directory");
+    let path = dir.path().join("app.toml");
+    fs::write(
+        &path,
+        r#"
+            [server]
+            port = 4000
+
+            [db]
+            password = "first-secret"
+        "#,
+    )
+    .expect("initial config");
+
+    let path_for_loader = path.clone();
+    let handle = ReloadHandle::new(move || {
+        ConfigLoader::new(ReloadConfig::default())
+            .file(path_for_loader.clone())
+            .secret_path("db")
+            .load()
+    })
+    .expect("initial load");
+
+    fs::write(
+        &path,
+        r#"
+            [server]
+            port = 4000
+
+            [db]
+            password = "second-secret"
+        "#,
+    )
+    .expect("updated config");
+
+    let summary = handle.reload_detailed().expect("reload succeeds");
+    let password_change = summary
+        .changes
+        .iter()
+        .find(|change| change.path == "db.password")
+        .expect("password change");
+
+    assert_eq!(
+        password_change
+            .before
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("***redacted***")
+    );
+    assert_eq!(
+        password_change
+            .after
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("***redacted***")
+    );
+    assert!(password_change.redacted);
 }
 
 #[test]
@@ -208,6 +290,57 @@ fn polling_watcher_can_start_and_stop() {
 
     let watcher = handle.start_polling([path], Duration::from_millis(25));
     assert_eq!(handle.config().server.port, 3001);
+    watcher.stop();
+}
+
+#[test]
+fn polling_watcher_reloads_when_watching_a_directory() {
+    let dir = tempdir().expect("temporary directory");
+    let config_dir = dir.path().join("config");
+    fs::create_dir(&config_dir).expect("config directory");
+    let path = config_dir.join("app.toml");
+    fs::write(
+        &path,
+        r#"
+            [server]
+            port = 3001
+
+            [db]
+            password = "secret"
+        "#,
+    )
+    .expect("config");
+
+    let path_for_loader = path.clone();
+    let handle = ReloadHandle::new(move || {
+        ConfigLoader::new(ReloadConfig::default())
+            .file(path_for_loader.clone())
+            .secret_path("db.password")
+            .load()
+    })
+    .expect("initial load");
+
+    let watcher = handle.start_polling([config_dir], Duration::from_millis(25));
+    std::thread::sleep(Duration::from_millis(75));
+
+    fs::write(
+        &path,
+        r#"
+            [server]
+            port = 4200
+
+            [db]
+            password = "updated-secret"
+        "#,
+    )
+    .expect("updated config");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && handle.config().server.port != 4200 {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    assert_eq!(handle.config().server.port, 4200);
     watcher.stop();
 }
 

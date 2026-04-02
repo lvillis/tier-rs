@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
@@ -14,8 +15,9 @@ use serde_json::{Map, Value};
 use crate::error::LineColumn;
 use crate::error::{ConfigError, UnknownField, ValidationError, ValidationErrors};
 use crate::report::{
-    ConfigReport, ConfigWarning, DeprecatedField, ResolutionStep, collect_diff_paths,
-    collect_paths, get_value_at_path, join_path, normalize_path,
+    ConfigReport, ConfigWarning, DeprecatedField, ResolutionStep, canonicalize_path_with_aliases,
+    collect_diff_paths, collect_paths, get_value_at_path, join_path, normalize_path,
+    path_matches_pattern, path_overlaps_pattern, path_starts_with_pattern, redact_value,
 };
 use crate::{ConfigMetadata, MergeStrategy, TierMetadata, ValidationCheck, ValidationRule};
 
@@ -250,7 +252,10 @@ impl EnvSource {
     /// Sets the segment separator used to map variables to paths.
     #[must_use]
     pub fn separator(mut self, separator: impl Into<String>) -> Self {
-        self.separator = separator.into();
+        let separator = separator.into();
+        if !separator.is_empty() {
+            self.separator = separator;
+        }
         self
     }
 
@@ -294,6 +299,10 @@ pub struct Layer {
     trace: SourceTrace,
     value: Value,
     entries: BTreeMap<String, SourceTrace>,
+    coercible_string_paths: BTreeSet<String>,
+    indexed_array_paths: BTreeSet<String>,
+    indexed_array_base_lengths: BTreeMap<String, usize>,
+    direct_array_paths: BTreeSet<String>,
 }
 
 impl Layer {
@@ -315,6 +324,7 @@ impl Layer {
 
     fn from_value(trace: SourceTrace, value: Value) -> Result<Self, ConfigError> {
         ensure_root_object(&value)?;
+        ensure_path_safe_keys(&value, "")?;
 
         let mut paths = Vec::new();
         collect_paths(&value, "", &mut paths);
@@ -327,6 +337,10 @@ impl Layer {
             trace,
             value,
             entries,
+            coercible_string_paths: BTreeSet::new(),
+            indexed_array_paths: BTreeSet::new(),
+            indexed_array_base_lengths: BTreeMap::new(),
+            direct_array_paths: BTreeSet::new(),
         })
     }
 }
@@ -515,7 +529,10 @@ where
     /// Marks a dot-delimited path as sensitive for report redaction.
     #[must_use]
     pub fn secret_path(mut self, path: impl Into<String>) -> Self {
-        self.secret_paths.insert(normalize_path(&path.into()));
+        let path = normalize_path(&path.into());
+        if !path.is_empty() {
+            self.secret_paths.insert(path);
+        }
         self
     }
 
@@ -653,32 +670,77 @@ where
             layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
+        let mut metadata = canonicalize_metadata_against_layers(&metadata, &layers);
+        let mut alias_overrides = metadata.alias_overrides()?;
+        let pending_secret_paths = canonicalize_secret_paths(&self.secret_paths, &alias_overrides);
+        let mut secret_paths = canonicalize_secret_paths_against_layers(
+            &pending_secret_paths,
+            &layers,
+            &alias_overrides,
+        );
+
         let defaults_value =
             canonicalize_value_paths(&serde_json::to_value(&self.defaults)?, &metadata)?;
-        let merge_strategies = metadata.merge_strategies();
+        let default_known_paths = collect_known_paths_from_value(&defaults_value);
+        let pre_deserialize_suggestion_paths =
+            collect_suggestion_paths(&metadata, &default_known_paths);
 
-        let mut report = ConfigReport::new(defaults_value.clone(), self.secret_paths.clone());
+        let mut report = ConfigReport::new(
+            defaults_value.clone(),
+            secret_paths.clone(),
+            alias_overrides.clone(),
+        );
         let mut string_coercion_paths = BTreeSet::new();
 
         let mut merged = defaults_value;
         ensure_root_object(&merged)?;
 
         for layer in layers {
-            if matches!(
-                layer.trace.kind,
-                SourceKind::Environment | SourceKind::Arguments
-            ) {
-                collect_coercion_paths(&layer.value, "", &mut string_coercion_paths);
-            }
+            string_coercion_paths.extend(layer.coercible_string_paths.iter().cloned());
+            validate_indexed_array_paths(&merged, &layer)?;
             report.record_source(layer.trace.clone());
-            record_layer_steps(&mut report, &layer, &self.secret_paths);
+            record_layer_steps(&mut report, &layer, &secret_paths);
             record_deprecation_warnings(&mut report, &layer, &metadata);
             if !matches!(layer.trace.kind, SourceKind::Default) {
-                merge_values(&mut merged, layer.value, "", &merge_strategies);
+                merge_values(
+                    &mut merged,
+                    layer.value,
+                    "",
+                    &metadata,
+                    &layer.indexed_array_paths,
+                    &layer.direct_array_paths,
+                );
             }
         }
 
-        let mut config = deserialize_with_path(&merged, &report, &string_coercion_paths)?;
+        let mut config = match deserialize_with_path(&merged, &report, &string_coercion_paths) {
+            Ok(config) => config,
+            Err(error) => {
+                if !matches!(unknown_field_policy, UnknownFieldPolicy::Allow) {
+                    let mut unknown_fields = collect_unknown_fields_best_effort::<T>(
+                        &merged,
+                        &pre_deserialize_suggestion_paths,
+                        &report,
+                        &string_coercion_paths,
+                    );
+                    if unknown_fields.is_empty() && !metadata.fields().is_empty() {
+                        unknown_fields = collect_unknown_fields_from_metadata_scope(
+                            &merged,
+                            &metadata,
+                            &pre_deserialize_suggestion_paths,
+                            &report,
+                            deserialize_error_scope(error_path_for_scope(&error)),
+                        );
+                    }
+                    if !unknown_fields.is_empty() {
+                        return Err(ConfigError::UnknownFields {
+                            fields: unknown_fields,
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        };
         let known_paths = collect_known_paths(&config)?;
         let suggestion_paths = collect_suggestion_paths(&metadata, &known_paths);
         if !matches!(unknown_field_policy, UnknownFieldPolicy::Allow) {
@@ -712,19 +774,29 @@ where
                 message,
             })?;
             let after = serde_json::to_value(&config)?;
+            ensure_root_object(&after)?;
+            ensure_path_safe_keys(&after, "")?;
+            metadata = canonicalize_metadata_against_value(&metadata, &after);
+            alias_overrides = metadata.alias_overrides()?;
+            secret_paths = canonicalize_secret_paths_against_value(
+                &pending_secret_paths,
+                &after,
+                &alias_overrides,
+            );
             let trace = SourceTrace::new(SourceKind::Normalization, normalizer.name.clone());
             report.record_source(trace.clone());
-            record_diff_steps(&mut report, &before, &after, &trace, &self.secret_paths);
+            record_diff_steps(&mut report, &before, &after, &trace, &secret_paths);
         }
 
+        report.replace_runtime_metadata(secret_paths.clone(), alias_overrides.clone());
         let normalized_value =
             canonicalize_value_paths(&serde_json::to_value(&config)?, &metadata)?;
         let mut declared_errors =
-            validate_declared_rules(&normalized_value, &metadata, &self.secret_paths);
+            validate_declared_rules(&normalized_value, &metadata, &secret_paths);
         declared_errors.extend(validate_declared_checks(
             &normalized_value,
             &metadata,
-            &self.secret_paths,
+            &secret_paths,
         ));
         if !declared_errors.is_empty() {
             return Err(ConfigError::DeclaredValidation {
@@ -757,6 +829,114 @@ where
     }
 }
 
+fn validate_indexed_array_paths(base: &Value, layer: &Layer) -> Result<(), ConfigError> {
+    for path in &layer.indexed_array_paths {
+        let base_len = if let Some(base_len) = layer.indexed_array_base_lengths.get(path) {
+            *base_len
+        } else if layer.direct_array_paths.contains(path) {
+            continue;
+        } else {
+            match get_value_at_path(base, path) {
+                Some(Value::Array(values)) => values.len(),
+                _ => 0,
+            }
+        };
+
+        let mut explicit_indices = layer
+            .entries
+            .iter()
+            .filter_map(|(entry_path, _)| direct_child_array_index(path, entry_path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if explicit_indices.is_empty() {
+            continue;
+        }
+        explicit_indices.retain(|index| *index >= base_len);
+        if explicit_indices.is_empty() {
+            continue;
+        }
+
+        for (offset, index) in explicit_indices.iter().enumerate() {
+            let expected = base_len + offset;
+            if *index != expected {
+                return Err(sparse_indexed_array_error(layer, path, *index, expected));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn direct_child_array_index(container_path: &str, entry_path: &str) -> Option<usize> {
+    let remainder = if container_path.is_empty() {
+        entry_path
+    } else {
+        entry_path.strip_prefix(container_path)?.strip_prefix('.')?
+    };
+    remainder.split('.').next()?.parse::<usize>().ok()
+}
+
+fn sparse_indexed_array_error(
+    layer: &Layer,
+    container_path: &str,
+    offending_index: usize,
+    expected_index: usize,
+) -> ConfigError {
+    let offending_path = join_path(container_path, &offending_index.to_string());
+    let source = layer
+        .entries
+        .iter()
+        .filter(|(entry_path, _)| {
+            direct_child_array_index(container_path, entry_path) == Some(offending_index)
+        })
+        .max_by_key(|(entry_path, trace)| {
+            (
+                !is_generic_layer_trace(trace),
+                entry_path.split('.').count(),
+                entry_path.len(),
+            )
+        })
+        .or_else(|| {
+            layer
+                .entries
+                .iter()
+                .find(|(entry_path, _)| *entry_path == &offending_path)
+        });
+    let message = format!(
+        "sparse array override at `{container_path}`: index {offending_index} requires index {expected_index} to be provided first"
+    );
+
+    match source.map(|(_, trace)| trace) {
+        Some(trace) => match trace.kind {
+            SourceKind::Environment => ConfigError::InvalidEnv {
+                name: trace.name.clone(),
+                path: offending_path,
+                message,
+            },
+            SourceKind::Arguments => ConfigError::InvalidArg {
+                arg: trace.name.clone(),
+                message,
+            },
+            _ => ConfigError::InvalidArg {
+                arg: offending_path,
+                message,
+            },
+        },
+        None => ConfigError::InvalidArg {
+            arg: offending_path,
+            message,
+        },
+    }
+}
+
+fn is_generic_layer_trace(trace: &SourceTrace) -> bool {
+    matches!(
+        (trace.kind, trace.name.as_str()),
+        (SourceKind::Arguments, "arguments") | (SourceKind::Environment, "environment")
+    )
+}
+
 #[cfg(feature = "schema")]
 impl<T> ConfigLoader<T>
 where
@@ -780,9 +960,14 @@ impl EnvSource {
             separator,
             lowercase_segments,
         } = self;
-        let env_overrides = metadata.env_overrides();
+        let env_overrides = metadata.env_overrides()?;
         let mut root = Value::Object(Map::new());
         let mut entries = BTreeMap::new();
+        let mut coercible_string_paths = BTreeSet::new();
+        let mut indexed_array_paths = BTreeSet::new();
+        let mut indexed_array_base_lengths = BTreeMap::new();
+        let mut current_array_lengths = BTreeMap::new();
+        let mut direct_array_paths = BTreeSet::new();
 
         for (name, raw_value) in vars {
             let path = match env_overrides.get(&name) {
@@ -790,6 +975,11 @@ impl EnvSource {
                 None => {
                     let Some(path) =
                         path_for_env_var(&name, prefix.as_deref(), &separator, lowercase_segments)
+                            .map_err(|error| ConfigError::InvalidEnv {
+                                name: name.clone(),
+                                path: error.path,
+                                message: error.message,
+                            })?
                     else {
                         continue;
                     };
@@ -800,15 +990,42 @@ impl EnvSource {
                 continue;
             }
 
-            let value = parse_override_value(&raw_value);
+            let parsed =
+                parse_override_value(&raw_value).map_err(|message| ConfigError::InvalidEnv {
+                    name: name.clone(),
+                    path: path.clone(),
+                    message,
+                })?;
+            let is_direct_array = parsed.value.is_array();
             let segments = path.split('.').collect::<Vec<_>>();
-            insert_path(&mut root, &segments, value).map_err(|message| {
+            record_indexed_array_state(
+                &mut current_array_lengths,
+                &mut indexed_array_base_lengths,
+                &path,
+                &segments,
+            );
+            if is_direct_array {
+                record_direct_array_state(
+                    &mut current_array_lengths,
+                    &mut indexed_array_base_lengths,
+                    &path,
+                    &parsed.value,
+                );
+            }
+            insert_path(&mut root, &segments, parsed.value).map_err(|message| {
                 ConfigError::InvalidEnv {
                     name: name.clone(),
                     path: path.clone(),
                     message,
                 }
             })?;
+            if parsed.allow_string_coercion {
+                coercible_string_paths.insert(path.clone());
+            }
+            indexed_array_paths.extend(indexed_array_container_paths(&segments));
+            if is_direct_array {
+                direct_array_paths.insert(path.clone());
+            }
 
             entries.insert(
                 path.clone(),
@@ -822,9 +1039,12 @@ impl EnvSource {
                     prefix.push('.');
                 }
                 prefix.push_str(segment);
-                entries
+                let entry = entries
                     .entry(prefix.clone())
                     .or_insert_with(|| SourceTrace::new(SourceKind::Environment, name.clone()));
+                if prefix != path && entry.name != name {
+                    *entry = SourceTrace::new(SourceKind::Environment, "environment");
+                }
             }
         }
 
@@ -836,8 +1056,17 @@ impl EnvSource {
             trace: SourceTrace::new(SourceKind::Environment, "environment"),
             value: root,
             entries,
+            coercible_string_paths,
+            indexed_array_paths,
+            indexed_array_base_lengths,
+            direct_array_paths,
         }))
     }
+}
+
+struct DerivedEnvPathError {
+    path: String,
+    message: String,
 }
 
 fn path_for_env_var(
@@ -845,42 +1074,124 @@ fn path_for_env_var(
     prefix: Option<&str>,
     separator: &str,
     lowercase_segments: bool,
-) -> Option<String> {
-    let mut remainder = key;
-    if let Some(prefix) = prefix {
-        remainder = remainder.strip_prefix(prefix)?;
-        remainder = remainder.trim_start_matches('_');
-    }
+) -> Result<Option<String>, DerivedEnvPathError> {
+    let remainder = if let Some(prefix) = prefix {
+        let normalized = normalize_env_prefix(prefix, separator);
+        if normalized.is_empty() {
+            key
+        } else {
+            if key == normalized {
+                return Ok(None);
+            }
+            let Some(remainder) = key.strip_prefix(&normalized) else {
+                return Ok(None);
+            };
+            let boundary = if prefix.ends_with(separator) && !separator.is_empty() {
+                PrefixBoundary::SeparatorOnly
+            } else {
+                PrefixBoundary::Flexible
+            };
+            let Some(remainder) = parse_prefixed_env_remainder(remainder, separator, boundary)
+            else {
+                return Ok(None);
+            };
+            remainder
+        }
+    } else {
+        key
+    };
 
     if remainder.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut segments = Vec::new();
     for segment in remainder.split(separator) {
         if segment.is_empty() {
-            return None;
+            return Ok(None);
         }
         let segment = if lowercase_segments {
             segment.to_ascii_lowercase()
         } else {
             segment.to_owned()
         };
+        if let Some(message) = invalid_path_key_message(&segment) {
+            let mut path = segments.join(".");
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(&segment);
+            return Err(DerivedEnvPathError {
+                path,
+                message: format!(
+                    "environment variable segments must not contain reserved path syntax: {message}"
+                ),
+            });
+        }
         segments.push(segment);
     }
 
-    Some(segments.join("."))
+    Ok(Some(segments.join(".")))
+}
+
+#[derive(Clone, Copy)]
+enum PrefixBoundary {
+    SeparatorOnly,
+    Flexible,
+}
+
+fn parse_prefixed_env_remainder<'a>(
+    remainder: &'a str,
+    separator: &str,
+    boundary: PrefixBoundary,
+) -> Option<&'a str> {
+    let remainder = match boundary {
+        PrefixBoundary::SeparatorOnly => remainder.strip_prefix(separator)?,
+        PrefixBoundary::Flexible => {
+            if let Some(stripped) = remainder.strip_prefix(separator) {
+                stripped
+            } else if separator == "__" {
+                remainder.strip_prefix('_')?
+            } else {
+                return None;
+            }
+        }
+    };
+
+    (!remainder.is_empty()).then_some(remainder)
+}
+
+fn normalize_env_prefix(prefix: &str, separator: &str) -> String {
+    if prefix.is_empty() {
+        return String::new();
+    }
+
+    let mut normalized = prefix.to_owned();
+    if !separator.is_empty() {
+        while normalized.ends_with(separator) {
+            normalized.truncate(normalized.len() - separator.len());
+        }
+    }
+    if separator != "_" {
+        normalized = normalized.trim_end_matches('_').to_owned();
+    }
+    normalized
 }
 
 fn record_layer_steps(report: &mut ConfigReport, layer: &Layer, secret_paths: &BTreeSet<String>) {
+    report.record_step(
+        String::new(),
+        ResolutionStep {
+            source: layer.trace.clone(),
+            value: redact_value(&layer.value, "", secret_paths),
+            redacted: path_contains_secret(secret_paths, ""),
+        },
+    );
+
     for (path, trace) in &layer.entries {
         if let Some(value) = get_value_at_path(&layer.value, path) {
-            let redacted = is_secret_path(secret_paths, path);
-            let rendered = if redacted {
-                Value::String("***redacted***".to_owned())
-            } else {
-                value.clone()
-            };
+            let redacted = path_contains_secret(secret_paths, path);
+            let rendered = redact_value(value, path, secret_paths);
             report.record_step(
                 path.clone(),
                 ResolutionStep {
@@ -900,28 +1211,42 @@ fn record_diff_steps(
     trace: &SourceTrace,
     secret_paths: &BTreeSet<String>,
 ) {
+    if before != after {
+        report.record_step(
+            String::new(),
+            ResolutionStep {
+                source: trace.clone(),
+                value: redact_value(after, "", secret_paths),
+                redacted: path_contains_secret(secret_paths, ""),
+            },
+        );
+    }
+
     let mut paths = Vec::new();
     collect_diff_paths(before, after, "", &mut paths);
     paths.sort();
     paths.dedup();
 
     for path in paths {
-        if let Some(value) = get_value_at_path(after, &path) {
-            let redacted = is_secret_path(secret_paths, &path);
-            let rendered = if redacted {
-                Value::String("***redacted***".to_owned())
-            } else {
-                value.clone()
-            };
-            report.record_step(
-                path,
-                ResolutionStep {
-                    source: trace.clone(),
-                    value: rendered,
-                    redacted,
-                },
-            );
+        let after_value = get_value_at_path(after, &path).cloned();
+        let removed = after_value.is_none() && get_value_at_path(before, &path).is_some();
+        if !removed && after_value.is_none() {
+            continue;
         }
+
+        let redacted = path_contains_secret(secret_paths, &path);
+        let rendered = match after_value {
+            Some(value) => redact_value(&value, &path, secret_paths),
+            None => Value::Null,
+        };
+        report.record_step(
+            path,
+            ResolutionStep {
+                source: trace.clone(),
+                value: rendered,
+                redacted,
+            },
+        );
     }
 }
 
@@ -950,10 +1275,9 @@ fn record_deprecation_warnings(
 
     let mut warned = BTreeSet::new();
     for field in deprecated {
-        let prefix = format!("{}.", field.path);
         let used = used_paths
             .iter()
-            .any(|path| path == &field.path || path.starts_with(&prefix));
+            .any(|path| path_starts_with_pattern(path, &field.path));
         if used && warned.insert(field.path.clone()) {
             report.record_warning(ConfigWarning::DeprecatedField(
                 DeprecatedField::new(field.path.clone())
@@ -965,99 +1289,395 @@ fn record_deprecation_warnings(
 }
 
 fn canonicalize_layer_paths(layer: Layer, metadata: &ConfigMetadata) -> Result<Layer, ConfigError> {
-    let aliases = metadata.alias_overrides();
-    if aliases.is_empty() {
-        return Ok(layer);
-    }
-
-    let value = canonicalize_value_paths(&layer.value, metadata)?;
-    if value == layer.value {
-        return Ok(layer);
-    }
+    let raw_value = layer.value;
+    let aliases = canonicalize_alias_overrides_against_value(metadata, &raw_value)?;
+    let value = canonicalize_value_paths_with_aliases(&raw_value, &aliases)?;
 
     let entries = layer
         .entries
         .into_iter()
-        .map(|(path, trace)| (aliases.get(&path).cloned().unwrap_or(path), trace))
+        .map(|(path, trace)| (canonicalize_layer_path(&raw_value, &path, &aliases), trace))
+        .collect();
+    let coercible_string_paths = layer
+        .coercible_string_paths
+        .into_iter()
+        .map(|path| canonicalize_layer_path(&raw_value, &path, &aliases))
+        .collect();
+    let indexed_array_paths = layer
+        .indexed_array_paths
+        .into_iter()
+        .map(|path| canonicalize_layer_path(&raw_value, &path, &aliases))
+        .collect();
+    let indexed_array_base_lengths = layer
+        .indexed_array_base_lengths
+        .into_iter()
+        .map(|(path, length)| (canonicalize_layer_path(&raw_value, &path, &aliases), length))
+        .collect();
+    let direct_array_paths = layer
+        .direct_array_paths
+        .into_iter()
+        .map(|path| canonicalize_layer_path(&raw_value, &path, &aliases))
         .collect();
 
     Ok(Layer {
         trace: layer.trace,
         value,
         entries,
+        coercible_string_paths,
+        indexed_array_paths,
+        indexed_array_base_lengths,
+        direct_array_paths,
     })
+}
+
+fn canonicalize_alias_overrides_against_value(
+    metadata: &ConfigMetadata,
+    value: &Value,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let aliases = metadata.alias_overrides()?;
+    let mut canonicalized = BTreeMap::new();
+
+    for (alias, canonical) in aliases {
+        let alias = canonicalize_runtime_path(value, &alias);
+        let canonical = canonicalize_runtime_path(value, &canonical);
+        if alias == canonical {
+            continue;
+        }
+        if let Some(first_path) = canonicalized.insert(alias.clone(), canonical.clone())
+            && first_path != canonical
+        {
+            return Err(ConfigError::MetadataConflict {
+                kind: "alias",
+                name: alias,
+                first_path,
+                second_path: canonical,
+            });
+        }
+    }
+
+    Ok(canonicalized)
+}
+
+fn canonicalize_layer_path(
+    value: &Value,
+    path: &str,
+    aliases: &BTreeMap<String, String>,
+) -> String {
+    let runtime = canonicalize_runtime_path(value, path);
+    canonicalize_path_with_aliases(&runtime, aliases)
+}
+
+fn canonicalize_runtime_path(value: &Value, path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+
+    let segments = path.split('.').collect::<Vec<_>>();
+    let mut current = value;
+    let mut canonical = Vec::new();
+    let mut index = 0;
+    while index < segments.len() {
+        let segment = segments[index];
+        match current {
+            Value::Object(map) => {
+                canonical.push(segment.to_owned());
+                let Some(next) = map.get(segment) else {
+                    canonical.extend(
+                        segments[index + 1..]
+                            .iter()
+                            .map(|segment| (*segment).to_owned()),
+                    );
+                    break;
+                };
+                current = next;
+            }
+            Value::Array(values) => {
+                let Ok(array_index) = segment.parse::<usize>() else {
+                    canonical.push(segment.to_owned());
+                    canonical.extend(
+                        segments[index + 1..]
+                            .iter()
+                            .map(|segment| (*segment).to_owned()),
+                    );
+                    break;
+                };
+                canonical.push(array_index.to_string());
+                let Some(next) = values.get(array_index) else {
+                    canonical.extend(
+                        segments[index + 1..]
+                            .iter()
+                            .map(|segment| (*segment).to_owned()),
+                    );
+                    break;
+                };
+                current = next;
+            }
+            _ => {
+                canonical.push(segment.to_owned());
+                canonical.extend(
+                    segments[index + 1..]
+                        .iter()
+                        .map(|segment| (*segment).to_owned()),
+                );
+                break;
+            }
+        }
+        index += 1;
+    }
+
+    canonical.join(".")
+}
+
+fn canonicalize_secret_paths(
+    secret_paths: &BTreeSet<String>,
+    aliases: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    secret_paths
+        .iter()
+        .map(|path| canonicalize_path_with_aliases(path, aliases))
+        .collect()
+}
+
+fn canonicalize_metadata_against_layers(
+    metadata: &ConfigMetadata,
+    layers: &[Layer],
+) -> ConfigMetadata {
+    let fields = metadata.fields().iter().cloned().map(|mut field| {
+        field.path = canonicalize_runtime_path_across_layers(&field.path, layers);
+        field.aliases = canonicalize_runtime_paths_across_layers(field.aliases, layers);
+        field
+    });
+    let checks = metadata
+        .checks()
+        .iter()
+        .cloned()
+        .map(|check| canonicalize_check_against_layers(check, layers));
+
+    let mut resolved = ConfigMetadata::new();
+    resolved.extend_fields(fields);
+    resolved.extend_checks(checks);
+    resolved
+}
+
+fn canonicalize_secret_paths_against_layers(
+    secret_paths: &BTreeSet<String>,
+    layers: &[Layer],
+    aliases: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    secret_paths
+        .iter()
+        .map(|path| {
+            layers.iter().fold(path.clone(), |current, layer| {
+                canonicalize_layer_path(&layer.value, &current, aliases)
+            })
+        })
+        .collect()
+}
+
+fn canonicalize_metadata_against_value(metadata: &ConfigMetadata, value: &Value) -> ConfigMetadata {
+    let fields = metadata.fields().iter().cloned().map(|mut field| {
+        field.path = canonicalize_runtime_path(value, &field.path);
+        field.aliases = canonicalize_runtime_paths_against_value(field.aliases, value);
+        field
+    });
+    let checks = metadata
+        .checks()
+        .iter()
+        .cloned()
+        .map(|check| canonicalize_check_against_value(check, value));
+
+    let mut resolved = ConfigMetadata::new();
+    resolved.extend_fields(fields);
+    resolved.extend_checks(checks);
+    resolved
+}
+
+fn canonicalize_secret_paths_against_value(
+    secret_paths: &BTreeSet<String>,
+    value: &Value,
+    aliases: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    secret_paths
+        .iter()
+        .map(|path| canonicalize_layer_path(value, path, aliases))
+        .collect()
+}
+
+fn canonicalize_runtime_paths_against_value<I>(paths: I, value: &Value) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut canonicalized = Vec::new();
+    for path in paths {
+        let canonical = canonicalize_runtime_path(value, &path);
+        if canonical.is_empty() || canonicalized.contains(&canonical) {
+            continue;
+        }
+        canonicalized.push(canonical);
+    }
+    canonicalized
+}
+
+fn canonicalize_runtime_paths_across_layers<I>(paths: I, layers: &[Layer]) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut canonicalized = Vec::new();
+    for path in paths {
+        let canonical = canonicalize_runtime_path_across_layers(&path, layers);
+        if canonical.is_empty() || canonicalized.contains(&canonical) {
+            continue;
+        }
+        canonicalized.push(canonical);
+    }
+    canonicalized
+}
+
+fn canonicalize_runtime_path_across_layers(path: &str, layers: &[Layer]) -> String {
+    layers.iter().fold(normalize_path(path), |current, layer| {
+        canonicalize_runtime_path(&layer.value, &current)
+    })
+}
+
+fn canonicalize_check_against_layers(check: ValidationCheck, layers: &[Layer]) -> ValidationCheck {
+    match check {
+        ValidationCheck::AtLeastOneOf { paths } => ValidationCheck::AtLeastOneOf {
+            paths: canonicalize_runtime_paths_across_layers(paths, layers),
+        },
+        ValidationCheck::ExactlyOneOf { paths } => ValidationCheck::ExactlyOneOf {
+            paths: canonicalize_runtime_paths_across_layers(paths, layers),
+        },
+        ValidationCheck::MutuallyExclusive { paths } => ValidationCheck::MutuallyExclusive {
+            paths: canonicalize_runtime_paths_across_layers(paths, layers),
+        },
+        ValidationCheck::RequiredWith { path, requires } => ValidationCheck::RequiredWith {
+            path: canonicalize_runtime_path_across_layers(&path, layers),
+            requires: canonicalize_runtime_paths_across_layers(requires, layers),
+        },
+        ValidationCheck::RequiredIf {
+            path,
+            equals,
+            requires,
+        } => ValidationCheck::RequiredIf {
+            path: canonicalize_runtime_path_across_layers(&path, layers),
+            equals,
+            requires: canonicalize_runtime_paths_across_layers(requires, layers),
+        },
+    }
+}
+
+fn canonicalize_check_against_value(check: ValidationCheck, value: &Value) -> ValidationCheck {
+    match check {
+        ValidationCheck::AtLeastOneOf { paths } => ValidationCheck::AtLeastOneOf {
+            paths: canonicalize_runtime_paths_against_value(paths, value),
+        },
+        ValidationCheck::ExactlyOneOf { paths } => ValidationCheck::ExactlyOneOf {
+            paths: canonicalize_runtime_paths_against_value(paths, value),
+        },
+        ValidationCheck::MutuallyExclusive { paths } => ValidationCheck::MutuallyExclusive {
+            paths: canonicalize_runtime_paths_against_value(paths, value),
+        },
+        ValidationCheck::RequiredWith { path, requires } => ValidationCheck::RequiredWith {
+            path: canonicalize_runtime_path(value, &path),
+            requires: canonicalize_runtime_paths_against_value(requires, value),
+        },
+        ValidationCheck::RequiredIf {
+            path,
+            equals,
+            requires,
+        } => ValidationCheck::RequiredIf {
+            path: canonicalize_runtime_path(value, &path),
+            equals,
+            requires: canonicalize_runtime_paths_against_value(requires, value),
+        },
+    }
 }
 
 fn canonicalize_value_paths(
     value: &Value,
     metadata: &ConfigMetadata,
 ) -> Result<Value, ConfigError> {
-    let aliases = metadata.alias_overrides();
+    ensure_root_object(value)?;
+    ensure_path_safe_keys(value, "")?;
+
+    let aliases = metadata.alias_overrides()?;
+    canonicalize_value_paths_with_aliases(value, &aliases)
+}
+
+fn canonicalize_value_paths_with_aliases(
+    value: &Value,
+    aliases: &BTreeMap<String, String>,
+) -> Result<Value, ConfigError> {
+    ensure_root_object(value)?;
+    ensure_path_safe_keys(value, "")?;
     if aliases.is_empty() {
         return Ok(value.clone());
     }
 
-    ensure_root_object(value)?;
     let mut canonical = Value::Object(Map::new());
-    canonicalize_object(value, "", "", &aliases, &mut canonical)?;
+    let mut nodes = Vec::new();
+    collect_value_nodes(value, "", &mut nodes);
+    let mut seen = BTreeMap::<String, String>::new();
+
+    for (path, node) in nodes {
+        let canonical_path = canonicalize_path_with_aliases(&path, aliases);
+        if let Some(first_path) = seen.get(&canonical_path)
+            && first_path != &path
+        {
+            return Err(ConfigError::PathConflict {
+                first_path: first_path.clone(),
+                second_path: path,
+                canonical_path,
+            });
+        }
+        seen.insert(canonical_path.clone(), path);
+        let segments = canonical_path.split('.').collect::<Vec<_>>();
+        insert_path(&mut canonical, &segments, node).map_err(|message| {
+            ConfigError::InvalidArg {
+                arg: canonical_path.clone(),
+                message,
+            }
+        })?;
+    }
+
     Ok(canonical)
 }
 
-fn canonicalize_object(
-    value: &Value,
-    input_current: &str,
-    canonical_current: &str,
-    aliases: &BTreeMap<String, String>,
-    root: &mut Value,
-) -> Result<(), ConfigError> {
+fn collect_value_nodes(value: &Value, current: &str, nodes: &mut Vec<(String, Value)>) {
     match value {
-        Value::Object(map) if map.is_empty() && !canonical_current.is_empty() => {
-            let segments = canonical_current.split('.').collect::<Vec<_>>();
-            insert_path(root, &segments, Value::Object(Map::new())).map_err(|message| {
-                ConfigError::InvalidArg {
-                    arg: canonical_current.to_owned(),
-                    message,
-                }
-            })?;
+        Value::Object(map) if map.is_empty() && !current.is_empty() => {
+            nodes.push((current.to_owned(), Value::Object(Map::new())));
         }
         Value::Object(map) => {
             for (key, child) in map {
-                let input_path = join_path(input_current, key);
-                let default_canonical_path = join_path(canonical_current, key);
-                let canonical_path = aliases
-                    .get(&input_path)
-                    .cloned()
-                    .unwrap_or(default_canonical_path);
-                match child {
-                    Value::Object(_) => {
-                        canonicalize_object(child, &input_path, &canonical_path, aliases, root)?;
-                    }
-                    _ => {
-                        let segments = canonical_path.split('.').collect::<Vec<_>>();
-                        insert_path(root, &segments, child.clone()).map_err(|message| {
-                            ConfigError::InvalidArg {
-                                arg: canonical_path.clone(),
-                                message,
-                            }
-                        })?;
-                    }
-                }
+                let next = join_path(current, key);
+                collect_value_nodes(child, &next, nodes);
             }
         }
-        _ => {
-            return Err(ConfigError::RootMustBeObject {
-                actual: value_kind(value),
-            });
+        Value::Array(values) if values.is_empty() && !current.is_empty() => {
+            nodes.push((current.to_owned(), Value::Array(Vec::new())));
         }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                let next = join_path(current, &index.to_string());
+                collect_value_nodes(child, &next, nodes);
+            }
+        }
+        _ if !current.is_empty() => nodes.push((current.to_owned(), value.clone())),
+        _ => {}
     }
-
-    Ok(())
 }
 
 fn is_secret_path(secret_paths: &BTreeSet<String>, path: &str) -> bool {
     secret_paths
         .iter()
-        .any(|secret| path == secret || path.starts_with(&format!("{secret}.")))
+        .any(|secret| path_starts_with_pattern(path, secret))
+}
+
+fn path_contains_secret(secret_paths: &BTreeSet<String>, path: &str) -> bool {
+    secret_paths
+        .iter()
+        .any(|secret| path_overlaps_pattern(path, secret))
 }
 
 fn validate_declared_rules(
@@ -1071,12 +1691,17 @@ fn validate_declared_rules(
         if field.validations.is_empty() || field.path.is_empty() {
             continue;
         }
-        let Some(actual) = get_value_at_path(value, &field.path) else {
+        let matches = collect_matching_values(value, &field.path);
+        if matches.is_empty() {
             continue;
-        };
+        }
         for rule in &field.validations {
-            if let Some(error) = validate_declared_rule(&field.path, actual, rule, secret_paths) {
-                errors.push(error);
+            for (matched_path, actual) in &matches {
+                if let Some(error) =
+                    validate_declared_rule(matched_path, actual, rule, secret_paths)
+                {
+                    errors.push(error);
+                }
             }
         }
     }
@@ -1133,16 +1758,24 @@ fn validate_declared_checks(
                 }
             }
             ValidationCheck::RequiredWith { path, requires } => {
-                if path_is_present(value, path) {
-                    let missing = missing_paths(value, requires);
+                for (matched_path, _) in collect_matching_values(value, path)
+                    .into_iter()
+                    .filter(|(_, actual)| is_present_value(actual))
+                {
+                    let bound_requires = bind_required_paths(path, &matched_path, requires)
+                        .unwrap_or_else(|| requires.to_vec());
+                    let missing = missing_paths(value, &bound_requires);
                     if !missing.is_empty() {
                         errors.push(group_validation_error(
                             check,
-                            std::iter::once(path.as_str())
+                            std::iter::once(matched_path.as_str())
                                 .chain(missing.iter().map(String::as_str)),
                             secret_paths,
-                            &format!("{} requires {}", path, missing.join(", ")),
-                            Some(serde_json::json!({ "trigger": path, "requires": requires })),
+                            &format!("{matched_path} requires {}", missing.join(", ")),
+                            Some(serde_json::json!({
+                                "trigger": matched_path,
+                                "requires": bound_requires
+                            })),
                             Some(serde_json::json!({ "missing": missing })),
                         ));
                     }
@@ -1153,21 +1786,28 @@ fn validate_declared_checks(
                 equals,
                 requires,
             } => {
-                let matches =
-                    get_value_at_path(value, path).is_some_and(|actual| actual == &equals.0);
-                if matches {
-                    let missing = missing_paths(value, requires);
+                for (matched_path, _) in collect_matching_values(value, path)
+                    .into_iter()
+                    .filter(|(_, actual)| *actual == &equals.0)
+                {
+                    let bound_requires = bind_required_paths(path, &matched_path, requires)
+                        .unwrap_or_else(|| requires.to_vec());
+                    let missing = missing_paths(value, &bound_requires);
                     if !missing.is_empty() {
                         errors.push(group_validation_error(
                             check,
-                            std::iter::once(path.as_str())
+                            std::iter::once(matched_path.as_str())
                                 .chain(missing.iter().map(String::as_str)),
                             secret_paths,
-                            &format!("{} == {} requires {}", path, equals, missing.join(", ")),
+                            &format!(
+                                "{matched_path} == {} requires {}",
+                                equals,
+                                missing.join(", ")
+                            ),
                             Some(serde_json::json!({
-                                "trigger": path,
+                                "trigger": matched_path,
                                 "equals": equals,
-                                "requires": requires
+                                "requires": bound_requires
                             })),
                             Some(serde_json::json!({ "missing": missing })),
                         ));
@@ -1478,8 +2118,127 @@ where
     error
 }
 
+fn collect_matching_values<'a>(value: &'a Value, path: &str) -> Vec<(String, &'a Value)> {
+    let normalized = normalize_path(path);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let segments = normalized.split('.').collect::<Vec<_>>();
+    let mut matches = Vec::new();
+    collect_matching_values_recursive(value, "", &segments, 0, &mut matches);
+    matches
+}
+
+fn bind_required_paths(
+    trigger_pattern: &str,
+    matched_path: &str,
+    requires: &[String],
+) -> Option<Vec<String>> {
+    let bindings = wildcard_bindings(trigger_pattern, matched_path)?;
+    Some(
+        requires
+            .iter()
+            .map(|path| apply_wildcard_bindings(path, &bindings))
+            .collect(),
+    )
+}
+
+fn wildcard_bindings(pattern: &str, matched_path: &str) -> Option<Vec<String>> {
+    let pattern_segments = pattern
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let path_segments = matched_path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if pattern_segments.len() != path_segments.len() {
+        return None;
+    }
+
+    let mut bindings = Vec::new();
+    for (expected, actual) in pattern_segments.iter().zip(path_segments.iter()) {
+        if *expected == "*" {
+            bindings.push((*actual).to_owned());
+        } else if expected != actual {
+            return None;
+        }
+    }
+
+    Some(bindings)
+}
+
+fn apply_wildcard_bindings(pattern: &str, bindings: &[String]) -> String {
+    let mut binding_index = 0;
+    pattern
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if segment == "*" {
+                let resolved = bindings
+                    .get(binding_index)
+                    .cloned()
+                    .unwrap_or_else(|| "*".to_owned());
+                binding_index += 1;
+                resolved
+            } else {
+                segment.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn collect_matching_values_recursive<'a>(
+    value: &'a Value,
+    current: &str,
+    segments: &[&str],
+    index: usize,
+    matches: &mut Vec<(String, &'a Value)>,
+) {
+    if index == segments.len() {
+        matches.push((current.to_owned(), value));
+        return;
+    }
+
+    let segment = segments[index];
+    match (segment, value) {
+        ("*", Value::Object(map)) => {
+            for (key, child) in map {
+                let next = join_path(current, key);
+                collect_matching_values_recursive(child, &next, segments, index + 1, matches);
+            }
+        }
+        ("*", Value::Array(values)) => {
+            for (child_index, child) in values.iter().enumerate() {
+                let next = join_path(current, &child_index.to_string());
+                collect_matching_values_recursive(child, &next, segments, index + 1, matches);
+            }
+        }
+        (_, Value::Object(map)) => {
+            if let Some(child) = map.get(segment) {
+                let next = join_path(current, segment);
+                collect_matching_values_recursive(child, &next, segments, index + 1, matches);
+            }
+        }
+        (_, Value::Array(values)) => {
+            if let Ok(child_index) = segment.parse::<usize>()
+                && let Some(child) = values.get(child_index)
+            {
+                let next = join_path(current, segment);
+                collect_matching_values_recursive(child, &next, segments, index + 1, matches);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn path_is_present(value: &Value, path: &str) -> bool {
-    get_value_at_path(value, path).is_some_and(is_present_value)
+    collect_matching_values(value, path)
+        .iter()
+        .any(|(_, value)| is_present_value(value))
 }
 
 fn present_paths(value: &Value, paths: &[String]) -> Vec<String> {
@@ -1531,8 +2290,9 @@ fn redact_group_value_recursive(
             }
         }
         Value::Array(values) => {
-            for child in values {
-                redact_group_value_recursive(child, current, related_paths, secret_paths);
+            for (index, child) in values.iter_mut().enumerate() {
+                let next = join_path(current, &index.to_string());
+                redact_group_value_recursive(child, &next, related_paths, secret_paths);
             }
         }
         _ => {}
@@ -1561,6 +2321,11 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
     let mut profile = None;
     let mut root = Value::Object(Map::new());
     let mut entries = BTreeMap::new();
+    let mut coercible_string_paths = BTreeSet::new();
+    let mut indexed_array_paths = BTreeSet::new();
+    let mut indexed_array_base_lengths = BTreeMap::new();
+    let mut current_array_lengths = BTreeMap::new();
+    let mut direct_array_paths = BTreeSet::new();
 
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--config=") {
@@ -1602,14 +2367,18 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
             continue;
         };
 
-        let (path, raw_value) =
+        let (raw_path, raw_value) =
             set_value
                 .split_once('=')
                 .ok_or_else(|| ConfigError::InvalidArg {
                     arg: set_value.clone(),
                     message: "expected key=value".to_owned(),
                 })?;
-        let path = normalize_path(path);
+        let path =
+            try_normalize_external_path(raw_path).map_err(|message| ConfigError::InvalidArg {
+                arg: format!("--set {raw_path}={raw_value}"),
+                message,
+            })?;
         if path.is_empty() {
             return Err(ConfigError::InvalidArg {
                 arg: set_value,
@@ -1618,16 +2387,44 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
         }
 
         let segments = path.split('.').collect::<Vec<_>>();
-        insert_path(&mut root, &segments, parse_override_value(raw_value)).map_err(|message| {
+        let parsed =
+            parse_override_value(raw_value).map_err(|message| ConfigError::InvalidArg {
+                arg: format!("--set {path}={raw_value}"),
+                message,
+            })?;
+        let is_direct_array = parsed.value.is_array();
+        record_indexed_array_state(
+            &mut current_array_lengths,
+            &mut indexed_array_base_lengths,
+            &path,
+            &segments,
+        );
+        if is_direct_array {
+            record_direct_array_state(
+                &mut current_array_lengths,
+                &mut indexed_array_base_lengths,
+                &path,
+                &parsed.value,
+            );
+        }
+        insert_path(&mut root, &segments, parsed.value).map_err(|message| {
             ConfigError::InvalidArg {
                 arg: format!("--set {path}={raw_value}"),
                 message,
             }
         })?;
+        if parsed.allow_string_coercion {
+            coercible_string_paths.insert(path.clone());
+        }
+        indexed_array_paths.extend(indexed_array_container_paths(&segments));
+        if is_direct_array {
+            direct_array_paths.insert(path.clone());
+        }
 
+        let arg_trace_name = format!("--set {raw_path}={raw_value}");
         entries.insert(
             path.clone(),
-            SourceTrace::new(SourceKind::Arguments, format!("--set {path}={raw_value}")),
+            SourceTrace::new(SourceKind::Arguments, arg_trace_name.clone()),
         );
 
         let mut prefix = String::new();
@@ -1636,9 +2433,12 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
                 prefix.push('.');
             }
             prefix.push_str(segment);
-            entries.entry(prefix.clone()).or_insert_with(|| {
-                SourceTrace::new(SourceKind::Arguments, format!("--set {path}={raw_value}"))
-            });
+            let entry = entries
+                .entry(prefix.clone())
+                .or_insert_with(|| SourceTrace::new(SourceKind::Arguments, arg_trace_name.clone()));
+            if prefix != path && entry.name != arg_trace_name {
+                *entry = SourceTrace::new(SourceKind::Arguments, "arguments");
+            }
         }
     }
 
@@ -1649,6 +2449,10 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
             trace: SourceTrace::new(SourceKind::Arguments, "arguments"),
             value: root,
             entries,
+            coercible_string_paths,
+            indexed_array_paths,
+            indexed_array_base_lengths,
+            direct_array_paths,
         })
     };
 
@@ -1720,9 +2524,13 @@ where
     T: Serialize,
 {
     let value = serde_json::to_value(config)?;
+    Ok(collect_known_paths_from_value(&value))
+}
+
+fn collect_known_paths_from_value(value: &Value) -> BTreeSet<String> {
     let mut paths = Vec::new();
-    collect_paths(&value, "", &mut paths);
-    Ok(paths.into_iter().collect())
+    collect_paths(value, "", &mut paths);
+    paths.into_iter().collect()
 }
 
 fn collect_suggestion_paths(
@@ -1753,6 +2561,87 @@ fn collect_suggestion_paths(
     candidates
 }
 
+fn collect_unknown_fields_from_metadata_scope(
+    value: &Value,
+    metadata: &ConfigMetadata,
+    suggestion_paths: &BTreeMap<String, String>,
+    report: &ConfigReport,
+    scope: Option<String>,
+) -> Vec<UnknownField> {
+    let patterns = metadata_pattern_paths(metadata);
+    let mut paths = Vec::new();
+    collect_paths(value, "", &mut paths);
+    paths.sort();
+    paths.dedup();
+
+    paths
+        .into_iter()
+        .filter(|path| {
+            scope
+                .as_ref()
+                .is_none_or(|scope| path == scope || path.starts_with(&format!("{scope}.")))
+        })
+        .filter(|path| !path_is_covered_by_patterns(path, &patterns))
+        .map(|path| {
+            let source = find_source_for_unknown_path(report, &path);
+            let suggestion = best_path_suggestion(&path, suggestion_paths);
+            UnknownField::new(path)
+                .with_source(source)
+                .with_suggestion(suggestion)
+        })
+        .collect()
+}
+
+fn error_path_for_scope(error: &ConfigError) -> Option<&str> {
+    match error {
+        ConfigError::Deserialize { path, .. } => Some(path.as_str()),
+        _ => None,
+    }
+}
+
+fn deserialize_error_scope(path: Option<&str>) -> Option<String> {
+    let normalized = path.map(normalize_external_path)?;
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn metadata_pattern_paths(metadata: &ConfigMetadata) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for field in metadata.fields() {
+        patterns.push(field.path.clone());
+        patterns.extend(field.aliases.iter().cloned());
+    }
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+fn path_is_covered_by_patterns(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        path_matches_pattern(path, pattern) || path_is_prefix_of_pattern(path, pattern)
+    })
+}
+
+fn path_is_prefix_of_pattern(prefix: &str, pattern: &str) -> bool {
+    let prefix_segments = prefix
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let pattern_segments = pattern
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    prefix_segments.len() <= pattern_segments.len()
+        && prefix_segments
+            .iter()
+            .zip(pattern_segments.iter())
+            .all(|(actual, expected)| *expected == "*" || actual == expected)
+}
+
 fn collect_unknown_fields<T>(
     value: &Value,
     suggestion_paths: &BTreeMap<String, String>,
@@ -1762,22 +2651,119 @@ fn collect_unknown_fields<T>(
 where
     T: DeserializeOwned,
 {
-    let mut ignored = Vec::new();
-    let deserializer = CoercingDeserializer::new(value, "", string_coercion_paths);
-    let result: Result<T, ValueDeError> = serde_ignored::deserialize(deserializer, |path| {
-        ignored.push(normalize_external_path(&path.to_string()))
-    });
-    result.map_err(|error| ConfigError::Deserialize {
+    let scan = scan_unknown_field_paths_with_retry::<T>(value, string_coercion_paths);
+    scan.result.map_err(|error| ConfigError::Deserialize {
         path: "<unknown>".to_owned(),
         provenance: None,
         message: error.to_string(),
     })?;
 
+    Ok(unknown_fields_from_paths(
+        scan.ignored,
+        &merge_suggestion_paths(suggestion_paths, &scan.known_paths),
+        report,
+    ))
+}
+
+fn collect_unknown_fields_best_effort<T>(
+    value: &Value,
+    suggestion_paths: &BTreeMap<String, String>,
+    report: &ConfigReport,
+    string_coercion_paths: &BTreeSet<String>,
+) -> Vec<UnknownField>
+where
+    T: DeserializeOwned,
+{
+    let scan = scan_unknown_field_paths_with_retry::<T>(value, string_coercion_paths);
+    unknown_fields_from_paths(
+        scan.ignored,
+        &merge_suggestion_paths(suggestion_paths, &scan.known_paths),
+        report,
+    )
+}
+
+struct UnknownFieldScan<T> {
+    ignored: Vec<String>,
+    known_paths: BTreeSet<String>,
+    result: Result<T, ValueDeError>,
+}
+
+fn scan_unknown_field_paths<T>(
+    value: &Value,
+    string_coercion_paths: &BTreeSet<String>,
+) -> UnknownFieldScan<T>
+where
+    T: DeserializeOwned,
+{
+    let ignored = RefCell::new(Vec::new());
+    let known_paths = RefCell::new(BTreeSet::new());
+    let deserializer = CoercingDeserializer::new(
+        value,
+        "",
+        string_coercion_paths,
+        Some(&known_paths),
+        Some(&ignored),
+    );
+    let result = serde_ignored::deserialize(deserializer, |path| {
+        ignored
+            .borrow_mut()
+            .push(normalize_external_path(&path.to_string()))
+    });
+    let mut ignored = ignored.into_inner();
     ignored.sort();
     ignored.dedup();
+    UnknownFieldScan {
+        ignored,
+        known_paths: known_paths.into_inner(),
+        result,
+    }
+}
 
-    Ok(ignored
+fn scan_unknown_field_paths_with_retry<T>(
+    value: &Value,
+    string_coercion_paths: &BTreeSet<String>,
+) -> UnknownFieldScan<T>
+where
+    T: DeserializeOwned,
+{
+    let scan = scan_unknown_field_paths::<T>(value, string_coercion_paths);
+    if scan.result.is_ok() {
+        return scan;
+    }
+
+    let retry_value = coerce_retry_scalars(value, "", string_coercion_paths);
+    if retry_value == *value {
+        return scan;
+    }
+
+    let retry_scan = scan_unknown_field_paths::<T>(&retry_value, string_coercion_paths);
+    if retry_scan.result.is_ok() {
+        retry_scan
+    } else {
+        scan
+    }
+}
+
+fn merge_suggestion_paths(
+    base: &BTreeMap<String, String>,
+    known_paths: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut merged = base.clone();
+    for path in known_paths {
+        merged.entry(path.clone()).or_insert_with(|| path.clone());
+    }
+    merged
+}
+
+fn unknown_fields_from_paths(
+    paths: Vec<String>,
+    suggestion_paths: &BTreeMap<String, String>,
+    report: &ConfigReport,
+) -> Vec<UnknownField> {
+    paths
         .into_iter()
+        .map(|path| normalize_external_path(&path))
+        .filter(|path| !suggestion_paths.contains_key(path))
         .map(|path| {
             let source = find_source_for_unknown_path(report, &path);
             let suggestion = best_path_suggestion(&path, suggestion_paths);
@@ -1785,7 +2771,7 @@ where
                 .with_source(source)
                 .with_suggestion(suggestion)
         })
-        .collect())
+        .collect()
 }
 
 fn find_source_for_unknown_path(report: &ConfigReport, path: &str) -> Option<SourceTrace> {
@@ -1814,9 +2800,13 @@ fn best_path_suggestion(path: &str, suggestion_paths: &BTreeMap<String, String>)
 
     let mut sibling_best: Option<(usize, String)> = None;
     for (candidate, canonical) in suggestion_paths {
-        let (candidate_parent, candidate_leaf) = candidate
+        let display_candidate = materialize_pattern_for_path(candidate, &normalized);
+        let display_canonical = materialize_pattern_for_path(canonical, &normalized);
+        let (candidate_parent, candidate_leaf) = display_candidate
             .rsplit_once('.')
-            .map_or(("", candidate.as_str()), |(parent, leaf)| (parent, leaf));
+            .map_or(("", display_candidate.as_str()), |(parent, leaf)| {
+                (parent, leaf)
+            });
         if candidate_parent != parent {
             continue;
         }
@@ -1825,9 +2815,9 @@ fn best_path_suggestion(path: &str, suggestion_paths: &BTreeMap<String, String>)
         match &mut sibling_best {
             Some((best_distance, best_candidate)) if distance < *best_distance => {
                 *best_distance = distance;
-                *best_candidate = canonical.clone();
+                *best_candidate = display_canonical.clone();
             }
-            None => sibling_best = Some((distance, canonical.clone())),
+            None => sibling_best = Some((distance, display_canonical.clone())),
             _ => {}
         }
     }
@@ -1840,13 +2830,15 @@ fn best_path_suggestion(path: &str, suggestion_paths: &BTreeMap<String, String>)
 
     let mut best: Option<(usize, String)> = None;
     for (candidate, canonical) in suggestion_paths {
-        let distance = levenshtein(&normalized, candidate);
+        let display_candidate = materialize_pattern_for_path(candidate, &normalized);
+        let display_canonical = materialize_pattern_for_path(canonical, &normalized);
+        let distance = levenshtein(&normalized, &display_candidate);
         match &mut best {
             Some((best_distance, best_candidate)) if distance < *best_distance => {
                 *best_distance = distance;
-                *best_candidate = canonical.clone();
+                *best_candidate = display_canonical.clone();
             }
-            None => best = Some((distance, canonical.clone())),
+            None => best = Some((distance, display_canonical.clone())),
             _ => {}
         }
     }
@@ -1855,6 +2847,34 @@ fn best_path_suggestion(path: &str, suggestion_paths: &BTreeMap<String, String>)
         let max_len = normalized.len().max(suggestion.len());
         (distance <= (max_len / 3).max(2)).then_some(suggestion)
     })
+}
+
+fn materialize_pattern_for_path(pattern: &str, actual_path: &str) -> String {
+    let pattern_segments = pattern
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let actual_segments = actual_path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    pattern_segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            if *segment == "*" {
+                actual_segments
+                    .get(index)
+                    .copied()
+                    .unwrap_or("<item>")
+                    .to_owned()
+            } else {
+                (*segment).to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -1927,6 +2947,7 @@ fn collect_secret_paths_from_schema(
         && let Some(target) = resolve_schema_ref(root, reference)
     {
         collect_secret_paths_from_schema(target, root, current, paths, visited_refs);
+        visited_refs.remove(reference);
     }
 
     if let Some(properties) = object.get("properties").and_then(Value::as_object) {
@@ -1936,8 +2957,31 @@ fn collect_secret_paths_from_schema(
         }
     }
 
+    if let Some(items) = object.get("prefixItems").and_then(Value::as_array) {
+        for (index, child) in items.iter().enumerate() {
+            let next = crate::report::join_path(current, &index.to_string());
+            collect_secret_paths_from_schema(child, root, &next, paths, visited_refs);
+        }
+    }
+
+    if let Some(items) = object.get("items").and_then(Value::as_array) {
+        for (index, child) in items.iter().enumerate() {
+            let next = crate::report::join_path(current, &index.to_string());
+            collect_secret_paths_from_schema(child, root, &next, paths, visited_refs);
+        }
+    }
+
     if let Some(items) = object.get("items") {
-        collect_secret_paths_from_schema(items, root, current, paths, visited_refs);
+        let next = crate::report::join_path(current, "*");
+        collect_secret_paths_from_schema(items, root, &next, paths, visited_refs);
+    }
+
+    if let Some(additional) = object
+        .get("additionalProperties")
+        .filter(|value| value.is_object())
+    {
+        let next = crate::report::join_path(current, "*");
+        collect_secret_paths_from_schema(additional, root, &next, paths, visited_refs);
     }
 
     for keyword in ["allOf", "anyOf", "oneOf"] {
@@ -2083,19 +3127,81 @@ fn deserialize_with_path<T>(
 where
     T: DeserializeOwned,
 {
-    let deserializer = CoercingDeserializer::new(value, "", string_coercion_paths);
-    let result: Result<T, serde_path_to_error::Error<ValueDeError>> =
-        serde_path_to_error::deserialize(deserializer);
-    result.map_err(|error| {
-        let path = error.path().to_string();
-        let lookup_path = normalize_external_path(&path);
-        let source = find_source_for_unknown_path(report, &lookup_path);
-        ConfigError::Deserialize {
-            path,
-            provenance: source,
-            message: error.inner().to_string(),
+    let deserialize_attempt = |value: &Value| {
+        let deserializer = CoercingDeserializer::new(value, "", string_coercion_paths, None, None);
+        let result: Result<T, serde_path_to_error::Error<ValueDeError>> =
+            serde_path_to_error::deserialize(deserializer);
+        result
+    };
+
+    match deserialize_attempt(value) {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            let retry_value = coerce_retry_scalars(value, "", string_coercion_paths);
+            if retry_value != *value
+                && let Ok(config) = deserialize_attempt(&retry_value)
+            {
+                return Ok(config);
+            }
+            Err(deserialization_error(report, error))
         }
-    })
+    }
+}
+
+fn deserialization_error(
+    report: &ConfigReport,
+    error: serde_path_to_error::Error<ValueDeError>,
+) -> ConfigError {
+    let path = error.path().to_string();
+    let lookup_path = normalize_external_path(&path);
+    let source = find_source_for_unknown_path(report, &lookup_path);
+    ConfigError::Deserialize {
+        path,
+        provenance: source,
+        message: error.inner().to_string(),
+    }
+}
+
+fn coerce_retry_scalars(
+    value: &Value,
+    current_path: &str,
+    string_coercion_paths: &BTreeSet<String>,
+) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    let next = join_path(current_path, key);
+                    (
+                        key.clone(),
+                        coerce_retry_scalars(child, &next, string_coercion_paths),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, child)| {
+                    let next = join_path(current_path, &index.to_string());
+                    coerce_retry_scalars(child, &next, string_coercion_paths)
+                })
+                .collect(),
+        ),
+        Value::String(raw) if string_coercion_paths.contains(current_path) => {
+            retry_scalar_value(raw).unwrap_or_else(|| Value::String(raw.clone()))
+        }
+        other => other.clone(),
+    }
+}
+
+fn retry_scalar_value(raw: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(raw.trim()).ok()?;
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Some(value),
+        _ => None,
+    }
 }
 
 fn ensure_root_object(value: &Value) -> Result<(), ConfigError> {
@@ -2105,6 +3211,54 @@ fn ensure_root_object(value: &Value) -> Result<(), ConfigError> {
         Err(ConfigError::RootMustBeObject {
             actual: value_kind(value),
         })
+    }
+}
+
+fn ensure_path_safe_keys(value: &Value, current_path: &str) -> Result<(), ConfigError> {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                validate_path_key(current_path, key)?;
+                let next = join_path(current_path, key);
+                ensure_path_safe_keys(child, &next)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                let next = join_path(current_path, &index.to_string());
+                ensure_path_safe_keys(child, &next)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_path_key(current_path: &str, key: &str) -> Result<(), ConfigError> {
+    let message = invalid_path_key_message(key);
+    if let Some(message) = message {
+        Err(ConfigError::InvalidPathKey {
+            path: current_path.to_owned(),
+            key: key.to_owned(),
+            message,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_path_key_message(key: &str) -> Option<String> {
+    if key.is_empty() {
+        Some("empty object keys are not supported".to_owned())
+    } else if key == "*" {
+        Some("`*` is reserved for wildcard metadata paths".to_owned())
+    } else if key.contains('.') {
+        Some("`.` is reserved as the configuration path separator".to_owned())
+    } else if key.contains('[') || key.contains(']') {
+        Some("`[` and `]` are reserved for external array path syntax".to_owned())
+    } else {
+        None
     }
 }
 
@@ -2123,22 +3277,44 @@ fn merge_values(
     target: &mut Value,
     overlay: Value,
     current_path: &str,
-    strategies: &BTreeMap<String, MergeStrategy>,
+    metadata: &ConfigMetadata,
+    indexed_array_paths: &BTreeSet<String>,
+    direct_array_paths: &BTreeSet<String>,
 ) {
-    let strategy = strategies
-        .get(current_path)
-        .copied()
+    let strategy = metadata
+        .merge_strategy_for(current_path)
         .unwrap_or(MergeStrategy::Merge);
+    let indexed_array_patch =
+        indexed_array_paths.contains(current_path) && !direct_array_paths.contains(current_path);
 
-    match strategy {
-        MergeStrategy::Replace if !current_path.is_empty() => *target = overlay,
-        MergeStrategy::Append => match (target, overlay) {
+    match (target, overlay, strategy) {
+        (Value::Array(target), Value::Array(overlay), _)
+            if indexed_array_patch && !current_path.is_empty() =>
+        {
+            merge_indexed_array_patch(
+                target,
+                overlay,
+                current_path,
+                metadata,
+                indexed_array_paths,
+                direct_array_paths,
+            );
+        }
+        (target, overlay, MergeStrategy::Replace) if !current_path.is_empty() => *target = overlay,
+        (target, overlay, MergeStrategy::Append) => match (target, overlay) {
             (Value::Array(target), Value::Array(mut overlay)) => target.append(&mut overlay),
             (Value::Object(target), Value::Object(overlay)) => {
                 for (key, value) in overlay {
                     let path = join_path(current_path, &key);
                     match target.get_mut(&key) {
-                        Some(existing) => merge_values(existing, value, &path, strategies),
+                        Some(existing) => merge_values(
+                            existing,
+                            value,
+                            &path,
+                            metadata,
+                            indexed_array_paths,
+                            direct_array_paths,
+                        ),
                         None => {
                             target.insert(key, value);
                         }
@@ -2147,12 +3323,20 @@ fn merge_values(
             }
             (target, overlay) => *target = overlay,
         },
-        MergeStrategy::Merge | MergeStrategy::Replace => match (target, overlay) {
+        (target, overlay, MergeStrategy::Merge | MergeStrategy::Replace) => match (target, overlay)
+        {
             (Value::Object(target), Value::Object(overlay)) => {
                 for (key, value) in overlay {
                     let path = join_path(current_path, &key);
                     match target.get_mut(&key) {
-                        Some(existing) => merge_values(existing, value, &path, strategies),
+                        Some(existing) => merge_values(
+                            existing,
+                            value,
+                            &path,
+                            metadata,
+                            indexed_array_paths,
+                            direct_array_paths,
+                        ),
                         None => {
                             target.insert(key, value);
                         }
@@ -2164,84 +3348,244 @@ fn merge_values(
     }
 }
 
-fn collect_coercion_paths(value: &Value, current: &str, paths: &mut BTreeSet<String>) {
-    if !current.is_empty() {
-        paths.insert(current.to_owned());
-    }
+fn merge_indexed_array_patch(
+    target: &mut Vec<Value>,
+    overlay: Vec<Value>,
+    current_path: &str,
+    metadata: &ConfigMetadata,
+    indexed_array_paths: &BTreeSet<String>,
+    direct_array_paths: &BTreeSet<String>,
+) {
+    for (index, value) in overlay.into_iter().enumerate() {
+        if value.is_null() {
+            continue;
+        }
 
+        let path = join_path(current_path, &index.to_string());
+        if target.len() <= index {
+            target.resize(index + 1, Value::Null);
+        }
+
+        if target[index].is_null() {
+            target[index] = value;
+            continue;
+        }
+
+        merge_values(
+            &mut target[index],
+            value,
+            &path,
+            metadata,
+            indexed_array_paths,
+            direct_array_paths,
+        );
+    }
+}
+
+fn indexed_array_container_paths(segments: &[&str]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for index in 0..segments.len() {
+        if segments[index].parse::<usize>().is_ok() && index > 0 {
+            paths.insert(segments[..index].join("."));
+        }
+    }
+    paths
+}
+
+fn record_indexed_array_state(
+    current_array_lengths: &mut BTreeMap<String, usize>,
+    indexed_array_base_lengths: &mut BTreeMap<String, usize>,
+    path: &str,
+    segments: &[&str],
+) {
+    for container_path in indexed_array_container_paths(segments) {
+        let Some(index) = direct_child_array_index(&container_path, path) else {
+            continue;
+        };
+        let Some(current_length) = current_array_lengths.get_mut(&container_path) else {
+            continue;
+        };
+
+        indexed_array_base_lengths
+            .entry(container_path.clone())
+            .or_insert(*current_length);
+        if index >= *current_length {
+            *current_length = index + 1;
+        }
+    }
+}
+
+fn record_direct_array_state(
+    current_array_lengths: &mut BTreeMap<String, usize>,
+    indexed_array_base_lengths: &mut BTreeMap<String, usize>,
+    path: &str,
+    value: &Value,
+) {
+    clear_array_state(current_array_lengths, path);
+    clear_array_state(indexed_array_base_lengths, path);
+    collect_array_lengths(value, path, current_array_lengths);
+}
+
+fn clear_array_state<T>(state: &mut BTreeMap<String, T>, path: &str) {
+    let nested_prefix = format!("{path}.");
+    state.retain(|candidate, _| candidate != path && !candidate.starts_with(&nested_prefix));
+}
+
+fn collect_array_lengths(value: &Value, path: &str, lengths: &mut BTreeMap<String, usize>) {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                let next = join_path(current, key);
-                collect_coercion_paths(child, &next, paths);
+                let next = join_path(path, key);
+                collect_array_lengths(child, &next, lengths);
             }
         }
         Value::Array(values) => {
+            lengths.insert(path.to_owned(), values.len());
             for (index, child) in values.iter().enumerate() {
-                let next = join_path(current, &index.to_string());
-                collect_coercion_paths(child, &next, paths);
+                let next = join_path(path, &index.to_string());
+                collect_array_lengths(child, &next, lengths);
             }
         }
         _ => {}
     }
 }
 
-fn normalize_external_path(path: &str) -> String {
+pub(crate) fn normalize_external_path(path: &str) -> String {
+    try_normalize_external_path(path).unwrap_or_else(|_| normalize_path(path))
+}
+
+pub(crate) fn try_normalize_external_path(path: &str) -> Result<String, String> {
     if path == "." {
-        return String::new();
+        return Ok(String::new());
     }
 
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut chars = path.chars().peekable();
+    let mut after_index = false;
+    let mut expecting_segment = true;
 
     while let Some(ch) = chars.next() {
+        if after_index {
+            match ch {
+                '.' => {
+                    if chars.peek().is_none() {
+                        return Err("configuration path cannot end with `.`".to_owned());
+                    }
+                    after_index = false;
+                    expecting_segment = true;
+                }
+                '[' => {
+                    let index = parse_external_array_index(&mut chars)?;
+                    segments.push(index);
+                    after_index = true;
+                    expecting_segment = false;
+                }
+                _ => {
+                    return Err(
+                        "expected `.` or `[` after an array index in configuration path".to_owned(),
+                    );
+                }
+            }
+            continue;
+        }
+
         match ch {
             '.' => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
+                if current.is_empty() {
+                    return Err("empty path segment in configuration path".to_owned());
                 }
+                segments.push(std::mem::take(&mut current));
+                expecting_segment = true;
             }
             '[' => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
+                if current.is_empty() {
+                    return Err("array indices must follow a field name".to_owned());
                 }
-                let mut index = String::new();
-                for next in chars.by_ref() {
-                    if next == ']' {
-                        break;
-                    }
-                    index.push(next);
-                }
-                if !index.is_empty() {
-                    segments.push(index);
-                }
+                segments.push(std::mem::take(&mut current));
+                let index = parse_external_array_index(&mut chars)?;
+                segments.push(index);
+                after_index = true;
+                expecting_segment = false;
             }
-            _ => current.push(ch),
+            ']' => return Err("unexpected `]` in configuration path".to_owned()),
+            _ => {
+                current.push(ch);
+                expecting_segment = false;
+            }
         }
+    }
+
+    if expecting_segment && !segments.is_empty() && current.is_empty() && !after_index {
+        return Err("configuration path cannot end with `.`".to_owned());
     }
 
     if !current.is_empty() {
         segments.push(current);
     }
 
-    normalize_path(&segments.join("."))
+    Ok(normalize_path(&segments.join(".")))
 }
 
-fn parse_override_value(raw: &str) -> Value {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Value::String(String::new());
+fn parse_external_array_index<I>(chars: &mut std::iter::Peekable<I>) -> Result<String, String>
+where
+    I: Iterator<Item = char>,
+{
+    let mut index = String::new();
+    let mut closed = false;
+    for next in chars.by_ref() {
+        if next == ']' {
+            closed = true;
+            break;
+        }
+        index.push(next);
     }
+    if !closed {
+        return Err("unclosed `[` in configuration path".to_owned());
+    }
+    if index.is_empty() {
+        return Err("empty array index in configuration path".to_owned());
+    }
+    if !index.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("array indices in configuration paths must be numeric".to_owned());
+    }
+    index
+        .parse::<usize>()
+        .map(|value| value.to_string())
+        .map_err(|_| "array indices in configuration paths must fit in usize".to_owned())
+}
+
+struct ParsedOverride {
+    value: Value,
+    allow_string_coercion: bool,
+}
+
+fn parse_override_value(raw: &str) -> Result<ParsedOverride, String> {
+    if raw.is_empty() {
+        return Ok(ParsedOverride {
+            value: Value::String(String::new()),
+            allow_string_coercion: true,
+        });
+    }
+
+    let trimmed = raw.trim();
 
     let uses_explicit_json_syntax =
         matches!(trimmed.chars().next(), Some('{') | Some('[') | Some('"'));
 
-    if uses_explicit_json_syntax && let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        return value;
+    if uses_explicit_json_syntax {
+        let value = serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("invalid explicit JSON override: {error}"))?;
+        return Ok(ParsedOverride {
+            value,
+            allow_string_coercion: false,
+        });
     }
 
-    Value::String(raw.to_owned())
+    Ok(ParsedOverride {
+        value: Value::String(raw.to_owned()),
+        allow_string_coercion: true,
+    })
 }
 
 fn unexpected_value(value: &Value) -> de::Unexpected<'_> {
@@ -2269,6 +3613,8 @@ struct CoercingDeserializer<'a> {
     value: &'a Value,
     path: String,
     string_coercion_paths: &'a BTreeSet<String>,
+    known_paths: Option<&'a RefCell<BTreeSet<String>>>,
+    ignored_paths: Option<&'a RefCell<Vec<String>>>,
 }
 
 impl<'a> CoercingDeserializer<'a> {
@@ -2276,11 +3622,15 @@ impl<'a> CoercingDeserializer<'a> {
         value: &'a Value,
         path: impl Into<String>,
         string_coercion_paths: &'a BTreeSet<String>,
+        known_paths: Option<&'a RefCell<BTreeSet<String>>>,
+        ignored_paths: Option<&'a RefCell<Vec<String>>>,
     ) -> Self {
         Self {
             value,
             path: path.into(),
             string_coercion_paths,
+            known_paths,
+            ignored_paths,
         }
     }
 
@@ -2303,6 +3653,24 @@ impl<'a> CoercingDeserializer<'a> {
         V: Visitor<'de>,
     {
         de::Error::invalid_type(de::Unexpected::Str(raw), visitor)
+    }
+
+    fn record_known_path(&self, path: &str) {
+        if let Some(known_paths) = self.known_paths {
+            let normalized = normalize_path(path);
+            if !normalized.is_empty() {
+                known_paths.borrow_mut().insert(normalized);
+            }
+        }
+    }
+
+    fn record_ignored_path(&self, path: &str) {
+        if let Some(ignored_paths) = self.ignored_paths {
+            let normalized = normalize_path(path);
+            if !normalized.is_empty() {
+                ignored_paths.borrow_mut().push(normalized);
+            }
+        }
     }
 }
 
@@ -2387,11 +3755,15 @@ where
                 values.iter().enumerate(),
                 self.path,
                 self.string_coercion_paths,
+                self.known_paths,
+                self.ignored_paths,
             )),
             Value::Object(map) => visitor.visit_map(CoercingMapAccess::new(
                 map.iter(),
                 self.path,
                 self.string_coercion_paths,
+                self.known_paths,
+                self.ignored_paths,
             )),
         }
     }
@@ -2546,6 +3918,8 @@ where
                 values.iter().enumerate(),
                 self.path,
                 self.string_coercion_paths,
+                self.known_paths,
+                self.ignored_paths,
             )),
             _ => Err(self.invalid_type(&visitor)),
         }
@@ -2555,6 +3929,14 @@ where
     where
         V: Visitor<'de>,
     {
+        if let Value::Array(values) = self.value {
+            for index in 0.._len {
+                self.record_known_path(&join_path(&self.path, &index.to_string()));
+            }
+            for index in _len..values.len() {
+                self.record_ignored_path(&join_path(&self.path, &index.to_string()));
+            }
+        }
         self.deserialize_seq(visitor)
     }
 
@@ -2567,7 +3949,7 @@ where
     where
         V: Visitor<'de>,
     {
-        self.deserialize_seq(visitor)
+        self.deserialize_tuple(_len, visitor)
     }
 
     fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -2579,6 +3961,8 @@ where
                 map.iter(),
                 self.path,
                 self.string_coercion_paths,
+                self.known_paths,
+                self.ignored_paths,
             )),
             _ => Err(self.invalid_type(&visitor)),
         }
@@ -2587,12 +3971,15 @@ where
     fn deserialize_struct<V>(
         self,
         _name: &'static str,
-        _fields: &'static [&'static str],
+        fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
+        for field in fields {
+            self.record_known_path(&join_path(&self.path, field));
+        }
         self.deserialize_map(visitor)
     }
 
@@ -2607,9 +3994,15 @@ where
     {
         match self.value {
             Value::String(value) => visitor.visit_enum(value.as_str().into_deserializer()),
-            Value::Object(map) => visitor.visit_enum(MapAccessDeserializer::new(
-                CoercingMapAccess::new(map.iter(), self.path, self.string_coercion_paths),
-            )),
+            Value::Object(map) => {
+                visitor.visit_enum(MapAccessDeserializer::new(CoercingMapAccess::new(
+                    map.iter(),
+                    self.path,
+                    self.string_coercion_paths,
+                    self.known_paths,
+                    self.ignored_paths,
+                )))
+            }
             _ => Err(self.invalid_type(&visitor)),
         }
     }
@@ -2633,14 +4026,24 @@ struct CoercingSeqAccess<'a, I> {
     iter: I,
     parent_path: String,
     string_coercion_paths: &'a BTreeSet<String>,
+    known_paths: Option<&'a RefCell<BTreeSet<String>>>,
+    ignored_paths: Option<&'a RefCell<Vec<String>>>,
 }
 
 impl<'a, I> CoercingSeqAccess<'a, I> {
-    fn new(iter: I, parent_path: String, string_coercion_paths: &'a BTreeSet<String>) -> Self {
+    fn new(
+        iter: I,
+        parent_path: String,
+        string_coercion_paths: &'a BTreeSet<String>,
+        known_paths: Option<&'a RefCell<BTreeSet<String>>>,
+        ignored_paths: Option<&'a RefCell<Vec<String>>>,
+    ) -> Self {
         Self {
             iter,
             parent_path,
             string_coercion_paths,
+            known_paths,
+            ignored_paths,
         }
     }
 }
@@ -2664,6 +4067,8 @@ where
             value,
             path,
             self.string_coercion_paths,
+            self.known_paths,
+            self.ignored_paths,
         ))
         .map(Some)
     }
@@ -2674,15 +4079,25 @@ struct CoercingMapAccess<'a, I> {
     current: Option<(&'a str, &'a Value)>,
     parent_path: String,
     string_coercion_paths: &'a BTreeSet<String>,
+    known_paths: Option<&'a RefCell<BTreeSet<String>>>,
+    ignored_paths: Option<&'a RefCell<Vec<String>>>,
 }
 
 impl<'a, I> CoercingMapAccess<'a, I> {
-    fn new(iter: I, parent_path: String, string_coercion_paths: &'a BTreeSet<String>) -> Self {
+    fn new(
+        iter: I,
+        parent_path: String,
+        string_coercion_paths: &'a BTreeSet<String>,
+        known_paths: Option<&'a RefCell<BTreeSet<String>>>,
+        ignored_paths: Option<&'a RefCell<Vec<String>>>,
+    ) -> Self {
         Self {
             iter,
             current: None,
             parent_path,
             string_coercion_paths,
+            known_paths,
+            ignored_paths,
         }
     }
 }
@@ -2718,6 +4133,8 @@ where
             value,
             path,
             self.string_coercion_paths,
+            self.known_paths,
+            self.ignored_paths,
         ))
     }
 }
@@ -2727,35 +4144,95 @@ fn insert_path(root: &mut Value, segments: &[&str], value: Value) -> Result<(), 
         return Err("configuration path cannot be empty".to_owned());
     }
 
-    let mut current = root;
-    for (index, segment) in segments.iter().enumerate() {
-        if segment.is_empty() {
-            return Err("configuration path contains an empty segment".to_owned());
-        }
+    insert_path_recursive(root, segments, value)
+}
 
-        let is_last = index == segments.len() - 1;
-        match current {
-            Value::Object(map) if is_last => {
-                map.insert((*segment).to_owned(), value);
+fn insert_path_recursive(
+    current: &mut Value,
+    segments: &[&str],
+    value: Value,
+) -> Result<(), String> {
+    let segment = segments[0];
+    if segment.is_empty() {
+        return Err("configuration path contains an empty segment".to_owned());
+    }
+
+    let is_last = segments.len() == 1;
+    match current {
+        Value::Object(map) => {
+            if is_last {
+                map.insert(segment.to_owned(), value);
                 return Ok(());
             }
-            Value::Object(map) => {
-                current = map
-                    .entry((*segment).to_owned())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if !matches!(current, Value::Object(_)) {
+
+            let next_is_index = segments[1].parse::<usize>().is_ok();
+            let child = map.entry(segment.to_owned()).or_insert_with(|| {
+                if next_is_index {
+                    Value::Array(Vec::new())
+                } else {
+                    Value::Object(Map::new())
+                }
+            });
+
+            match child {
+                Value::Object(_) if !next_is_index => {}
+                Value::Array(_) if next_is_index => {}
+                _ => {
                     return Err(format!(
-                        "path segment {segment} conflicts with an existing non-object value"
+                        "path segment {segment} conflicts with an existing non-container value"
                     ));
                 }
             }
-            _ => {
-                return Err(format!(
-                    "path segment {segment} conflicts with an existing non-object value"
-                ));
-            }
-        }
-    }
 
-    Ok(())
+            insert_path_recursive(child, &segments[1..], value)
+        }
+        Value::Array(values) => {
+            let index = segment.parse::<usize>().map_err(|_| {
+                format!("path segment {segment} must be an array index at this position")
+            })?;
+
+            if is_last {
+                if values.len() <= index {
+                    values.resize(index + 1, Value::Null);
+                }
+                values[index] = value;
+                return Ok(());
+            }
+
+            let next_is_index = segments[1].parse::<usize>().is_ok();
+            if values.len() <= index {
+                values.resize_with(index + 1, || {
+                    if next_is_index {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Object(Map::new())
+                    }
+                });
+            }
+
+            let child = &mut values[index];
+            if child.is_null() {
+                *child = if next_is_index {
+                    Value::Array(Vec::new())
+                } else {
+                    Value::Object(Map::new())
+                };
+            }
+
+            match child {
+                Value::Object(_) if !next_is_index => {}
+                Value::Array(_) if next_is_index => {}
+                _ => {
+                    return Err(format!(
+                        "path segment {segment} conflicts with an existing non-container value"
+                    ));
+                }
+            }
+
+            insert_path_recursive(child, &segments[1..], value)
+        }
+        _ => Err(format!(
+            "path segment {segment} conflicts with an existing non-container value"
+        )),
+    }
 }

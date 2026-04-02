@@ -219,6 +219,7 @@ impl Display for ConfigWarning {
 pub struct ConfigReport {
     final_value: Value,
     secret_paths: BTreeSet<String>,
+    alias_overrides: BTreeMap<String, String>,
     traces: BTreeMap<String, Vec<ResolutionStep>>,
     applied_sources: Vec<SourceTrace>,
     validations: Vec<String>,
@@ -226,10 +227,15 @@ pub struct ConfigReport {
 }
 
 impl ConfigReport {
-    pub(crate) fn new(final_value: Value, secret_paths: BTreeSet<String>) -> Self {
+    pub(crate) fn new(
+        final_value: Value,
+        secret_paths: BTreeSet<String>,
+        alias_overrides: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             final_value,
             secret_paths,
+            alias_overrides,
             traces: BTreeMap::new(),
             applied_sources: Vec::new(),
             validations: Vec::new(),
@@ -247,6 +253,15 @@ impl ConfigReport {
 
     pub(crate) fn replace_final_value(&mut self, final_value: Value) {
         self.final_value = final_value;
+    }
+
+    pub(crate) fn replace_runtime_metadata(
+        &mut self,
+        secret_paths: BTreeSet<String>,
+        alias_overrides: BTreeMap<String, String>,
+    ) {
+        self.secret_paths = secret_paths;
+        self.alias_overrides = alias_overrides;
     }
 
     pub(crate) fn record_validation(&mut self, name: String) {
@@ -315,18 +330,24 @@ impl ConfigReport {
     /// Explains how a configuration path was resolved.
     #[must_use]
     pub fn explain(&self, path: &str) -> Option<Explanation> {
-        let normalized = normalize_path(path);
-        let steps = self.traces.get(&normalized)?.clone();
-        let redacted = self.is_secret_path(&normalized);
+        let normalized = self.normalize_lookup_path(path)?;
+        let redacted = self.path_overlaps_secret(&normalized);
+        let steps = self
+            .traces
+            .get(&normalized)?
+            .iter()
+            .cloned()
+            .map(|mut step| {
+                if redacted {
+                    step.value = redact_value(&step.value, &normalized, &self.secret_paths);
+                    step.redacted = true;
+                }
+                step
+            })
+            .collect();
         let final_value = get_value_at_path(&self.final_value, &normalized)
             .cloned()
-            .map(|value| {
-                if redacted {
-                    redact_value(&value, &normalized, &self.secret_paths)
-                } else {
-                    value
-                }
-            });
+            .map(|value| redact_value(&value, &normalized, &self.secret_paths));
 
         Some(Explanation {
             path: normalized,
@@ -448,17 +469,212 @@ impl ConfigReport {
     }
 
     pub(crate) fn latest_source_for(&self, path: &str) -> Option<SourceTrace> {
+        let path = self.normalize_lookup_path(path)?;
         self.traces
-            .get(path)
+            .get(&path)
             .and_then(|steps| steps.last())
             .map(|step| step.source.clone())
     }
 
-    fn is_secret_path(&self, path: &str) -> bool {
+    fn normalize_lookup_path(&self, path: &str) -> Option<String> {
+        let segments = parse_external_lookup_path(path).ok()?;
+        let normalized = render_lookup_segments(&segments);
+        let runtime = canonicalize_runtime_lookup_path(&self.final_value, &segments)?;
+        let aliased_runtime = canonicalize_path_with_aliases(&runtime, &self.alias_overrides);
+        if self.traces.contains_key(&aliased_runtime)
+            || get_value_at_path(&self.final_value, &aliased_runtime).is_some()
+        {
+            return Some(aliased_runtime);
+        }
+
+        let aliased_normalized = canonicalize_path_with_aliases(&normalized, &self.alias_overrides);
+        if self.traces.contains_key(&aliased_normalized)
+            || get_value_at_path(&self.final_value, &aliased_normalized).is_some()
+        {
+            return Some(aliased_normalized);
+        }
+
+        Some(aliased_runtime)
+    }
+
+    fn path_overlaps_secret(&self, path: &str) -> bool {
         self.secret_paths
             .iter()
-            .any(|secret| path == secret || path.starts_with(&format!("{secret}.")))
+            .any(|secret| path_overlaps_pattern(path, secret))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LookupSegment {
+    Field(String),
+    Index(String),
+}
+
+fn parse_external_lookup_path(path: &str) -> Result<Vec<LookupSegment>, String> {
+    if path == "." {
+        return Ok(Vec::new());
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = path.chars().peekable();
+    let mut after_index = false;
+    let mut expecting_segment = true;
+
+    while let Some(ch) = chars.next() {
+        if after_index {
+            match ch {
+                '.' => {
+                    if chars.peek().is_none() {
+                        return Err("configuration path cannot end with `.`".to_owned());
+                    }
+                    after_index = false;
+                    expecting_segment = true;
+                }
+                '[' => {
+                    let index = parse_lookup_index(&mut chars)?;
+                    segments.push(LookupSegment::Index(index));
+                    after_index = true;
+                    expecting_segment = false;
+                }
+                _ => {
+                    return Err(
+                        "expected `.` or `[` after an array index in configuration path".to_owned(),
+                    );
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '.' => {
+                if current.is_empty() {
+                    return Err("empty path segment in configuration path".to_owned());
+                }
+                segments.push(LookupSegment::Field(std::mem::take(&mut current)));
+                expecting_segment = true;
+            }
+            '[' => {
+                if current.is_empty() {
+                    return Err("array indices must follow a field name".to_owned());
+                }
+                segments.push(LookupSegment::Field(std::mem::take(&mut current)));
+                let index = parse_lookup_index(&mut chars)?;
+                segments.push(LookupSegment::Index(index));
+                after_index = true;
+                expecting_segment = false;
+            }
+            ']' => return Err("unexpected `]` in configuration path".to_owned()),
+            _ => {
+                current.push(ch);
+                expecting_segment = false;
+            }
+        }
+    }
+
+    if expecting_segment && !segments.is_empty() && current.is_empty() && !after_index {
+        return Err("configuration path cannot end with `.`".to_owned());
+    }
+
+    if !current.is_empty() {
+        segments.push(LookupSegment::Field(current));
+    }
+
+    Ok(segments)
+}
+
+fn parse_lookup_index<I>(chars: &mut std::iter::Peekable<I>) -> Result<String, String>
+where
+    I: Iterator<Item = char>,
+{
+    let mut index = String::new();
+    let mut closed = false;
+    for next in chars.by_ref() {
+        if next == ']' {
+            closed = true;
+            break;
+        }
+        index.push(next);
+    }
+    if !closed {
+        return Err("unclosed `[` in configuration path".to_owned());
+    }
+    if index.is_empty() {
+        return Err("empty array index in configuration path".to_owned());
+    }
+    if !index.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("array indices in configuration paths must be numeric".to_owned());
+    }
+    index
+        .parse::<usize>()
+        .map(|value| value.to_string())
+        .map_err(|_| "array indices in configuration paths must fit in usize".to_owned())
+}
+
+fn render_lookup_segments(segments: &[LookupSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            LookupSegment::Field(field) | LookupSegment::Index(field) => field.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn canonicalize_runtime_lookup_path(value: &Value, segments: &[LookupSegment]) -> Option<String> {
+    let mut current = value;
+    let mut canonical = Vec::new();
+
+    for (index, segment) in segments.iter().enumerate() {
+        match current {
+            Value::Object(map) => {
+                let LookupSegment::Field(field) = segment else {
+                    return None;
+                };
+                canonical.push(field.clone());
+                let Some(next) = map.get(field) else {
+                    canonical.extend(segments[index + 1..].iter().map(|segment| match segment {
+                        LookupSegment::Field(field) | LookupSegment::Index(field) => field.clone(),
+                    }));
+                    break;
+                };
+                current = next;
+            }
+            Value::Array(values) => {
+                let array_index = match segment {
+                    LookupSegment::Index(array_index) => array_index.clone(),
+                    LookupSegment::Field(field) if field.parse::<usize>().is_ok() => field.clone(),
+                    LookupSegment::Field(_) => return None,
+                };
+                let Ok(array_index) = array_index.parse::<usize>() else {
+                    canonical.push(array_index);
+                    canonical.extend(segments[index + 1..].iter().map(|segment| match segment {
+                        LookupSegment::Field(field) | LookupSegment::Index(field) => field.clone(),
+                    }));
+                    break;
+                };
+                canonical.push(array_index.to_string());
+                let Some(next) = values.get(array_index) else {
+                    canonical.extend(segments[index + 1..].iter().map(|segment| match segment {
+                        LookupSegment::Field(field) | LookupSegment::Index(field) => field.clone(),
+                    }));
+                    break;
+                };
+                current = next;
+            }
+            _ => {
+                canonical.push(match segment {
+                    LookupSegment::Field(field) | LookupSegment::Index(field) => field.clone(),
+                });
+                canonical.extend(segments[index + 1..].iter().map(|segment| match segment {
+                    LookupSegment::Field(field) | LookupSegment::Index(field) => field.clone(),
+                }));
+                break;
+            }
+        }
+    }
+
+    Some(normalize_path(&canonical.join(".")))
 }
 
 pub(crate) fn normalize_path(path: &str) -> String {
@@ -473,10 +689,120 @@ pub(crate) fn join_path(parent: &str, child: &str) -> String {
     }
 }
 
+pub(crate) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    let actual_segments = path_segments(path);
+    let pattern_segments = path_segments(pattern);
+    actual_segments.len() == pattern_segments.len()
+        && actual_segments
+            .iter()
+            .zip(pattern_segments.iter())
+            .all(|(actual, expected)| *expected == "*" || actual == expected)
+}
+
+pub(crate) fn path_starts_with_pattern(path: &str, pattern: &str) -> bool {
+    let actual_segments = path_segments(path);
+    let pattern_segments = path_segments(pattern);
+    actual_segments.len() >= pattern_segments.len()
+        && actual_segments
+            .iter()
+            .zip(pattern_segments.iter())
+            .all(|(actual, expected)| *expected == "*" || actual == expected)
+}
+
+pub(crate) fn path_overlaps_pattern(path: &str, pattern: &str) -> bool {
+    let actual_segments = path_segments(path);
+    let pattern_segments = path_segments(pattern);
+    let shared = actual_segments.len().min(pattern_segments.len());
+    actual_segments
+        .iter()
+        .take(shared)
+        .zip(pattern_segments.iter().take(shared))
+        .all(|(actual, expected)| *expected == "*" || *actual == "*" || actual == expected)
+}
+
+pub(crate) fn canonicalize_path_with_aliases(
+    path: &str,
+    aliases: &BTreeMap<String, String>,
+) -> String {
+    let normalized = normalize_path(path);
+    if normalized.is_empty() || aliases.is_empty() {
+        return normalized;
+    }
+
+    let path_segments = normalized.split('.').collect::<Vec<_>>();
+    let mut best = None::<(usize, usize, String)>;
+
+    for (alias, canonical) in aliases {
+        let alias_segments = alias.split('.').collect::<Vec<_>>();
+        if alias_segments.len() > path_segments.len() {
+            continue;
+        }
+
+        let matched = alias_segments
+            .iter()
+            .zip(path_segments.iter())
+            .all(|(expected, actual)| *expected == "*" || expected == actual);
+        if !matched {
+            continue;
+        }
+
+        let specificity = alias_segments
+            .iter()
+            .filter(|segment| **segment != "*")
+            .count();
+        let candidate = rewrite_alias_path(&path_segments, &alias_segments, canonical);
+        match &mut best {
+            Some((best_len, best_specificity, best_candidate))
+                if alias_segments.len() > *best_len
+                    || (alias_segments.len() == *best_len && specificity > *best_specificity) =>
+            {
+                *best_len = alias_segments.len();
+                *best_specificity = specificity;
+                *best_candidate = candidate;
+            }
+            None => best = Some((alias_segments.len(), specificity, candidate)),
+            _ => {}
+        }
+    }
+
+    best.map_or(normalized, |(_, _, candidate)| candidate)
+}
+
+fn rewrite_alias_path(path_segments: &[&str], alias_segments: &[&str], canonical: &str) -> String {
+    let canonical_segments = canonical
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let mut rewritten = canonical_segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            if *segment == "*" && alias_segments.get(index) == Some(&"*") {
+                path_segments[index].to_owned()
+            } else {
+                (*segment).to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    rewritten.extend(
+        path_segments[alias_segments.len()..]
+            .iter()
+            .map(|segment| (*segment).to_owned()),
+    );
+    normalize_path(&rewritten.join("."))
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
 pub(crate) fn redact_value(value: &Value, path: &str, secret_paths: &BTreeSet<String>) -> Value {
-    if secret_paths.iter().any(|secret| {
-        path == secret || (!path.is_empty() && path.starts_with(&format!("{secret}.")))
-    }) {
+    if secret_paths
+        .iter()
+        .any(|secret| path_starts_with_pattern(path, secret))
+    {
         return Value::String("***redacted***".to_owned());
     }
 
@@ -489,7 +815,16 @@ pub(crate) fn redact_value(value: &Value, path: &str, secret_paths: &BTreeSet<St
                 })
                 .collect(),
         ),
-        Value::Array(values) => Value::Array(values.clone()),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let next = join_path(path, &index.to_string());
+                    redact_value(value, &next, secret_paths)
+                })
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -502,6 +837,11 @@ pub(crate) fn collect_paths(value: &Value, current: &str, paths: &mut Vec<String
     if let Value::Object(map) = value {
         for (key, child) in map {
             let next = join_path(current, key);
+            collect_paths(child, &next, paths);
+        }
+    } else if let Value::Array(values) = value {
+        for (index, child) in values.iter().enumerate() {
+            let next = join_path(current, &index.to_string());
             collect_paths(child, &next, paths);
         }
     }
@@ -517,6 +857,10 @@ pub(crate) fn get_value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a 
         match current {
             Value::Object(map) => {
                 current = map.get(segment)?;
+            }
+            Value::Array(values) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = values.get(index)?;
             }
             _ => return None,
         }
@@ -549,6 +893,21 @@ pub(crate) fn collect_diff_paths(
             let after_child = after_map.get(key).unwrap_or(&Value::Null);
             let next = join_path(current, key);
             collect_diff_paths(before_child, after_child, &next, paths);
+        }
+    } else if let (Value::Array(before_values), Value::Array(after_values)) = (before, after) {
+        let len = before_values.len().max(after_values.len());
+        for index in 0..len {
+            let before_child = before_values.get(index).unwrap_or(&Value::Null);
+            let after_child = after_values.get(index).unwrap_or(&Value::Null);
+            let next = join_path(current, &index.to_string());
+            collect_diff_paths(before_child, after_child, &next, paths);
+        }
+    } else {
+        if matches!(before, Value::Object(_) | Value::Array(_)) {
+            collect_paths(before, current, paths);
+        }
+        if matches!(after, Value::Object(_) | Value::Array(_)) {
+            collect_paths(after, current, paths);
         }
     }
 }

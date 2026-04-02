@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::report::normalize_path;
+use crate::ConfigError;
+use crate::report::{normalize_path, path_matches_pattern};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Structured metadata describing configuration fields.
@@ -30,7 +31,11 @@ use crate::report::normalize_path;
 /// .required_with("tls.enabled", ["tls.cert", "tls.key"]);
 ///
 /// assert_eq!(
-///     metadata.env_overrides().get("DATABASE_URL").map(String::as_str),
+///     metadata
+///         .env_overrides()
+///         .expect("valid metadata")
+///         .get("DATABASE_URL")
+///         .map(String::as_str),
 ///     Some("db.url")
 /// );
 /// assert_eq!(metadata.secret_paths(), vec!["db.password".to_owned()]);
@@ -39,6 +44,13 @@ use crate::report::normalize_path;
 pub struct ConfigMetadata {
     fields: Vec<FieldMetadata>,
     checks: Vec<ValidationCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetadataMatchScore {
+    segment_count: usize,
+    specificity: usize,
+    positional_specificity: Vec<bool>,
 }
 
 impl ConfigMetadata {
@@ -71,11 +83,31 @@ impl ConfigMetadata {
         &self.checks
     }
 
-    /// Returns the metadata entry for a normalized configuration path.
+    /// Returns the metadata entry for a normalized configuration path or alias.
     #[must_use]
     pub fn field(&self, path: &str) -> Option<&FieldMetadata> {
         let normalized = normalize_path(path);
-        self.fields.iter().find(|field| field.path == normalized)
+        let mut best = None::<(MetadataMatchScore, &FieldMetadata)>;
+        for field in &self.fields {
+            for candidate in
+                std::iter::once(field.path.as_str()).chain(field.aliases.iter().map(String::as_str))
+            {
+                let Some(score) = metadata_match_score(&normalized, candidate) else {
+                    continue;
+                };
+
+                match &mut best {
+                    Some((best_score, best_field)) if score > *best_score => {
+                        *best_score = score;
+                        *best_field = field;
+                    }
+                    None => best = Some((score, field)),
+                    _ => {}
+                }
+            }
+        }
+
+        best.map(|(_, field)| field)
     }
 
     /// Returns metadata entries keyed by normalized path.
@@ -207,29 +239,98 @@ impl ConfigMetadata {
     }
 
     /// Returns explicit environment variable name overrides keyed by env name.
-    #[must_use]
-    pub fn env_overrides(&self) -> BTreeMap<String, String> {
-        self.fields
-            .iter()
-            .filter_map(|field| {
-                field
-                    .env
-                    .as_ref()
-                    .map(|env| (env.clone(), field.path.clone()))
-            })
-            .collect()
+    pub fn env_overrides(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut envs = BTreeMap::new();
+        for field in &self.fields {
+            let Some(env) = &field.env else {
+                continue;
+            };
+            if field.path.split('.').any(|segment| segment == "*") {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "explicit environment variable names cannot target wildcard paths"
+                        .to_owned(),
+                });
+            }
+            if let Some(first_path) = envs.insert(env.clone(), field.path.clone())
+                && first_path != field.path
+            {
+                return Err(ConfigError::MetadataConflict {
+                    kind: "environment variable",
+                    name: env.clone(),
+                    first_path,
+                    second_path: field.path.clone(),
+                });
+            }
+        }
+        Ok(envs)
     }
 
     /// Returns explicit path aliases keyed by alias path.
-    #[must_use]
-    pub fn alias_overrides(&self) -> BTreeMap<String, String> {
-        let mut aliases = BTreeMap::new();
+    pub fn alias_overrides(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut aliases = BTreeMap::<String, String>::new();
+        let canonical_paths = self
+            .fields
+            .iter()
+            .map(|field| field.path.clone())
+            .collect::<BTreeSet<_>>();
+
         for field in &self.fields {
             for alias in &field.aliases {
+                if !alias_mapping_is_lossless(alias, &field.path) {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: alias.clone(),
+                        message: format!(
+                            "alias `{alias}` must preserve wildcard positions and cannot be deeper than canonical path `{}`",
+                            field.path
+                        ),
+                    });
+                }
+                if canonical_paths.contains(alias) && alias != &field.path {
+                    return Err(ConfigError::MetadataConflict {
+                        kind: "alias",
+                        name: alias.clone(),
+                        first_path: alias.clone(),
+                        second_path: field.path.clone(),
+                    });
+                }
+                if let Some(first_path) = aliases.get(alias)
+                    && first_path != &field.path
+                {
+                    return Err(ConfigError::MetadataConflict {
+                        kind: "alias",
+                        name: alias.clone(),
+                        first_path: first_path.clone(),
+                        second_path: field.path.clone(),
+                    });
+                }
+                if let Some((other_alias, sample_path)) =
+                    aliases.iter().find_map(|(other_alias, other_canonical)| {
+                        alias_patterns_are_ambiguous(
+                            alias,
+                            &field.path,
+                            other_alias,
+                            other_canonical,
+                        )
+                        .then(|| {
+                            (
+                                other_alias.clone(),
+                                alias_overlap_sample_path(alias, other_alias),
+                            )
+                        })
+                    })
+                {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: alias.clone(),
+                        message: format!(
+                            "alias `{alias}` overlaps ambiguously with `{other_alias}` for concrete path `{sample_path}`"
+                        ),
+                    });
+                }
                 aliases.insert(alias.clone(), field.path.clone());
             }
         }
-        aliases
+        Ok(aliases)
     }
 
     /// Returns field merge strategies keyed by normalized path.
@@ -239,6 +340,37 @@ impl ConfigMetadata {
             .iter()
             .map(|field| (field.path.clone(), field.merge))
             .collect()
+    }
+
+    /// Resolves the effective merge strategy for a concrete configuration path.
+    #[must_use]
+    pub fn merge_strategy_for(&self, path: &str) -> Option<MergeStrategy> {
+        let normalized = normalize_path(path);
+        if normalized.is_empty() {
+            return None;
+        }
+
+        let mut best = None::<(MetadataMatchScore, MergeStrategy)>;
+        for field in &self.fields {
+            for candidate in
+                std::iter::once(field.path.as_str()).chain(field.aliases.iter().map(String::as_str))
+            {
+                let Some(score) = metadata_match_score(&normalized, candidate) else {
+                    continue;
+                };
+
+                match &mut best {
+                    Some((best_score, best_merge)) if score > *best_score => {
+                        *best_score = score;
+                        *best_merge = field.merge;
+                    }
+                    None => best = Some((score, field.merge)),
+                    _ => {}
+                }
+            }
+        }
+
+        best.map(|(_, merge)| merge)
     }
 
     fn normalize(&mut self) {
@@ -455,7 +587,9 @@ impl FieldMetadata {
             self.deprecated = Some(deprecated);
         }
         self.has_default |= other.has_default;
-        self.merge = other.merge;
+        if other.merge != MergeStrategy::Merge || self.merge == MergeStrategy::Merge {
+            self.merge = other.merge;
+        }
         for rule in other.validations {
             if !self.validations.contains(&rule) {
                 self.validations.push(rule);
@@ -898,7 +1032,11 @@ pub trait TierMetadata {
     }
 }
 
-impl<T> TierMetadata for super::Secret<T> {}
+impl<T> TierMetadata for super::Secret<T> {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("").secret()])
+    }
+}
 impl TierMetadata for String {}
 impl TierMetadata for bool {}
 impl TierMetadata for char {}
@@ -935,12 +1073,59 @@ where
     }
 }
 
-impl<T> TierMetadata for Vec<T> {}
-impl<T, const N: usize> TierMetadata for [T; N] {}
-impl<T> TierMetadata for BTreeSet<T> {}
-impl<T> TierMetadata for HashSet<T> {}
-impl<K, V> TierMetadata for BTreeMap<K, V> {}
-impl<K, V, S> TierMetadata for HashMap<K, V, S> {}
+impl<T> TierMetadata for Vec<T>
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        prefixed_metadata("*", Vec::new(), T::metadata())
+    }
+}
+
+impl<T, const N: usize> TierMetadata for [T; N]
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        prefixed_metadata("*", Vec::new(), T::metadata())
+    }
+}
+
+impl<T> TierMetadata for BTreeSet<T>
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        prefixed_metadata("*", Vec::new(), T::metadata())
+    }
+}
+
+impl<T> TierMetadata for HashSet<T>
+where
+    T: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        prefixed_metadata("*", Vec::new(), T::metadata())
+    }
+}
+
+impl<K, V> TierMetadata for BTreeMap<K, V>
+where
+    V: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        prefixed_metadata("*", Vec::new(), V::metadata())
+    }
+}
+
+impl<K, V, S> TierMetadata for HashMap<K, V, S>
+where
+    V: TierMetadata,
+{
+    fn metadata() -> ConfigMetadata {
+        prefixed_metadata("*", Vec::new(), V::metadata())
+    }
+}
 
 impl<T> TierMetadata for Box<T>
 where
@@ -1063,4 +1248,128 @@ where
         normalized.push(path);
     }
     (!normalized.is_empty()).then_some(normalized)
+}
+
+fn metadata_match_score(path: &str, candidate: &str) -> Option<MetadataMatchScore> {
+    if candidate != path && !path_matches_pattern(path, candidate) {
+        return None;
+    }
+
+    let segments = candidate
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let positional_specificity = segments
+        .iter()
+        .map(|segment| *segment != "*")
+        .collect::<Vec<_>>();
+    let specificity = positional_specificity
+        .iter()
+        .filter(|segment| **segment)
+        .count();
+    Some(MetadataMatchScore {
+        segment_count: segments.len(),
+        specificity,
+        positional_specificity,
+    })
+}
+
+fn alias_mapping_is_lossless(alias: &str, canonical: &str) -> bool {
+    let alias_segments = path_segments(alias);
+    let canonical_segments = path_segments(canonical);
+    if canonical_segments.len() < alias_segments.len() {
+        return false;
+    }
+
+    for index in 0..alias_segments.len() {
+        let alias_wildcard = alias_segments[index] == "*";
+        let canonical_wildcard = canonical_segments[index] == "*";
+        if alias_wildcard != canonical_wildcard {
+            return false;
+        }
+    }
+
+    !canonical_segments[alias_segments.len()..].contains(&"*")
+}
+
+fn alias_patterns_are_ambiguous(
+    left_alias: &str,
+    left_canonical: &str,
+    right_alias: &str,
+    right_canonical: &str,
+) -> bool {
+    if alias_rank(left_alias) != alias_rank(right_alias) {
+        return false;
+    }
+
+    let left_segments = path_segments(left_alias);
+    let right_segments = path_segments(right_alias);
+    if left_segments.len() != right_segments.len() {
+        return false;
+    }
+
+    if !left_segments
+        .iter()
+        .zip(right_segments.iter())
+        .all(|(left, right)| *left == "*" || *right == "*" || left == right)
+    {
+        return false;
+    }
+
+    let sample_path = alias_overlap_sample_path(left_alias, right_alias);
+    rewrite_alias_sample(&sample_path, left_alias, left_canonical)
+        != rewrite_alias_sample(&sample_path, right_alias, right_canonical)
+}
+
+fn alias_rank(alias: &str) -> (usize, usize) {
+    let segments = path_segments(alias);
+    let specificity = segments.iter().filter(|segment| **segment != "*").count();
+    (segments.len(), specificity)
+}
+
+fn alias_overlap_sample_path(left: &str, right: &str) -> String {
+    path_segments(left)
+        .into_iter()
+        .zip(path_segments(right))
+        .map(|(left, right)| {
+            if left == "*" && right == "*" {
+                "item".to_owned()
+            } else if left == "*" {
+                right.to_owned()
+            } else {
+                left.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn rewrite_alias_sample(path: &str, alias: &str, canonical: &str) -> String {
+    let concrete_segments = path_segments(path);
+    let alias_segments = path_segments(alias);
+    let canonical_segments = path_segments(canonical);
+
+    let mut rewritten = canonical_segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            if *segment == "*" && alias_segments.get(index) == Some(&"*") {
+                concrete_segments[index].to_owned()
+            } else {
+                (*segment).to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    rewritten.extend(
+        concrete_segments[alias_segments.len()..]
+            .iter()
+            .map(|segment| (*segment).to_owned()),
+    );
+    normalize_path(&rewritten.join("."))
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }

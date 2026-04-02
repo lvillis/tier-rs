@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use tier::{
-    ArgsSource, ConfigLoader, EnvSource, MergeStrategy, Secret, TierConfig, TierMetadata,
-    ValidationCheck, ValidationRule,
+    ArgsSource, ConfigLoader, ConfigMetadata, EnvSource, FieldMetadata, MergeStrategy, Secret,
+    TierConfig, TierMetadata, ValidationCheck, ValidationRule,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
@@ -157,6 +157,134 @@ struct AdjacentEnumConfig {
     cache: CacheLayer,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InternalCacheLayer {
+    Memory { max_items: usize },
+    Disk { path_root: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct InternalEnumConfig {
+    cache: InternalCacheLayer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+#[serde(untagged)]
+enum UntaggedEndpoint {
+    Tcp { port: u16 },
+    Unix { path: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct UntaggedEnumConfig {
+    endpoint: UntaggedEndpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AcronymBackend {
+    HTTPServer { bind_port: u16 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct AcronymEnumConfig {
+    backend: AcronymBackend,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum InternalOverlapMode {
+    Text {
+        #[tier(non_empty)]
+        value: String,
+    },
+    Count {
+        #[tier(min = 1)]
+        value: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct InternalOverlapConfig {
+    mode: InternalOverlapMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum InternalAliasConflictMode {
+    A {
+        #[serde(alias = "legacy")]
+        first: String,
+    },
+    B {
+        #[serde(alias = "legacy")]
+        second: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct InternalAliasConflictConfig {
+    mode: InternalAliasConflictMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum InternalEnvConflictMode {
+    A {
+        #[tier(env = "APP_VALUE")]
+        first: String,
+    },
+    B {
+        #[tier(env = "APP_VALUE")]
+        second: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct InternalEnvConflictConfig {
+    mode: InternalEnvConflictMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct DerivedCollectionConfig {
+    users: Vec<DerivedCollectionUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct DerivedCollectionUser {
+    name: String,
+    password: Secret<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct DerivedCollectionValidatedConfig {
+    users: Vec<DerivedCollectionValidatedUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct DerivedCollectionValidatedUser {
+    #[tier(non_empty)]
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct SecretMergeConfig {
+    #[tier(merge = "replace")]
+    token: Secret<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RootMetadataInner {
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct RootMetadataOuter {
+    #[tier(env = "OUTER_VALUE", doc = "outer doc", example = "outer-example")]
+    inner: RootMetadataInner,
+}
+
 fn default_region() -> String {
     "ap-southeast-1".to_owned()
 }
@@ -217,6 +345,99 @@ impl Default for ExternalEnumConfig {
     }
 }
 
+impl Default for InternalEnumConfig {
+    fn default() -> Self {
+        Self {
+            cache: InternalCacheLayer::Memory { max_items: 64 },
+        }
+    }
+}
+
+impl Default for UntaggedEnumConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: UntaggedEndpoint::Tcp { port: 7000 },
+        }
+    }
+}
+
+impl Default for AcronymEnumConfig {
+    fn default() -> Self {
+        Self {
+            backend: AcronymBackend::HTTPServer { bind_port: 8080 },
+        }
+    }
+}
+
+impl Default for InternalOverlapConfig {
+    fn default() -> Self {
+        Self {
+            mode: InternalOverlapMode::Text {
+                value: "hello".to_owned(),
+            },
+        }
+    }
+}
+
+impl Default for InternalAliasConflictConfig {
+    fn default() -> Self {
+        Self {
+            mode: InternalAliasConflictMode::A {
+                first: "hello".to_owned(),
+            },
+        }
+    }
+}
+
+impl Default for InternalEnvConflictConfig {
+    fn default() -> Self {
+        Self {
+            mode: InternalEnvConflictMode::A {
+                first: "hello".to_owned(),
+            },
+        }
+    }
+}
+
+impl Default for DerivedCollectionConfig {
+    fn default() -> Self {
+        Self {
+            users: vec![DerivedCollectionUser {
+                name: "alice".to_owned(),
+                password: Secret::new("derived-collection-secret".to_owned()),
+            }],
+        }
+    }
+}
+
+impl Default for DerivedCollectionValidatedConfig {
+    fn default() -> Self {
+        Self {
+            users: vec![DerivedCollectionValidatedUser {
+                name: String::new(),
+            }],
+        }
+    }
+}
+
+impl Default for SecretMergeConfig {
+    fn default() -> Self {
+        Self {
+            token: Secret::new("seed".to_owned()),
+        }
+    }
+}
+
+impl TierMetadata for RootMetadataInner {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("")
+            .env("INNER_VALUE")
+            .doc("inner doc")
+            .example("inner-example")
+            .secret()])
+    }
+}
+
 #[test]
 fn derive_metadata_collects_structured_field_metadata() {
     let metadata = DerivedConfig::metadata();
@@ -236,6 +457,26 @@ fn derive_metadata_collects_structured_field_metadata() {
     assert!(paths.contains(&"database.password".to_owned()));
     assert!(paths.contains(&"database.token".to_owned()));
     assert!(paths.contains(&"api_key".to_owned()));
+}
+
+#[test]
+fn derive_metadata_preserves_explicit_merge_on_secret_fields() {
+    let metadata = SecretMergeConfig::metadata();
+    let token = metadata.field("token").expect("token metadata");
+
+    assert!(token.secret);
+    assert_eq!(token.merge, MergeStrategy::Replace);
+}
+
+#[test]
+fn field_level_metadata_overrides_type_level_root_metadata() {
+    let metadata = RootMetadataOuter::metadata();
+    let inner = metadata.field("inner").expect("inner metadata");
+
+    assert!(inner.secret);
+    assert_eq!(inner.env.as_deref(), Some("OUTER_VALUE"));
+    assert_eq!(inner.doc.as_deref(), Some("outer doc"));
+    assert_eq!(inner.example.as_deref(), Some("outer-example"));
 }
 
 #[test]
@@ -264,6 +505,83 @@ fn loader_can_use_derived_metadata_for_redaction_env_mapping_and_warnings() {
             .to_string()
             .contains("deprecated field `server.port`")
     }));
+}
+
+#[test]
+fn derive_metadata_supports_collection_item_paths_and_redaction() {
+    let metadata = DerivedCollectionConfig::metadata();
+    let password = metadata
+        .field("users.0.password")
+        .expect("users.0.password metadata");
+    assert!(password.secret);
+
+    let loaded = ConfigLoader::new(DerivedCollectionConfig::default())
+        .derive_metadata()
+        .load()
+        .expect("config loads");
+
+    let rendered = loaded.report().redacted_pretty_json();
+    assert!(rendered.contains("***redacted***"));
+    assert!(!rendered.contains("derived-collection-secret"));
+
+    let explanation = loaded
+        .report()
+        .explain("users.0.password")
+        .expect("password explanation");
+    assert!(explanation.redacted);
+}
+
+#[test]
+fn metadata_field_prefers_more_specific_matches() {
+    let metadata = tier::ConfigMetadata::from_fields([
+        tier::FieldMetadata::new("headers.*").doc("generic"),
+        tier::FieldMetadata::new("headers.service").doc("specific"),
+    ]);
+
+    let field = metadata
+        .field("headers.service")
+        .expect("headers.service metadata");
+    assert_eq!(field.doc.as_deref(), Some("specific"));
+}
+
+#[test]
+fn metadata_field_prefers_earlier_specific_segments_when_patterns_tie() {
+    let metadata = tier::ConfigMetadata::from_fields([
+        tier::FieldMetadata::new("users.*.password").doc("leaf specific"),
+        tier::FieldMetadata::new("users.admin.*").doc("prefix specific"),
+    ]);
+
+    let field = metadata
+        .field("users.admin.password")
+        .expect("users.admin.password metadata");
+    assert_eq!(field.doc.as_deref(), Some("prefix specific"));
+}
+
+#[test]
+fn merge_strategy_prefers_earlier_specific_segments_when_patterns_tie() {
+    let metadata = tier::ConfigMetadata::from_fields([
+        tier::FieldMetadata::new("users.*.password").merge_strategy(tier::MergeStrategy::Append),
+        tier::FieldMetadata::new("users.admin.*").merge_strategy(tier::MergeStrategy::Replace),
+    ]);
+
+    assert_eq!(
+        metadata.merge_strategy_for("users.admin.password"),
+        Some(tier::MergeStrategy::Replace)
+    );
+}
+
+#[test]
+fn derive_metadata_runs_declared_validations_for_collection_items() {
+    let error = ConfigLoader::new(DerivedCollectionValidatedConfig::default())
+        .derive_metadata()
+        .load()
+        .expect_err("declared validation must run for collection items");
+
+    let tier::ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    assert!(errors.iter().any(|error| error.path == "users.0.name"));
 }
 
 #[test]
@@ -437,6 +755,132 @@ fn derive_metadata_supports_adjacent_tagged_enums() {
 
     assert!(metadata.field("cache.config.maxItems").is_some());
     assert!(metadata.field("cache.config.pathRoot").is_some());
+}
+
+#[test]
+fn derive_metadata_supports_internal_tagged_enums() {
+    let metadata = InternalEnumConfig::metadata();
+
+    assert!(metadata.field("cache.kind").is_some());
+    assert!(metadata.field("cache.max_items").is_some());
+    assert!(metadata.field("cache.path_root").is_some());
+
+    let args = ArgsSource::from_args([
+        "tier",
+        "--set",
+        r#"cache.kind="memory""#,
+        "--set",
+        "cache.max_items=128",
+    ]);
+    let loaded = ConfigLoader::new(InternalEnumConfig::default())
+        .derive_metadata()
+        .args(args)
+        .load()
+        .expect("config loads");
+
+    assert_eq!(loaded.cache, InternalCacheLayer::Memory { max_items: 128 });
+}
+
+#[test]
+fn derive_metadata_supports_untagged_enums() {
+    let metadata = UntaggedEnumConfig::metadata();
+
+    assert!(metadata.field("endpoint.port").is_some());
+    assert!(metadata.field("endpoint.path").is_some());
+
+    let args = ArgsSource::from_args(["tier", "--set", "endpoint.port=7001"]);
+    let loaded = ConfigLoader::new(UntaggedEnumConfig::default())
+        .derive_metadata()
+        .args(args)
+        .load()
+        .expect("config loads");
+
+    assert_eq!(loaded.endpoint, UntaggedEndpoint::Tcp { port: 7001 });
+}
+
+#[test]
+fn derive_metadata_matches_serde_variant_rename_rules_for_acronyms() {
+    let serialized = serde_json::to_value(AcronymEnumConfig::default()).expect("serialize config");
+    let variant = serialized
+        .get("backend")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| object.keys().next())
+        .cloned()
+        .expect("variant key");
+
+    assert_eq!(variant, "h_t_t_p_server");
+
+    let metadata = AcronymEnumConfig::metadata();
+    assert!(metadata.field("backend.h_t_t_p_server.bind_port").is_some());
+}
+
+#[test]
+fn internal_tagged_enums_keep_variant_specific_validation_rules_isolated() {
+    let metadata = InternalOverlapConfig::metadata();
+    assert!(metadata.field("mode.kind").is_some());
+    assert!(metadata.field("mode.value").is_none());
+
+    let args = ArgsSource::from_args([
+        "tier",
+        "--set",
+        r#"mode.kind="Text""#,
+        "--set",
+        r#"mode.value="hello""#,
+    ]);
+    let loaded = ConfigLoader::new(InternalOverlapConfig::default())
+        .derive_metadata()
+        .args(args)
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.mode,
+        InternalOverlapMode::Text {
+            value: "hello".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn internal_tagged_enum_conflicting_aliases_are_dropped_instead_of_erroring() {
+    let metadata = InternalAliasConflictConfig::metadata();
+    assert!(metadata.field("mode.first").is_some());
+    assert!(metadata.field("mode.second").is_some());
+    assert!(metadata.field("mode.legacy").is_none());
+
+    let loaded = ConfigLoader::new(InternalAliasConflictConfig::default())
+        .derive_metadata()
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.mode,
+        InternalAliasConflictMode::A {
+            first: "hello".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn internal_tagged_enum_conflicting_env_names_are_dropped_instead_of_erroring() {
+    let metadata = InternalEnvConflictConfig::metadata();
+    let first = metadata.field("mode.first").expect("mode.first metadata");
+    let second = metadata.field("mode.second").expect("mode.second metadata");
+    assert!(first.env.is_none());
+    assert!(second.env.is_none());
+
+    let loaded = ConfigLoader::new(InternalEnvConflictConfig::default())
+        .derive_metadata()
+        .env(EnvSource::from_pairs([("APP_VALUE", "\"override\"")]).prefix("TIER"))
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.mode,
+        InternalEnvConflictMode::A {
+            first: "hello".to_owned(),
+        }
+    );
 }
 
 #[test]

@@ -313,6 +313,55 @@ pub enum ConfigError {
         message: String,
     },
 
+    /// Multiple input paths resolved to the same canonical path.
+    #[error(
+        "configuration paths `{first_path}` and `{second_path}` both resolve to `{canonical_path}`"
+    )]
+    PathConflict {
+        /// First input path that mapped to the canonical path.
+        first_path: String,
+        /// Second conflicting input path.
+        second_path: String,
+        /// Canonical path both inputs resolved to.
+        canonical_path: String,
+    },
+
+    /// A serialized object key could not be represented in tier's dot-delimited path model.
+    #[error(
+        "configuration object key `{key}` under {location} cannot be represented in tier paths: {message}",
+        location = format_path_location(path)
+    )]
+    InvalidPathKey {
+        /// Parent path containing the unsupported key.
+        path: String,
+        /// Unsupported object key segment.
+        key: String,
+        /// Human-readable validation failure.
+        message: String,
+    },
+
+    /// Metadata declared the same alias or environment variable more than once.
+    #[error("metadata {kind} `{name}` is assigned to both `{first_path}` and `{second_path}`")]
+    MetadataConflict {
+        /// Human-readable conflict category such as `alias` or `environment variable`.
+        kind: &'static str,
+        /// Conflicting alias or environment variable name.
+        name: String,
+        /// First path using the name.
+        first_path: String,
+        /// Second path using the name.
+        second_path: String,
+    },
+
+    /// Metadata declared an unsupported or invalid field configuration.
+    #[error("invalid metadata for `{path}`: {message}")]
+    MetadataInvalid {
+        /// Metadata path that triggered the validation failure.
+        path: String,
+        /// Human-readable validation failure.
+        message: String,
+    },
+
     /// A CLI flag requiring a value was missing one.
     #[error("missing value for CLI flag {flag}")]
     MissingArgValue {
@@ -404,6 +453,14 @@ fn format_unknown_fields(fields: &[UnknownField]) -> String {
         .map(|field| format!("- {field}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_path_location(path: &str) -> String {
+    if path.is_empty() {
+        "the configuration root".to_owned()
+    } else {
+        format!("`{path}`")
+    }
 }
 
 fn deserialize_source_suffix(provenance: &Option<SourceTrace>) -> String {

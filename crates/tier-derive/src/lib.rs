@@ -3,6 +3,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
+use std::collections::{HashMap, HashSet};
 use syn::{
     Attribute, Data, DataEnum, DataStruct, DeriveInput, Expr, Field, Fields, FieldsNamed,
     FieldsUnnamed, GenericArgument, Lit, LitStr, Meta, PathArguments, Type, parse_macro_input,
@@ -60,6 +61,7 @@ fn expand_struct_metadata(
             fields,
             SerdeFieldContext::for_struct(container_attrs),
             &format_ident!("metadata"),
+            None,
         ),
         Fields::Unnamed(fields) => {
             expand_newtype_struct_metadata(fields, &format_ident!("metadata"))
@@ -73,11 +75,18 @@ fn expand_enum_metadata(
     container_attrs: &SerdeContainerAttrs,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let representation = enum_representation(container_attrs)?;
+    let conflicts = non_external_variant_field_conflicts(&data_enum, container_attrs)?;
     let mut tokens = vec![quote! {
         metadata.push(
             ::tier::FieldMetadata::new("").merge_strategy(::tier::MergeStrategy::Replace)
         );
     }];
+    if let Some(tag) = representation.tag_field() {
+        let tag_lit = LitStr::new(tag, proc_macro2::Span::call_site());
+        tokens.push(quote! {
+            metadata.push(::tier::FieldMetadata::new(#tag_lit));
+        });
+    }
 
     for variant in data_enum.variants {
         let variant_ident = variant.ident.clone();
@@ -93,6 +102,7 @@ fn expand_enum_metadata(
                     fields,
                     SerdeFieldContext::for_enum_variant_fields(container_attrs),
                     &format_ident!("variant_metadata"),
+                    Some(&conflicts),
                 )?;
                 push_variant_tokens(
                     &mut tokens,
@@ -152,7 +162,7 @@ fn push_variant_tokens(
                 }
             });
         }
-        EnumRepresentation::Adjacent { content } => {
+        EnumRepresentation::Adjacent { content, .. } => {
             let content_lit = LitStr::new(content, span);
             tokens.push(quote! {
                 {
@@ -166,8 +176,14 @@ fn push_variant_tokens(
                 }
             });
         }
-        EnumRepresentation::Internal | EnumRepresentation::Untagged => {
-            tokens.extend(variant_tokens);
+        EnumRepresentation::Internal { .. } | EnumRepresentation::Untagged => {
+            tokens.push(quote! {
+                {
+                    let mut variant_metadata = ::tier::ConfigMetadata::new();
+                    #(#variant_tokens)*
+                    metadata.extend(variant_metadata);
+                }
+            });
         }
     }
 }
@@ -176,11 +192,17 @@ fn expand_named_fields_metadata(
     fields: FieldsNamed,
     context: SerdeFieldContext,
     accumulator: &proc_macro2::Ident,
+    conflicts: Option<&NonExternalFieldConflicts>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let mut field_tokens = Vec::new();
 
     for field in fields.named {
-        field_tokens.extend(expand_named_field_metadata(field, context, accumulator)?);
+        field_tokens.extend(expand_named_field_metadata(
+            field,
+            context,
+            accumulator,
+            conflicts,
+        )?);
     }
 
     Ok(field_tokens)
@@ -190,9 +212,10 @@ fn expand_named_field_metadata(
     field: Field,
     context: SerdeFieldContext,
     accumulator: &proc_macro2::Ident,
+    conflicts: Option<&NonExternalFieldConflicts>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let field_ident = field.ident.expect("named field");
-    let serde_attrs = parse_serde_field_attrs(&field.attrs, &field_ident, context)?;
+    let mut serde_attrs = parse_serde_field_attrs(&field.attrs, &field_ident, context)?;
     let mut attrs = parse_tier_attrs(&field.attrs)?;
     if attrs.doc.is_none() {
         attrs.doc = doc_comment(&field.attrs);
@@ -215,6 +238,25 @@ fn expand_named_field_metadata(
         ));
     }
 
+    if let Some(conflicts) = conflicts {
+        if conflicts
+            .skipped_fields
+            .contains(&serde_attrs.canonical_name)
+        {
+            return Ok(Vec::new());
+        }
+        serde_attrs
+            .aliases
+            .retain(|alias| !conflicts.skipped_aliases.contains(alias));
+        if attrs
+            .env
+            .as_ref()
+            .is_some_and(|env| conflicts.skipped_envs.contains(env))
+        {
+            attrs.env = None;
+        }
+    }
+
     validate_merge_strategy(&attrs, &field.ty)?;
     validate_validation_attrs(&attrs, &field_ident)?;
 
@@ -234,6 +276,13 @@ fn expand_named_field_metadata(
     }
 
     Ok(vec![
+        quote! {
+            #accumulator.extend(::tier::metadata::prefixed_metadata(
+                #canonical_name_lit,
+                ::std::vec![#(::std::string::String::from(#alias_lits)),*],
+                <#metadata_ty as ::tier::TierMetadata>::metadata(),
+            ));
+        },
         direct_field_metadata_tokens(
             accumulator,
             &canonical_name_lit,
@@ -242,13 +291,6 @@ fn expand_named_field_metadata(
             &attrs,
             is_secret_type(metadata_ty),
         )?,
-        quote! {
-            #accumulator.extend(::tier::metadata::prefixed_metadata(
-                #canonical_name_lit,
-                ::std::vec![#(::std::string::String::from(#alias_lits)),*],
-                <#metadata_ty as ::tier::TierMetadata>::metadata(),
-            ));
-        },
     ])
 }
 
@@ -290,7 +332,7 @@ fn expand_newtype_variant_metadata(
         ));
     }
 
-    if matches!(representation, EnumRepresentation::Internal) {
+    if matches!(representation, EnumRepresentation::Internal { .. }) {
         return Err(syn::Error::new(
             span,
             "internally tagged enums with tuple variants are not supported by TierConfig metadata",
@@ -432,12 +474,29 @@ struct SerdeVariantAttrs {
     skip_metadata: bool,
 }
 
+#[derive(Debug, Default)]
+struct NonExternalFieldConflicts {
+    skipped_fields: HashSet<String>,
+    skipped_aliases: HashSet<String>,
+    skipped_envs: HashSet<String>,
+}
+
 #[derive(Debug, Clone)]
 enum EnumRepresentation {
     External,
-    Internal,
-    Adjacent { content: String },
+    Internal { tag: String },
+    Adjacent { tag: String, content: String },
     Untagged,
+}
+
+impl EnumRepresentation {
+    fn tag_field(&self) -> Option<&str> {
+        match self {
+            Self::Internal { tag } => Some(tag.as_str()),
+            Self::Adjacent { tag, .. } => Some(tag.as_str()),
+            Self::External | Self::Untagged => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,79 +529,64 @@ impl RenameRule {
         }
     }
 
-    fn apply(self, value: &str) -> String {
-        let words = split_words(value);
+    fn apply_to_field(self, value: &str) -> String {
         match self {
-            Self::Lower => words.join("").to_ascii_lowercase(),
-            Self::Upper => words.join("").to_ascii_uppercase(),
-            Self::Pascal => words
-                .into_iter()
-                .map(|word| capitalize(&word))
-                .collect::<String>(),
-            Self::Camel => {
-                let mut words = words.into_iter();
-                let mut output = words
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                for word in words {
-                    output.push_str(&capitalize(&word));
+            Self::Lower | Self::Snake => value.to_owned(),
+            Self::Upper | Self::ScreamingSnake => value.to_ascii_uppercase(),
+            Self::Pascal => {
+                let mut output = String::new();
+                let mut capitalize = true;
+                for ch in value.chars() {
+                    if ch == '_' {
+                        capitalize = true;
+                    } else if capitalize {
+                        output.push(ch.to_ascii_uppercase());
+                        capitalize = false;
+                    } else {
+                        output.push(ch);
+                    }
                 }
                 output
             }
-            Self::Snake => words.join("_").to_ascii_lowercase(),
-            Self::ScreamingSnake => words.join("_").to_ascii_uppercase(),
-            Self::Kebab => words.join("-").to_ascii_lowercase(),
-            Self::ScreamingKebab => words.join("-").to_ascii_uppercase(),
-        }
-    }
-}
-
-fn split_words(value: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut previous_was_lower_or_digit = false;
-
-    for ch in value.chars() {
-        if matches!(ch, '_' | '-' | ' ') {
-            if !current.is_empty() {
-                words.push(current.to_ascii_lowercase());
-                current.clear();
+            Self::Camel => {
+                let pascal = Self::Pascal.apply_to_field(value);
+                lowercase_first_char(&pascal)
             }
-            previous_was_lower_or_digit = false;
-            continue;
+            Self::Kebab => value.replace('_', "-"),
+            Self::ScreamingKebab => value.replace('_', "-").to_ascii_uppercase(),
         }
-
-        let is_upper = ch.is_ascii_uppercase();
-        if is_upper && previous_was_lower_or_digit && !current.is_empty() {
-            words.push(current.to_ascii_lowercase());
-            current.clear();
-        }
-
-        current.push(ch);
-        previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
     }
 
-    if !current.is_empty() {
-        words.push(current.to_ascii_lowercase());
-    }
-
-    if words.is_empty() {
-        vec![value.to_ascii_lowercase()]
-    } else {
-        words
+    fn apply_to_variant(self, value: &str) -> String {
+        match self {
+            Self::Lower => value.to_ascii_lowercase(),
+            Self::Upper => value.to_ascii_uppercase(),
+            Self::Pascal => value.to_owned(),
+            Self::Camel => lowercase_first_char(value),
+            Self::Snake => {
+                let mut output = String::new();
+                for (index, ch) in value.char_indices() {
+                    if index > 0 && ch.is_uppercase() {
+                        output.push('_');
+                    }
+                    output.push(ch.to_ascii_lowercase());
+                }
+                output
+            }
+            Self::ScreamingSnake => Self::Snake.apply_to_variant(value).to_ascii_uppercase(),
+            Self::Kebab => Self::Snake.apply_to_variant(value).replace('_', "-"),
+            Self::ScreamingKebab => Self::Kebab.apply_to_variant(value).to_ascii_uppercase(),
+        }
     }
 }
 
-fn capitalize(value: &str) -> String {
+fn lowercase_first_char(value: &str) -> String {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
         return String::new();
     };
 
-    let mut output = first.to_ascii_uppercase().to_string();
+    let mut output = first.to_ascii_lowercase().to_string();
     output.push_str(chars.as_str());
     output
 }
@@ -777,13 +821,17 @@ fn parse_serde_field_attrs(
     let has_explicit_rename = rename_serialize.is_some() || rename_deserialize.is_some();
 
     let canonical_name = rename_serialize
-        .or_else(|| context.rename_serialize.map(|rule| rule.apply(&base_name)))
+        .or_else(|| {
+            context
+                .rename_serialize
+                .map(|rule| rule.apply_to_field(&base_name))
+        })
         .unwrap_or_else(|| base_name.clone());
     let deserialize_name = rename_deserialize
         .or_else(|| {
             context
                 .rename_deserialize
-                .map(|rule| rule.apply(&base_name))
+                .map(|rule| rule.apply_to_field(&base_name))
         })
         .unwrap_or_else(|| base_name.clone());
 
@@ -853,14 +901,14 @@ fn parse_serde_variant_attrs(
         .or_else(|| {
             container_attrs
                 .rename_all_serialize
-                .map(|rule| rule.apply(&base_name))
+                .map(|rule| rule.apply_to_variant(&base_name))
         })
         .unwrap_or_else(|| base_name.clone());
     let deserialize_name = rename_deserialize
         .or_else(|| {
             container_attrs
                 .rename_all_deserialize
-                .map(|rule| rule.apply(&base_name))
+                .map(|rule| rule.apply_to_variant(&base_name))
         })
         .unwrap_or_else(|| base_name.clone());
 
@@ -925,13 +973,94 @@ fn enum_representation(container_attrs: &SerdeContainerAttrs) -> syn::Result<Enu
     }
 
     match (&container_attrs.tag, &container_attrs.content) {
-        (Some(_), Some(content)) => Ok(EnumRepresentation::Adjacent {
+        (Some(tag), Some(content)) => Ok(EnumRepresentation::Adjacent {
+            tag: tag.clone(),
             content: content.clone(),
         }),
-        (Some(_), None) => Ok(EnumRepresentation::Internal),
+        (Some(tag), None) => Ok(EnumRepresentation::Internal { tag: tag.clone() }),
         (None, None) => Ok(EnumRepresentation::External),
         (None, Some(_)) => unreachable!("validated above"),
     }
+}
+
+fn non_external_variant_field_conflicts(
+    data_enum: &DataEnum,
+    container_attrs: &SerdeContainerAttrs,
+) -> syn::Result<NonExternalFieldConflicts> {
+    let representation = enum_representation(container_attrs)?;
+    if matches!(representation, EnumRepresentation::External) {
+        return Ok(NonExternalFieldConflicts::default());
+    }
+
+    let context = SerdeFieldContext::for_enum_variant_fields(container_attrs);
+    let mut counts = HashMap::<String, usize>::new();
+    let mut canonical_names = HashSet::new();
+    let mut alias_owners = HashMap::<String, HashSet<String>>::new();
+    let mut env_owners = HashMap::<String, HashSet<String>>::new();
+
+    for variant in &data_enum.variants {
+        let variant_attrs =
+            parse_serde_variant_attrs(&variant.attrs, &variant.ident, container_attrs)?;
+        if variant_attrs.skip_metadata {
+            continue;
+        }
+
+        let Fields::Named(fields) = &variant.fields else {
+            continue;
+        };
+
+        let mut seen = HashSet::new();
+        for field in &fields.named {
+            let Some(field_ident) = &field.ident else {
+                continue;
+            };
+            let serde_attrs = parse_serde_field_attrs(&field.attrs, field_ident, context)?;
+            if serde_attrs.skip_metadata || serde_attrs.flatten {
+                continue;
+            }
+            let tier_attrs = parse_tier_attrs(&field.attrs)?;
+            let canonical_name = serde_attrs.canonical_name.clone();
+            if seen.insert(canonical_name.clone()) {
+                canonical_names.insert(canonical_name.clone());
+                *counts.entry(canonical_name.clone()).or_default() += 1;
+            }
+            for alias in serde_attrs.aliases {
+                alias_owners
+                    .entry(alias)
+                    .or_default()
+                    .insert(canonical_name.clone());
+            }
+            if let Some(env) = tier_attrs.env {
+                env_owners
+                    .entry(env)
+                    .or_default()
+                    .insert(canonical_name.clone());
+            }
+        }
+    }
+
+    let skipped_fields = counts
+        .into_iter()
+        .filter_map(|(path, count)| (count > 1).then_some(path))
+        .collect::<HashSet<_>>();
+
+    let skipped_aliases = alias_owners
+        .into_iter()
+        .filter_map(|(alias, owners)| {
+            (owners.len() > 1 || canonical_names.contains(&alias)).then_some(alias)
+        })
+        .collect::<HashSet<_>>();
+
+    let skipped_envs = env_owners
+        .into_iter()
+        .filter_map(|(env, owners)| (owners.len() > 1).then_some(env))
+        .collect::<HashSet<_>>();
+
+    Ok(NonExternalFieldConflicts {
+        skipped_fields,
+        skipped_aliases,
+        skipped_envs,
+    })
 }
 
 fn has_field_naming_attrs(attributes: &[Attribute]) -> syn::Result<bool> {
