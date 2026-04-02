@@ -21,7 +21,7 @@ quote = { version = "1.0.45", default-features = false, features = ["proc-macro"
 syn = { version = "2.0.117", default-features = false, features = ["clone-impls", "derive", "extra-traits", "full", "parsing", "printing", "proc-macro"] }
 
 # Serialization, schema, and config formats.
-regex = { version = "1.12.2", default-features = false, features = ["std", "unicode"] }
+regex = { version = "1.12.3", default-features = false, features = ["std", "unicode"] }
 schemars = { version = "1.2.1", default-features = false, features = ["derive", "std"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_ignored = { version = "0.1.14", default-features = false }
