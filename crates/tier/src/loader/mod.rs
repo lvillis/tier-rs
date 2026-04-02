@@ -138,6 +138,37 @@ impl Display for FileFormat {
 
 #[derive(Debug, Clone)]
 /// File-backed configuration source definition.
+///
+/// `FileSource` is useful when you need more control than
+/// [`ConfigLoader::file`] or [`ConfigLoader::optional_file`] provide, such as
+/// candidate-path search or explicit format selection.
+///
+/// # Examples
+///
+/// ```no_run
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ConfigLoader, FileFormat, FileSource};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct AppConfig {
+///     port: u16,
+/// }
+///
+/// impl Default for AppConfig {
+///     fn default() -> Self {
+///         Self { port: 3000 }
+///     }
+/// }
+///
+/// let loaded = ConfigLoader::new(AppConfig::default())
+///     .with_file(
+///         FileSource::search(["config/local", "config/default.toml"]).format(FileFormat::Toml),
+///     )
+///     .load()?;
+///
+/// assert!(loaded.port >= 1);
+/// # Ok::<(), tier::ConfigError>(())
+/// ```
 pub struct FileSource {
     candidates: Vec<PathBuf>,
     required: bool,
@@ -209,6 +240,41 @@ impl FileSource {
 
 #[derive(Debug, Clone)]
 /// Environment variable source definition.
+///
+/// Use `EnvSource` when environment variables should participate in the same
+/// layered pipeline as defaults and files.
+///
+/// # Examples
+///
+/// ```
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ConfigLoader, EnvSource};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct AppConfig {
+///     server: ServerConfig,
+/// }
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct ServerConfig {
+///     port: u16,
+/// }
+///
+/// impl Default for AppConfig {
+///     fn default() -> Self {
+///         Self {
+///             server: ServerConfig { port: 3000 },
+///         }
+///     }
+/// }
+///
+/// let loaded = ConfigLoader::new(AppConfig::default())
+///     .env(EnvSource::from_pairs([("APP__SERVER__PORT", "7000")]).prefix("APP"))
+///     .load()?;
+///
+/// assert_eq!(loaded.server.port, 7000);
+/// # Ok::<(), tier::ConfigError>(())
+/// ```
 pub struct EnvSource {
     vars: BTreeMap<String, String>,
     prefix: Option<String>,
@@ -276,6 +342,34 @@ impl EnvSource {
 
 #[derive(Debug, Clone)]
 /// CLI override source definition.
+///
+/// `ArgsSource` parses the same `--config`, `--profile`, and `--set key=value`
+/// flags that `tier` accepts through its reusable `clap` integration.
+///
+/// # Examples
+///
+/// ```
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ArgsSource, ConfigLoader};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct AppConfig {
+///     port: u16,
+/// }
+///
+/// impl Default for AppConfig {
+///     fn default() -> Self {
+///         Self { port: 3000 }
+///     }
+/// }
+///
+/// let loaded = ConfigLoader::new(AppConfig::default())
+///     .args(ArgsSource::from_args(["app", "--set", "port=7000"]))
+///     .load()?;
+///
+/// assert_eq!(loaded.port, 7000);
+/// # Ok::<(), tier::ConfigError>(())
+/// ```
 pub struct ArgsSource {
     args: Vec<String>,
 }

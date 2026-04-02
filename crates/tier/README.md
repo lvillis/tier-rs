@@ -26,6 +26,14 @@ Use `tier` when you want:
 - `json`: JSON file parsing
 - `yaml`: YAML file parsing
 
+## Feature Map
+
+- Loading: `ConfigLoader`, `FileSource`, `EnvSource`, `ArgsSource`
+- Metadata: `ConfigMetadata`, `FieldMetadata`, `TierConfig`
+- Diagnostics: `ConfigReport`, `doctor()`, `explain()`, `audit_report()`
+- Schema and docs: `json_schema_*`, `annotated_json_schema_*`, `config_example_*`, `EnvDocOptions`
+- Reload: `ReloadHandle`, `PollingWatcher`, `NativeWatcher`
+
 ## Input Semantics
 
 - Env values and `--set key=value` overrides are string-first inputs

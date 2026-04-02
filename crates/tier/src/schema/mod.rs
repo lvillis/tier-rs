@@ -12,6 +12,22 @@ use self::toml::render_example_toml;
 pub use schemars::JsonSchema;
 
 /// Exports the JSON Schema for a configuration type.
+///
+/// # Examples
+///
+/// ```
+/// use schemars::JsonSchema;
+/// use serde::{Deserialize, Serialize};
+/// use tier::json_schema_for;
+///
+/// #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+/// struct AppConfig {
+///     port: u16,
+/// }
+///
+/// let schema = json_schema_for::<AppConfig>();
+/// assert_eq!(schema["type"], "object");
+/// ```
 #[must_use]
 pub fn json_schema_for<T>() -> Value
 where
@@ -32,6 +48,32 @@ where
 }
 
 /// Exports the JSON Schema for a configuration type annotated with `tier` metadata.
+///
+/// # Examples
+///
+/// ```
+/// use schemars::JsonSchema;
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ConfigMetadata, FieldMetadata, TierMetadata, annotated_json_schema_for};
+///
+/// #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+/// struct AppConfig {
+///     port: u16,
+/// }
+///
+/// impl TierMetadata for AppConfig {
+///     fn metadata() -> ConfigMetadata {
+///         ConfigMetadata::from_fields([
+///             FieldMetadata::new("port")
+///                 .env("APP_PORT")
+///                 .doc("Port used for incoming traffic"),
+///         ])
+///     }
+/// }
+///
+/// let schema = annotated_json_schema_for::<AppConfig>();
+/// assert_eq!(schema["properties"]["port"]["x-tier-env"], "APP_PORT");
+/// ```
 #[must_use]
 pub fn annotated_json_schema_for<T>() -> Value
 where
@@ -56,6 +98,28 @@ where
 }
 
 /// Generates a machine-readable example configuration value from schema and metadata.
+///
+/// # Examples
+///
+/// ```
+/// use schemars::JsonSchema;
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ConfigMetadata, FieldMetadata, TierMetadata, config_example_for};
+///
+/// #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+/// struct AppConfig {
+///     port: u16,
+/// }
+///
+/// impl TierMetadata for AppConfig {
+///     fn metadata() -> ConfigMetadata {
+///         ConfigMetadata::from_fields([FieldMetadata::new("port").example("8080")])
+///     }
+/// }
+///
+/// let example = config_example_for::<AppConfig>();
+/// assert_eq!(example["port"], 8080);
+/// ```
 #[must_use]
 pub fn config_example_for<T>() -> Value
 where
@@ -78,6 +142,33 @@ where
 
 #[cfg(feature = "toml")]
 /// Renders the generated example configuration as commented TOML.
+///
+/// # Examples
+///
+/// ```
+/// use schemars::JsonSchema;
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ConfigMetadata, FieldMetadata, TierMetadata, config_example_toml};
+///
+/// #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+/// struct AppConfig {
+///     port: u16,
+/// }
+///
+/// impl TierMetadata for AppConfig {
+///     fn metadata() -> ConfigMetadata {
+///         ConfigMetadata::from_fields([
+///             FieldMetadata::new("port")
+///                 .doc("Port used for incoming traffic")
+///                 .example("8080"),
+///         ])
+///     }
+/// }
+///
+/// let example = config_example_toml::<AppConfig>();
+/// assert!(example.contains("8080"));
+/// assert!(example.contains("incoming traffic"));
+/// ```
 #[must_use]
 pub fn config_example_toml<T>() -> String
 where

@@ -59,6 +59,18 @@ pub struct EnvDocsReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Options controlling schema-derived environment variable documentation.
+///
+/// Use `EnvDocOptions` to keep generated env docs aligned with the same prefix
+/// and separator conventions you use at runtime.
+///
+/// # Examples
+///
+/// ```
+/// use tier::EnvDocOptions;
+///
+/// let env = EnvDocOptions::prefixed("APP").env_name("server.port");
+/// assert_eq!(env, "APP__SERVER__PORT");
+/// ```
 pub struct EnvDocOptions {
     prefix: Option<String>,
     separator: String,
@@ -168,6 +180,38 @@ fn normalize_env_prefix(prefix: &str, separator: &str) -> String {
 }
 
 /// Generates environment variable documentation rows from a configuration schema.
+///
+/// # Examples
+///
+/// ```
+/// use schemars::JsonSchema;
+/// use serde::{Deserialize, Serialize};
+/// use tier::{ConfigMetadata, EnvDocOptions, FieldMetadata, TierMetadata, env_docs_for};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// struct AppConfig {
+///     server: ServerConfig,
+/// }
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// struct ServerConfig {
+///     port: u16,
+/// }
+///
+/// impl TierMetadata for AppConfig {
+///     fn metadata() -> ConfigMetadata {
+///         ConfigMetadata::from_fields([
+///             FieldMetadata::new("server.port")
+///                 .env("APP_SERVER_PORT")
+///                 .doc("Port used for incoming traffic"),
+///         ])
+///     }
+/// }
+///
+/// let docs = env_docs_for::<AppConfig>(&EnvDocOptions::prefixed("APP"));
+/// assert_eq!(docs[0].path, "server.port");
+/// assert_eq!(docs[0].env, "APP_SERVER_PORT");
+/// ```
 #[must_use]
 pub fn env_docs_for<T>(options: &EnvDocOptions) -> Vec<EnvDocEntry>
 where
