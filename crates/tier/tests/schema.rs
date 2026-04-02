@@ -131,6 +131,36 @@ struct PrimitiveArraySchemaConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ContainsArraySchemaConfig;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BooleanContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PropertyNamesContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UniqueContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PatternPropertiesContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UniqueFixedArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PatternPropertiesDynamicMapSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PatternPropertiesPropertyNamesDynamicMapSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PatternPropertiesMinPropertiesDynamicMapSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PropertyNamesFalseAdditionalPropertiesSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PropertyNamesFalsePatternPropertiesSchemaConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct NestedPrimitiveArraySchemaConfig {
     matrix: Vec<Vec<u16>>,
@@ -193,6 +223,27 @@ struct RefSiblingTupleSchemaConfig;
 struct PropertyAndMapSchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct MinPropertiesDynamicMapSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MinPropertiesSatisfiedByFixedPropertySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MaxPropertiesExhaustedByRequiredFixedPropertySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImplicitAdditionalPropertiesMinPropertiesSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExplicitlyForbiddenAdditionalPropertiesMinPropertiesSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PropertyNamesEnumDynamicMapSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AllOfRequiredUnionSchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +290,9 @@ struct MultipleOfContainsArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdditionalPropertiesFalseContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MinPropertiesContainsArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OverlaidFixedItemsContainsSchemaConfig;
@@ -432,6 +486,223 @@ impl TierMetadata for ContainsArraySchemaConfig {
     }
 }
 
+impl JsonSchema for BooleanContainsArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("BooleanContainsArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::BooleanContainsArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "contains": true,
+                    "minContains": 1
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid boolean contains array schema")
+    }
+}
+
+impl TierMetadata for BooleanContainsArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("ports.*").doc("Any matching value")])
+    }
+}
+
+impl JsonSchema for PropertyNamesContainsArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PropertyNamesContainsArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PropertyNamesContainsArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "backends": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "object",
+                            "example": {
+                                "legacy": {
+                                    "token": "stale"
+                                }
+                            }
+                        }
+                    ],
+                    "contains": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "propertyNames": {
+                            "enum": ["primary"]
+                        },
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "fresh" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "minContains": 1
+                }
+            },
+            "required": ["backends"]
+        }))
+        .expect("valid propertyNames contains array schema")
+    }
+}
+
+impl TierMetadata for PropertyNamesContainsArraySchemaConfig {}
+
+impl JsonSchema for UniqueContainsArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("UniqueContainsArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::UniqueContainsArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "prefixItems": [
+                        { "type": "integer", "example": 8080 }
+                    ],
+                    "contains": {
+                        "type": "integer",
+                        "example": 8080
+                    },
+                    "minContains": 2,
+                    "uniqueItems": true
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid unique contains array schema")
+    }
+}
+
+impl TierMetadata for UniqueContainsArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("ports.*")
+            .doc("Unique required matching port")
+            .min(1)
+            .max(65_535)])
+    }
+}
+
+impl JsonSchema for PatternPropertiesContainsArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PatternPropertiesContainsArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PatternPropertiesContainsArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "backends": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "object",
+                            "example": {
+                                "svc-primary": {
+                                    "token": "fresh"
+                                }
+                            }
+                        }
+                    ],
+                    "contains": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "patternProperties": {
+                            "^svc-": {
+                                "type": "object",
+                                "properties": {
+                                    "token": { "type": "string", "example": "fresh" }
+                                },
+                                "required": ["token"]
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    "minContains": 1
+                }
+            },
+            "required": ["backends"]
+        }))
+        .expect("valid patternProperties contains array schema")
+    }
+}
+
+impl TierMetadata for PatternPropertiesContainsArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([
+            FieldMetadata::new("backends.*").doc("Pattern matched backend item")
+        ])
+    }
+}
+
+impl JsonSchema for UniqueFixedArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("UniqueFixedArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::UniqueFixedArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "prefixItems": [
+                        { "type": "integer", "example": 8080 },
+                        { "type": "integer", "example": 8080 }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "uniqueItems": true
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid unique fixed array schema")
+    }
+}
+
+impl TierMetadata for UniqueFixedArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("ports.*")
+            .doc("Unique fixed port")
+            .min(1)
+            .max(65_535)])
+    }
+}
+
 impl TierMetadata for NestedPrimitiveArraySchemaConfig {
     fn metadata() -> ConfigMetadata {
         ConfigMetadata::from_fields([FieldMetadata::new("matrix.*.*")
@@ -470,6 +741,13 @@ impl TierMetadata for AllOfLocalSchemaConfig {}
 impl TierMetadata for OneOfLocalSchemaConfig {}
 impl TierMetadata for RefSiblingSchemaConfig {}
 impl TierMetadata for PropertyAndMapSchemaConfig {}
+impl TierMetadata for MinPropertiesDynamicMapSchemaConfig {}
+impl TierMetadata for MinPropertiesSatisfiedByFixedPropertySchemaConfig {}
+impl TierMetadata for MaxPropertiesExhaustedByRequiredFixedPropertySchemaConfig {}
+impl TierMetadata for MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig {}
+impl TierMetadata for ImplicitAdditionalPropertiesMinPropertiesSchemaConfig {}
+impl TierMetadata for ExplicitlyForbiddenAdditionalPropertiesMinPropertiesSchemaConfig {}
+impl TierMetadata for PropertyNamesEnumDynamicMapSchemaConfig {}
 impl TierMetadata for AllOfRequiredUnionSchemaConfig {}
 impl TierMetadata for MixedArrayTomlSchemaConfig {}
 impl TierMetadata for OneOfUnionTypeSchemaConfig {}
@@ -697,6 +975,442 @@ impl JsonSchema for PropertyAndMapSchemaConfig {
         .expect("valid property and map schema")
     }
 }
+
+impl JsonSchema for MinPropertiesDynamicMapSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("MinPropertiesDynamicMapSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::MinPropertiesDynamicMapSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "minProperties": 2,
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "token": { "type": "string" }
+                        },
+                        "required": ["token"]
+                    }
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid minProperties dynamic map schema")
+    }
+}
+
+impl JsonSchema for MinPropertiesSatisfiedByFixedPropertySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("MinPropertiesSatisfiedByFixedPropertySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::MinPropertiesSatisfiedByFixedPropertySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "properties": {
+                        "primary": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "token": { "type": "string" }
+                        },
+                        "required": ["token"]
+                    }
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid minProperties schema satisfied by fixed property")
+    }
+}
+
+impl JsonSchema for MaxPropertiesExhaustedByRequiredFixedPropertySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("MaxPropertiesExhaustedByRequiredFixedPropertySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::MaxPropertiesExhaustedByRequiredFixedPropertySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "maxProperties": 1,
+                    "properties": {
+                        "primary": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "required": ["primary"],
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "token": { "type": "string" }
+                        },
+                        "required": ["token"]
+                    }
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid maxProperties schema with exhausted required fixed property")
+    }
+}
+
+impl JsonSchema for MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "maxProperties": 1,
+                    "properties": {
+                        "primary": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "primary-token" }
+                            },
+                            "required": ["token"]
+                        },
+                        "secondary": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "secondary-token" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "required": ["primary"]
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid maxProperties schema that trims optional fixed properties")
+    }
+}
+
+impl JsonSchema for ImplicitAdditionalPropertiesMinPropertiesSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ImplicitAdditionalPropertiesMinPropertiesSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::ImplicitAdditionalPropertiesMinPropertiesSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "minProperties": 2,
+                    "properties": {
+                        "primary": {
+                            "type": "string",
+                            "example": "primary-token"
+                        }
+                    },
+                    "required": ["primary"]
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with implicit additionalProperties and minProperties")
+    }
+}
+
+impl JsonSchema for ExplicitlyForbiddenAdditionalPropertiesMinPropertiesSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ExplicitlyForbiddenAdditionalPropertiesMinPropertiesSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed(
+            "tier::tests::ExplicitlyForbiddenAdditionalPropertiesMinPropertiesSchemaConfig",
+        )
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "minProperties": 2,
+                    "properties": {
+                        "primary": {
+                            "type": "string",
+                            "example": "primary-token"
+                        }
+                    },
+                    "required": ["primary"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with forbidden additionalProperties and oversized minProperties")
+    }
+}
+
+impl JsonSchema for PropertyNamesEnumDynamicMapSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PropertyNamesEnumDynamicMapSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PropertyNamesEnumDynamicMapSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "minProperties": 2,
+                    "propertyNames": {
+                        "enum": ["primary", "secondary"]
+                    },
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "token": { "type": "string", "example": "enum-token" }
+                        },
+                        "required": ["token"]
+                    }
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with propertyNames-constrained dynamic map")
+    }
+}
+
+impl JsonSchema for PatternPropertiesDynamicMapSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PatternPropertiesDynamicMapSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PatternPropertiesDynamicMapSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^svc-": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "pattern-token" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with patternProperties dynamic map")
+    }
+}
+
+impl TierMetadata for PatternPropertiesDynamicMapSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([
+            FieldMetadata::new("services.*.token").doc("Pattern service token")
+        ])
+    }
+}
+
+impl JsonSchema for PatternPropertiesMinPropertiesDynamicMapSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PatternPropertiesMinPropertiesDynamicMapSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PatternPropertiesMinPropertiesDynamicMapSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "minProperties": 2,
+                    "patternProperties": {
+                        "^svc-": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "pattern-token" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with minProperties-constrained patternProperties")
+    }
+}
+
+impl TierMetadata for PatternPropertiesMinPropertiesDynamicMapSchemaConfig {}
+
+impl JsonSchema for PatternPropertiesPropertyNamesDynamicMapSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PatternPropertiesPropertyNamesDynamicMapSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PatternPropertiesPropertyNamesDynamicMapSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "propertyNames": {
+                        "enum": ["svc-primary"]
+                    },
+                    "patternProperties": {
+                        "^svc-": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "pattern-token" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with patternProperties constrained by propertyNames")
+    }
+}
+
+impl TierMetadata for PatternPropertiesPropertyNamesDynamicMapSchemaConfig {}
+
+impl JsonSchema for PropertyNamesFalseAdditionalPropertiesSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PropertyNamesFalseAdditionalPropertiesSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PropertyNamesFalseAdditionalPropertiesSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "propertyNames": false,
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "token": { "type": "string", "example": "blocked-token" }
+                        },
+                        "required": ["token"]
+                    }
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with propertyNames false and additionalProperties")
+    }
+}
+
+impl TierMetadata for PropertyNamesFalseAdditionalPropertiesSchemaConfig {}
+
+impl JsonSchema for PropertyNamesFalsePatternPropertiesSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PropertyNamesFalsePatternPropertiesSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::PropertyNamesFalsePatternPropertiesSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "object",
+                    "propertyNames": false,
+                    "patternProperties": {
+                        "^svc-": {
+                            "type": "object",
+                            "properties": {
+                                "token": { "type": "string", "example": "blocked-token" }
+                            },
+                            "required": ["token"]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["services"]
+        }))
+        .expect("valid schema with propertyNames false and patternProperties")
+    }
+}
+
+impl TierMetadata for PropertyNamesFalsePatternPropertiesSchemaConfig {}
 
 impl JsonSchema for AllOfRequiredUnionSchemaConfig {
     fn schema_name() -> Cow<'static, str> {
@@ -1284,6 +1998,54 @@ impl JsonSchema for AdditionalPropertiesFalseContainsArraySchemaConfig {
 impl TierMetadata for AdditionalPropertiesFalseContainsArraySchemaConfig {
     fn metadata() -> ConfigMetadata {
         ConfigMetadata::from_fields([FieldMetadata::new("backends.*").doc("Strict backend object")])
+    }
+}
+
+impl JsonSchema for MinPropertiesContainsArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("MinPropertiesContainsArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::MinPropertiesContainsArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "backends": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "object"
+                        }
+                    ],
+                    "contains": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "example": "prod"
+                            }
+                        },
+                        "minProperties": 1,
+                        "additionalProperties": false
+                    },
+                    "minContains": 1
+                }
+            },
+            "required": ["backends"]
+        }))
+        .expect("valid minProperties contains array schema")
+    }
+}
+
+impl TierMetadata for MinPropertiesContainsArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([
+            FieldMetadata::new("backends.*").doc("Non-empty backend object")
+        ])
     }
 }
 
@@ -1950,6 +2712,49 @@ fn env_docs_include_contains_array_items() {
 }
 
 #[test]
+fn env_docs_include_boolean_contains_array_items() {
+    let docs = env_docs_for::<BooleanContainsArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "ports.*")
+        .expect("ports.* env doc entry");
+
+    assert_eq!(wildcard.env, "APP__PORTS__{item}");
+    assert_eq!(wildcard.ty, "any");
+    assert!(wildcard.required);
+    assert_eq!(wildcard.description.as_deref(), Some("Any matching value"));
+}
+
+#[test]
+fn env_docs_mark_property_names_contains_wildcards_required_when_fixed_items_use_invalid_keys() {
+    let docs =
+        env_docs_for::<PropertyNamesContainsArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "backends.*.*.token")
+        .expect("backends.*.*.token env doc entry");
+
+    assert_eq!(wildcard.env, "APP__BACKENDS__{item}__{item}__TOKEN");
+    assert!(wildcard.required);
+}
+
+#[test]
+fn env_docs_do_not_mark_pattern_properties_contains_wildcards_required_when_fixed_items_match() {
+    let docs =
+        env_docs_for::<PatternPropertiesContainsArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "backends.*.*.token")
+        .expect("backends.*.*.token env doc entry");
+
+    assert_eq!(wildcard.env, "APP__BACKENDS__{item}__{item}__TOKEN");
+    assert!(!wildcard.required);
+}
+
+#[test]
 fn env_docs_do_not_mark_contains_wildcards_required_when_fixed_items_already_satisfy_it() {
     let docs =
         env_docs_for::<ContainsSatisfiedByFixedTupleSchemaConfig>(&EnvDocOptions::prefixed("APP"));
@@ -2016,6 +2821,21 @@ fn env_docs_mark_contains_wildcards_required_when_fixed_objects_violate_addition
     let docs = env_docs_for::<AdditionalPropertiesFalseContainsArraySchemaConfig>(
         &EnvDocOptions::prefixed("APP"),
     );
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "backends.*.kind")
+        .expect("backends.*.kind env doc entry");
+
+    assert_eq!(wildcard.env, "APP__BACKENDS__{item}__KIND");
+    assert_eq!(wildcard.ty, "string");
+    assert!(wildcard.required);
+}
+
+#[test]
+fn env_docs_mark_contains_wildcards_required_when_fixed_objects_violate_min_properties() {
+    let docs =
+        env_docs_for::<MinPropertiesContainsArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));
 
     let wildcard = docs
         .iter()
@@ -2137,6 +2957,220 @@ fn env_docs_include_additional_properties_alongside_fixed_properties() {
         entry.path == "services.*.token"
             && entry.env == "APP__SERVICES__{item}__TOKEN"
             && !entry.required
+    }));
+}
+
+#[test]
+fn env_docs_mark_dynamic_map_items_required_when_min_properties_requires_entries() {
+    let docs = env_docs_for::<MinPropertiesDynamicMapSchemaConfig>(&EnvDocOptions::prefixed("APP"));
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.*.token"
+            && entry.env == "APP__SERVICES__{item}__TOKEN"
+            && entry.required
+    }));
+}
+
+#[test]
+fn env_docs_do_not_mark_dynamic_map_items_required_when_fixed_properties_can_satisfy_min_properties()
+ {
+    let docs = env_docs_for::<MinPropertiesSatisfiedByFixedPropertySchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.*.token"
+            && entry.env == "APP__SERVICES__{item}__TOKEN"
+            && !entry.required
+    }));
+}
+
+#[test]
+fn env_docs_omit_dynamic_map_items_when_max_properties_is_exhausted_by_required_fixed_properties() {
+    let docs = env_docs_for::<MaxPropertiesExhaustedByRequiredFixedPropertySchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.primary.token"
+            && entry.env == "APP__SERVICES__PRIMARY__TOKEN"
+            && entry.required
+    }));
+    assert!(!docs.iter().any(|entry| entry.path == "services.*.token"));
+}
+
+#[test]
+fn env_docs_omit_dynamic_entries_when_property_names_forbid_all_keys() {
+    let additional_docs = env_docs_for::<PropertyNamesFalseAdditionalPropertiesSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+    let pattern_docs = env_docs_for::<PropertyNamesFalsePatternPropertiesSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(
+        !additional_docs
+            .iter()
+            .any(|entry| entry.path == "services.*.token")
+    );
+    assert!(
+        !pattern_docs
+            .iter()
+            .any(|entry| entry.path == "services.*.token")
+    );
+}
+
+#[test]
+fn example_generation_satisfies_min_properties_for_dynamic_maps() {
+    let example = config_example_for::<MinPropertiesDynamicMapSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 2);
+    assert_eq!(services["{item}"]["token"].as_str(), Some("example"));
+    assert_eq!(services["{key}"]["token"].as_str(), Some("example"));
+}
+
+#[test]
+fn example_generation_omits_dynamic_entries_when_property_names_forbid_all_keys() {
+    let additional = config_example_for::<PropertyNamesFalseAdditionalPropertiesSchemaConfig>();
+    let pattern = config_example_for::<PropertyNamesFalsePatternPropertiesSchemaConfig>();
+
+    assert_eq!(additional["services"], serde_json::json!({}));
+    assert_eq!(pattern["services"], serde_json::json!({}));
+}
+
+#[test]
+fn example_generation_includes_pattern_properties_dynamic_items() {
+    let example = config_example_for::<PatternPropertiesDynamicMapSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 1);
+    let (key, value) = services
+        .iter()
+        .next()
+        .expect("patternProperties example entry");
+    assert!(key.starts_with("svc-"));
+    assert_eq!(value["token"].as_str(), Some("pattern-token"));
+}
+
+#[test]
+fn example_generation_satisfies_min_properties_for_pattern_properties() {
+    let example = config_example_for::<PatternPropertiesMinPropertiesDynamicMapSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 2);
+    assert!(services.keys().all(|key| key.starts_with("svc-")));
+    assert!(
+        services
+            .values()
+            .all(|value| value["token"].as_str() == Some("pattern-token"))
+    );
+}
+
+#[test]
+fn example_generation_respects_property_names_for_pattern_properties() {
+    let example = config_example_for::<PatternPropertiesPropertyNamesDynamicMapSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 1);
+    assert_eq!(
+        services["svc-primary"]["token"].as_str(),
+        Some("pattern-token")
+    );
+    assert!(!services.contains_key("svc-"));
+}
+
+#[test]
+fn example_generation_respects_max_properties_for_fixed_object_properties() {
+    let example = config_example_for::<MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 1);
+    assert_eq!(services["primary"]["token"].as_str(), Some("primary-token"));
+    assert!(services.get("secondary").is_none());
+}
+
+#[test]
+fn example_generation_satisfies_min_properties_with_implicit_additional_properties() {
+    let example = config_example_for::<ImplicitAdditionalPropertiesMinPropertiesSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 2);
+    assert_eq!(services["primary"].as_str(), Some("primary-token"));
+    assert!(services.contains_key("{item}"));
+    assert!(services["{item}"].is_null());
+}
+
+#[test]
+fn example_generation_respects_property_names_for_dynamic_maps() {
+    let example = config_example_for::<PropertyNamesEnumDynamicMapSchemaConfig>();
+    let services = example["services"].as_object().expect("services object");
+
+    assert_eq!(services.len(), 2);
+    assert_eq!(services["primary"]["token"].as_str(), Some("enum-token"));
+    assert_eq!(services["secondary"]["token"].as_str(), Some("enum-token"));
+    assert!(!services.contains_key("{item}"));
+    assert!(!services.contains_key("{key}"));
+}
+
+#[test]
+fn env_docs_omit_optional_fixed_properties_when_max_properties_is_exhausted() {
+    let docs = env_docs_for::<MaxPropertiesTrimsOptionalFixedPropertiesSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.primary.token"
+            && entry.env == "APP__SERVICES__PRIMARY__TOKEN"
+            && entry.required
+    }));
+    assert!(
+        !docs
+            .iter()
+            .any(|entry| entry.path == "services.secondary.token")
+    );
+}
+
+#[test]
+fn env_docs_include_required_dynamic_items_when_additional_properties_is_implicit() {
+    let docs = env_docs_for::<ImplicitAdditionalPropertiesMinPropertiesSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.primary" && entry.env == "APP__SERVICES__PRIMARY" && entry.required
+    }));
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.*"
+            && entry.env == "APP__SERVICES__{item}"
+            && entry.ty == "any"
+            && entry.required
+    }));
+}
+
+#[test]
+fn env_docs_do_not_reintroduce_wildcards_when_additional_properties_is_explicitly_forbidden() {
+    let docs = env_docs_for::<ExplicitlyForbiddenAdditionalPropertiesMinPropertiesSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.primary" && entry.env == "APP__SERVICES__PRIMARY" && entry.required
+    }));
+    assert!(!docs.iter().any(|entry| entry.path == "services.*"));
+}
+
+#[test]
+fn env_docs_include_pattern_properties_dynamic_items() {
+    let docs =
+        env_docs_for::<PatternPropertiesDynamicMapSchemaConfig>(&EnvDocOptions::prefixed("APP"));
+
+    assert!(docs.iter().any(|entry| {
+        entry.path == "services.*.token"
+            && entry.env == "APP__SERVICES__{item}__TOKEN"
+            && entry.ty == "string"
+            && !entry.required
+            && entry.description.as_deref() == Some("Pattern service token")
     }));
 }
 
@@ -2316,6 +3350,53 @@ fn example_generation_satisfies_min_contains_for_arrays() {
 }
 
 #[test]
+fn example_generation_respects_contains_property_names_constraints() {
+    let example = config_example_for::<PropertyNamesContainsArraySchemaConfig>();
+    let backends = example["backends"].as_array().expect("backends array");
+
+    assert_eq!(backends.len(), 2);
+    assert_eq!(backends[0]["legacy"]["token"].as_str(), Some("stale"));
+    assert_eq!(backends[1]["primary"]["token"].as_str(), Some("fresh"));
+}
+
+#[test]
+fn example_generation_respects_contains_pattern_properties_constraints() {
+    let example = config_example_for::<PatternPropertiesContainsArraySchemaConfig>();
+    let backends = example["backends"].as_array().expect("backends array");
+
+    assert_eq!(backends.len(), 1);
+    assert_eq!(backends[0]["svc-primary"]["token"].as_str(), Some("fresh"));
+}
+
+#[test]
+fn example_generation_respects_unique_items_for_contains_arrays() {
+    let example = config_example_for::<UniqueContainsArraySchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 2);
+    assert_eq!(ports[0].as_i64(), Some(8080));
+    assert_eq!(ports[1].as_i64(), Some(8081));
+}
+
+#[test]
+fn example_generation_respects_unique_items_for_fixed_arrays() {
+    let example = config_example_for::<UniqueFixedArraySchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 2);
+    assert_eq!(ports[0].as_i64(), Some(8080));
+    assert_eq!(ports[1].as_i64(), Some(8081));
+}
+
+#[test]
+fn example_generation_satisfies_boolean_contains_constraints() {
+    let example = config_example_for::<BooleanContainsArraySchemaConfig>();
+
+    assert_eq!(example["ports"].as_array().map(Vec::len), Some(1));
+    assert!(example["ports"][0].is_null());
+}
+
+#[test]
 fn example_generation_respects_contains_numeric_constraints() {
     let example = config_example_for::<ConstrainedContainsArraySchemaConfig>();
 
@@ -2350,6 +3431,15 @@ fn example_generation_respects_contains_additional_properties_constraints() {
     assert_eq!(example["backends"][0]["extra"].as_bool(), Some(true));
     assert_eq!(example["backends"][1]["kind"].as_str(), Some("prod"));
     assert!(example["backends"][1].get("extra").is_none());
+    assert!(example["backends"].get(2).is_none());
+}
+
+#[test]
+fn example_generation_respects_contains_min_properties_constraints() {
+    let example = config_example_for::<MinPropertiesContainsArraySchemaConfig>();
+
+    assert_eq!(example["backends"][0], serde_json::json!({}));
+    assert_eq!(example["backends"][1]["kind"].as_str(), Some("prod"));
     assert!(example["backends"].get(2).is_none());
 }
 
@@ -2514,6 +3604,28 @@ fn commented_toml_examples_include_map_item_metadata() {
 
 #[cfg(feature = "toml")]
 #[test]
+fn commented_toml_examples_satisfy_min_properties_for_dynamic_maps() {
+    let example = config_example_toml::<MinPropertiesDynamicMapSchemaConfig>();
+
+    assert!(example.contains(r#"[services."{item}"]"#));
+    assert!(example.contains(r#"[services."{key}"]"#));
+    assert!(example.contains(r#"token = "example""#));
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn commented_toml_examples_respect_property_names_for_dynamic_maps() {
+    let example = config_example_toml::<PropertyNamesEnumDynamicMapSchemaConfig>();
+
+    assert!(example.contains("[services.primary]"));
+    assert!(example.contains("[services.secondary]"));
+    assert!(example.contains(r#"token = "enum-token""#));
+    assert!(!example.contains(r#""{item}""#));
+    assert!(!example.contains(r#""{key}""#));
+}
+
+#[cfg(feature = "toml")]
+#[test]
 fn commented_toml_examples_merge_generic_wildcard_metadata_for_template_paths() {
     let example = config_example_toml::<WildcardTemplateMetadataSchemaConfig>();
 
@@ -2620,6 +3732,16 @@ fn annotated_schema_projects_wildcard_metadata_to_contains_items() {
     assert_eq!(item["description"].as_str(), Some("Required matching port"));
     assert_eq!(item["example"].as_i64(), Some(8080));
     assert_eq!(item["x-tier-validate"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn annotated_schema_projects_wildcard_metadata_to_pattern_properties() {
+    let schema = annotated_json_schema_for::<PatternPropertiesDynamicMapSchemaConfig>();
+    let token =
+        &schema["properties"]["services"]["patternProperties"]["^svc-"]["properties"]["token"];
+
+    assert_eq!(token["description"].as_str(), Some("Pattern service token"));
+    assert_eq!(token["x-tier-merge"].as_str(), Some("merge"));
 }
 
 #[cfg(feature = "toml")]

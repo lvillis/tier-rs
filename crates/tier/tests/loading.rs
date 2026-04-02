@@ -121,6 +121,17 @@ struct AliasSecretServer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct AliasValidationConfig {
+    server: AliasValidationServer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct AliasValidationServer {
+    token: Option<String>,
+    cert: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 struct DynamicKeyConfig {
     headers: BTreeMap<String, String>,
 }
@@ -1920,6 +1931,50 @@ fn wildcard_required_with_binds_to_the_matching_collection_item() {
                 .filter_map(serde_json::Value::as_str)
                 .collect::<Vec<_>>()),
         Some(vec!["users.1.cert"])
+    );
+}
+
+#[test]
+fn declared_checks_accept_alias_paths() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("server.token").alias("service.legacyToken"),
+        FieldMetadata::new("server.cert").alias("service.legacyCert"),
+    ])
+    .required_with("service.legacyToken", ["service.legacyCert"]);
+
+    let error = ConfigLoader::new(AliasValidationConfig::default())
+        .metadata(metadata)
+        .args(ArgsSource::from_args([
+            "tier",
+            "--set",
+            r#"service.legacyToken="secret""#,
+        ]))
+        .load()
+        .expect_err("alias-based declared checks should fail when required fields are missing");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    let alias_error = errors
+        .iter()
+        .find(|entry| entry.rule.as_deref() == Some("required_with"))
+        .expect("required_with error");
+    assert_eq!(
+        alias_error.related_paths,
+        vec!["server.token".to_owned(), "server.cert".to_owned()]
+    );
+    assert_eq!(
+        alias_error
+            .actual
+            .as_ref()
+            .and_then(|value| value.get("missing"))
+            .and_then(serde_json::Value::as_array)
+            .map(|values| values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()),
+        Some(vec!["server.cert"])
     );
 }
 

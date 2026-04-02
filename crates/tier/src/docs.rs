@@ -4,7 +4,8 @@ use serde_json::Value;
 
 use crate::{
     ConfigMetadata, FieldMetadata, JsonSchema, MergeStrategy, TierMetadata, ValidationRule,
-    json_schema_for, schema::required_contains_additional_items_for_docs,
+    json_schema_for,
+    schema::{dynamic_object_placeholder_for_schema, required_contains_additional_items_for_docs},
 };
 
 /// Stable version tag for machine-readable environment documentation payloads.
@@ -478,25 +479,60 @@ fn collect_env_docs(
     }
 
     let Some(object) = schema.as_object() else {
-        if !path.is_empty() {
-            docs.push(EnvDocEntry {
-                path: path.to_owned(),
-                env: String::new(),
-                ty: "unknown".to_owned(),
-                required,
-                secret: false,
-                description: None,
-                example: None,
-                deprecated: None,
-                aliases: Vec::new(),
-                has_default: false,
-                merge: MergeStrategy::Merge,
-                validations: Vec::new(),
-            });
+        match schema {
+            Value::Bool(true) if !path.is_empty() => {
+                docs.push(EnvDocEntry {
+                    path: path.to_owned(),
+                    env: String::new(),
+                    ty: "any".to_owned(),
+                    required,
+                    secret: false,
+                    description: None,
+                    example: None,
+                    deprecated: None,
+                    aliases: Vec::new(),
+                    has_default: false,
+                    merge: MergeStrategy::Merge,
+                    validations: Vec::new(),
+                });
+            }
+            Value::Bool(false) => {}
+            _ if !path.is_empty() => {
+                docs.push(EnvDocEntry {
+                    path: path.to_owned(),
+                    env: String::new(),
+                    ty: "unknown".to_owned(),
+                    required,
+                    secret: false,
+                    description: None,
+                    example: None,
+                    deprecated: None,
+                    aliases: Vec::new(),
+                    has_default: false,
+                    merge: MergeStrategy::Merge,
+                    validations: Vec::new(),
+                });
+            }
+            _ => {}
         }
         return;
     };
     let reserved_keys = merged_object_level_property_names(schema, root, scope_reserved_keys);
+    let required_properties = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let min_properties = object
+        .get("minProperties")
+        .and_then(Value::as_u64)
+        .map_or(0, |min_properties| min_properties as usize);
 
     let mut traversed_combinator = false;
     for keyword in ["allOf", "anyOf", "oneOf"] {
@@ -528,19 +564,26 @@ fn collect_env_docs(
     let properties = object.get("properties").and_then(Value::as_object);
     if let Some(properties) = properties {
         traversed_children = true;
-        let required_properties = object
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|required| {
-                required
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
+        let max_properties = object
+            .get("maxProperties")
+            .and_then(Value::as_u64)
+            .map(|max_properties| max_properties as usize);
+        let additional_properties_forbidden = object
+            .get("additionalProperties")
+            .and_then(Value::as_bool)
+            .is_some_and(|allowed| !allowed);
+        let all_known_properties_required = additional_properties_forbidden
+            && !properties.is_empty()
+            && min_properties >= properties.len();
+        let allows_optional_properties =
+            max_properties.is_none_or(|max_properties| max_properties > required_properties.len());
 
         for (key, child_schema) in properties {
+            let property_required =
+                required && (required_properties.contains(key) || all_known_properties_required);
+            if !property_required && !allows_optional_properties {
+                continue;
+            }
             let next = if path.is_empty() {
                 key.clone()
             } else {
@@ -550,11 +593,52 @@ fn collect_env_docs(
                 child_schema,
                 root,
                 &next,
-                required && required_properties.contains(key),
+                property_required,
                 docs,
                 visited_refs,
                 None,
             );
+        }
+    }
+
+    let known_property_count = properties.map_or(0, serde_json::Map::len);
+    let max_properties = object
+        .get("maxProperties")
+        .and_then(Value::as_u64)
+        .map(|max_properties| max_properties as usize);
+    let required_dynamic_properties = required && min_properties > known_property_count;
+    let required_fixed_properties = required_properties.len();
+    let allows_dynamic_properties =
+        max_properties.is_none_or(|max_properties| max_properties > required_fixed_properties);
+
+    if let Some(pattern_properties) = object.get("patternProperties").and_then(Value::as_object) {
+        traversed_children = true;
+        let property_names_allow_dynamic_keys = object.get("propertyNames").is_none_or(|_| {
+            dynamic_object_placeholder_for_schema(object, root, &reserved_keys).is_some()
+        });
+        if allows_dynamic_properties && property_names_allow_dynamic_keys {
+            let placeholder = dynamic_object_placeholder(&reserved_keys);
+            let segment = if placeholder == "{item}" {
+                "*".to_owned()
+            } else {
+                placeholder
+            };
+            let next = if path.is_empty() {
+                segment
+            } else {
+                format!("{path}.{segment}")
+            };
+            for child_schema in pattern_properties.values() {
+                collect_env_docs(
+                    child_schema,
+                    root,
+                    &next,
+                    required_dynamic_properties,
+                    docs,
+                    visited_refs,
+                    None,
+                );
+            }
         }
     }
 
@@ -598,7 +682,10 @@ fn collect_env_docs(
         }
     }
 
-    if let Some(items) = object.get("items").filter(|value| value.is_object()) {
+    if let Some(items) = object
+        .get("items")
+        .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
+    {
         let fixed_item_count = object
             .get("prefixItems")
             .and_then(Value::as_array)
@@ -628,28 +715,50 @@ fn collect_env_docs(
         }
     }
 
-    if let Some(additional) = object
+    let implicit_additional = Value::Bool(true);
+    let has_explicit_additional_properties = object.contains_key("additionalProperties");
+    let additional_properties = object
         .get("additionalProperties")
-        .filter(|value| value.is_object())
-    {
+        .filter(|value| !matches!(value, Value::Bool(false)))
+        .or({
+            if !has_explicit_additional_properties && required_dynamic_properties {
+                Some(&implicit_additional)
+            } else {
+                None
+            }
+        });
+    if let Some(additional) = additional_properties {
         traversed_children = true;
-        let placeholder = dynamic_object_placeholder(&reserved_keys);
-        let segment = if placeholder == "{item}" {
-            "*".to_owned()
-        } else {
-            placeholder
-        };
-        let next = if path.is_empty() {
-            segment
-        } else {
-            format!("{path}.{segment}")
-        };
-        collect_env_docs(additional, root, &next, false, docs, visited_refs, None);
+        let property_names_allow_dynamic_keys = object.get("propertyNames").is_none_or(|_| {
+            dynamic_object_placeholder_for_schema(object, root, &reserved_keys).is_some()
+        });
+        if allows_dynamic_properties && property_names_allow_dynamic_keys {
+            let placeholder = dynamic_object_placeholder(&reserved_keys);
+            let segment = if placeholder == "{item}" {
+                "*".to_owned()
+            } else {
+                placeholder
+            };
+            let next = if path.is_empty() {
+                segment
+            } else {
+                format!("{path}.{segment}")
+            };
+            collect_env_docs(
+                additional,
+                root,
+                &next,
+                required_dynamic_properties,
+                docs,
+                visited_refs,
+                None,
+            );
+        }
     }
 
     if let Some(additional) = object
         .get("additionalItems")
-        .filter(|value| value.is_object())
+        .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
     {
         let fixed_item_count = object
             .get("prefixItems")
@@ -680,7 +789,10 @@ fn collect_env_docs(
         }
     }
 
-    if let Some(contains) = object.get("contains").filter(|value| value.is_object()) {
+    if let Some(contains) = object
+        .get("contains")
+        .filter(|value| !matches!(value, Value::Bool(false)))
+    {
         let fixed_item_count = object
             .get("prefixItems")
             .and_then(Value::as_array)

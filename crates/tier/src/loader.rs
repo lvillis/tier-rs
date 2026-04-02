@@ -670,7 +670,7 @@ where
             layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
-        let mut metadata = canonicalize_metadata_against_layers(&metadata, &layers);
+        let mut metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
         let mut alias_overrides = metadata.alias_overrides()?;
         let pending_secret_paths = canonicalize_secret_paths(&self.secret_paths, &alias_overrides);
         let mut secret_paths = canonicalize_secret_paths_against_layers(
@@ -776,7 +776,7 @@ where
             let after = serde_json::to_value(&config)?;
             ensure_root_object(&after)?;
             ensure_path_safe_keys(&after, "")?;
-            metadata = canonicalize_metadata_against_value(&metadata, &after);
+            metadata = canonicalize_metadata_against_value(&metadata, &after)?;
             alias_overrides = metadata.alias_overrides()?;
             secret_paths = canonicalize_secret_paths_against_value(
                 &pending_secret_paths,
@@ -1441,22 +1441,21 @@ fn canonicalize_secret_paths(
 fn canonicalize_metadata_against_layers(
     metadata: &ConfigMetadata,
     layers: &[Layer],
-) -> ConfigMetadata {
+) -> Result<ConfigMetadata, ConfigError> {
     let fields = metadata.fields().iter().cloned().map(|mut field| {
         field.path = canonicalize_runtime_path_across_layers(&field.path, layers);
         field.aliases = canonicalize_runtime_paths_across_layers(field.aliases, layers);
         field
     });
-    let checks = metadata
-        .checks()
-        .iter()
-        .cloned()
-        .map(|check| canonicalize_check_against_layers(check, layers));
 
     let mut resolved = ConfigMetadata::new();
     resolved.extend_fields(fields);
+    let aliases = resolved.alias_overrides()?;
+    let checks = metadata.checks().iter().cloned().map(|check| {
+        canonicalize_check_with_aliases(canonicalize_check_against_layers(check, layers), &aliases)
+    });
     resolved.extend_checks(checks);
-    resolved
+    Ok(resolved)
 }
 
 fn canonicalize_secret_paths_against_layers(
@@ -1474,22 +1473,24 @@ fn canonicalize_secret_paths_against_layers(
         .collect()
 }
 
-fn canonicalize_metadata_against_value(metadata: &ConfigMetadata, value: &Value) -> ConfigMetadata {
+fn canonicalize_metadata_against_value(
+    metadata: &ConfigMetadata,
+    value: &Value,
+) -> Result<ConfigMetadata, ConfigError> {
     let fields = metadata.fields().iter().cloned().map(|mut field| {
         field.path = canonicalize_runtime_path(value, &field.path);
         field.aliases = canonicalize_runtime_paths_against_value(field.aliases, value);
         field
     });
-    let checks = metadata
-        .checks()
-        .iter()
-        .cloned()
-        .map(|check| canonicalize_check_against_value(check, value));
 
     let mut resolved = ConfigMetadata::new();
     resolved.extend_fields(fields);
+    let aliases = resolved.alias_overrides()?;
+    let checks = metadata.checks().iter().cloned().map(|check| {
+        canonicalize_check_with_aliases(canonicalize_check_against_value(check, value), &aliases)
+    });
     resolved.extend_checks(checks);
-    resolved
+    Ok(resolved)
 }
 
 fn canonicalize_secret_paths_against_value(
@@ -1537,6 +1538,51 @@ fn canonicalize_runtime_path_across_layers(path: &str, layers: &[Layer]) -> Stri
     layers.iter().fold(normalize_path(path), |current, layer| {
         canonicalize_runtime_path(&layer.value, &current)
     })
+}
+
+fn canonicalize_paths_with_aliases<I>(paths: I, aliases: &BTreeMap<String, String>) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut canonicalized = Vec::new();
+    for path in paths {
+        let canonical = canonicalize_path_with_aliases(&path, aliases);
+        if canonical.is_empty() || canonicalized.contains(&canonical) {
+            continue;
+        }
+        canonicalized.push(canonical);
+    }
+    canonicalized
+}
+
+fn canonicalize_check_with_aliases(
+    check: ValidationCheck,
+    aliases: &BTreeMap<String, String>,
+) -> ValidationCheck {
+    match check {
+        ValidationCheck::AtLeastOneOf { paths } => ValidationCheck::AtLeastOneOf {
+            paths: canonicalize_paths_with_aliases(paths, aliases),
+        },
+        ValidationCheck::ExactlyOneOf { paths } => ValidationCheck::ExactlyOneOf {
+            paths: canonicalize_paths_with_aliases(paths, aliases),
+        },
+        ValidationCheck::MutuallyExclusive { paths } => ValidationCheck::MutuallyExclusive {
+            paths: canonicalize_paths_with_aliases(paths, aliases),
+        },
+        ValidationCheck::RequiredWith { path, requires } => ValidationCheck::RequiredWith {
+            path: canonicalize_path_with_aliases(&path, aliases),
+            requires: canonicalize_paths_with_aliases(requires, aliases),
+        },
+        ValidationCheck::RequiredIf {
+            path,
+            equals,
+            requires,
+        } => ValidationCheck::RequiredIf {
+            path: canonicalize_path_with_aliases(&path, aliases),
+            equals,
+            requires: canonicalize_paths_with_aliases(requires, aliases),
+        },
+    }
 }
 
 fn canonicalize_check_against_layers(check: ValidationCheck, layers: &[Layer]) -> ValidationCheck {

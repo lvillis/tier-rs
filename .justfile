@@ -26,3 +26,6 @@ bench:
 
 patch:
   cargo release patch --no-publish --execute
+
+publish:
+  cargo publish --workspace

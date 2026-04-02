@@ -274,6 +274,14 @@ fn annotate_schema_segments(
                 matched |= annotate_schema_segments(child, root, remaining, field);
             }
         }
+        if let Some(pattern_properties) = object
+            .get_mut("patternProperties")
+            .and_then(Value::as_object_mut)
+        {
+            for child in pattern_properties.values_mut() {
+                matched |= annotate_schema_segments(child, root, remaining, field);
+            }
+        }
         if let Some(children) = object.get_mut("prefixItems").and_then(Value::as_array_mut) {
             for child in children {
                 matched |= annotate_schema_segments(child, root, remaining, field);
@@ -359,6 +367,12 @@ fn build_example_value(
             return example;
         }
         return None;
+    }
+
+    match schema {
+        Value::Bool(true) => return Some(Value::Null),
+        Value::Bool(false) => return None,
+        _ => {}
     }
 
     let object = schema.as_object()?;
@@ -450,7 +464,59 @@ fn build_example_value(
                 rendered.insert(key.clone(), example);
             }
         }
+        trim_object_example_properties(&mut rendered, object);
         merge_example_value(&mut merged, Value::Object(rendered));
+    }
+
+    if let Some(pattern_properties) = object.get("patternProperties").and_then(Value::as_object) {
+        let existing_len = merged
+            .as_ref()
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len);
+        let required_dynamic = object
+            .get("minProperties")
+            .and_then(Value::as_u64)
+            .map_or(0, |min_properties| {
+                min_properties.saturating_sub(existing_len as u64) as usize
+            });
+        let available_slots = object
+            .get("maxProperties")
+            .and_then(Value::as_u64)
+            .map_or(usize::MAX, |max_properties| max_properties as usize)
+            .saturating_sub(existing_len);
+        if available_slots > 0 {
+            let mut taken = reserved_keys.clone();
+            if let Some(existing) = merged.as_ref().and_then(Value::as_object) {
+                taken.extend(existing.keys().cloned());
+            }
+
+            let mut rendered = serde_json::Map::new();
+            let target_entries =
+                available_slots.min(required_dynamic.max(pattern_properties.len()));
+            while rendered.len() < target_entries {
+                let mut made_progress = false;
+                for (pattern, child) in pattern_properties {
+                    if rendered.len() >= target_entries {
+                        break;
+                    }
+                    if let Some(key) =
+                        pattern_property_placeholder_for_schema(pattern, object, root, &taken)
+                        && let Some(example) = build_example_value(child, root, visited_refs, None)
+                    {
+                        taken.insert(key.clone());
+                        rendered.insert(key, example);
+                        made_progress = true;
+                    }
+                }
+
+                if !made_progress {
+                    break;
+                }
+            }
+            if !rendered.is_empty() {
+                merge_example_value(&mut merged, Value::Object(rendered));
+            }
+        }
     }
 
     if let Some(items) = object.get("prefixItems").and_then(Value::as_array) {
@@ -473,7 +539,7 @@ fn build_example_value(
         merge_example_value(&mut merged, Value::Array(rendered));
     }
 
-    if let Some(items) = object.get("items").filter(|value| value.is_object()) {
+    if let Some(items) = object.get("items").filter(|value| !value.is_array()) {
         let existing_len = merged
             .as_ref()
             .and_then(Value::as_array)
@@ -503,7 +569,7 @@ fn build_example_value(
 
     if let Some(additional) = object
         .get("additionalItems")
-        .filter(|value| value.is_object())
+        .filter(|value| !value.is_array())
     {
         let existing_len = merged
             .as_ref()
@@ -532,14 +598,15 @@ fn build_example_value(
         }
     }
 
-    if let Some(contains) = object.get("contains").filter(|value| value.is_object()) {
+    if let Some(contains) = object.get("contains") {
         let required_matches = required_contains_item_count(object);
         if required_matches > 0 {
+            let unique_items = array_requires_unique_items(object);
             let existing_matches = merged
                 .as_ref()
                 .and_then(Value::as_array)
                 .map_or(0, |values| {
-                    count_matching_example_items(values, contains, root)
+                    count_matching_example_items(values, contains, root, unique_items)
                 });
             let missing = required_matches.saturating_sub(existing_matches);
             let available_slots = available_additional_array_slots(
@@ -554,15 +621,26 @@ fn build_example_value(
                 match build_example_value(contains, root, visited_refs, None) {
                     Some(example) => match &mut merged {
                         Some(Value::Array(existing)) => {
-                            existing.extend(std::iter::repeat_n(example, additional_items))
+                            let additions = build_repeated_example_values(
+                                example,
+                                contains,
+                                root,
+                                additional_items,
+                                unique_items,
+                                existing,
+                            );
+                            existing.extend(additions);
                         }
                         _ => {
-                            merge_example_value(
-                                &mut merged,
-                                Value::Array(
-                                    std::iter::repeat_n(example, additional_items).collect(),
-                                ),
+                            let additions = build_repeated_example_values(
+                                example,
+                                contains,
+                                root,
+                                additional_items,
+                                unique_items,
+                                &[],
                             );
+                            merge_example_value(&mut merged, Value::Array(additions));
                         }
                     },
                     None => {
@@ -575,19 +653,58 @@ fn build_example_value(
         }
     }
 
-    if let Some(additional) = object
-        .get("additionalProperties")
-        .filter(|value| value.is_object())
+    let existing_object_len = merged
+        .as_ref()
+        .and_then(Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    let required_dynamic = object
+        .get("minProperties")
+        .and_then(Value::as_u64)
+        .map_or(0, |min_properties| {
+            min_properties.saturating_sub(existing_object_len as u64) as usize
+        });
+    let implicit_additional = Value::Bool(true);
+    let additional_properties = object.get("additionalProperties").or({
+        if required_dynamic > 0 {
+            Some(&implicit_additional)
+        } else {
+            None
+        }
+    });
+    if let Some(additional) = additional_properties
         && let Some(example) = build_example_value(additional, root, visited_refs, None)
     {
-        let placeholder = dynamic_object_placeholder(&reserved_keys);
-        let rendered = BTreeMap::from([(placeholder, example)])
-            .into_iter()
-            .collect::<serde_json::Map<_, _>>();
-        merge_example_value(&mut merged, Value::Object(rendered));
+        let available_slots = object
+            .get("maxProperties")
+            .and_then(Value::as_u64)
+            .map_or(usize::MAX, |max_properties| max_properties as usize)
+            .saturating_sub(existing_object_len);
+        let additional_entries = if object.contains_key("additionalProperties") {
+            required_dynamic.max(1).min(available_slots)
+        } else {
+            required_dynamic.min(available_slots)
+        };
+        if additional_entries > 0 {
+            let placeholders = dynamic_object_placeholders_for_schema(
+                object,
+                root,
+                &reserved_keys,
+                additional_entries,
+            );
+            let rendered = placeholders
+                .into_iter()
+                .map(|placeholder| (placeholder, example.clone()))
+                .collect::<serde_json::Map<_, _>>();
+            merge_example_value(&mut merged, Value::Object(rendered));
+        }
     }
 
-    if let Some(merged) = merged {
+    if let Some(mut merged) = merged {
+        if let Value::Array(items) = &mut merged
+            && array_requires_unique_items(object)
+        {
+            uniquify_array_example_items(items, object, root);
+        }
         return Some(if is_secret {
             redact_example_value(&merged)
         } else {
@@ -854,6 +971,251 @@ fn dynamic_object_placeholder(reserved: &BTreeSet<String>) -> String {
     }
 }
 
+pub(crate) fn dynamic_object_placeholder_for_schema(
+    object: &serde_json::Map<String, Value>,
+    root: &Value,
+    reserved: &BTreeSet<String>,
+) -> Option<String> {
+    let property_names = object.get("propertyNames")?;
+    let mut candidates = property_name_candidates(property_names);
+    if candidates.is_empty() {
+        candidates.extend([
+            "item".to_owned(),
+            "key".to_owned(),
+            "entry".to_owned(),
+            "value".to_owned(),
+            "name".to_owned(),
+            "field".to_owned(),
+            "property".to_owned(),
+            "primary".to_owned(),
+            "secondary".to_owned(),
+            "example".to_owned(),
+            "default".to_owned(),
+            "x".to_owned(),
+            "0".to_owned(),
+            "1".to_owned(),
+        ]);
+    }
+
+    let mut taken = reserved.clone();
+    for candidate in candidates {
+        if taken.contains(&candidate) {
+            continue;
+        }
+        if property_name_matches_schema(&candidate, property_names, root) {
+            return Some(candidate);
+        }
+        taken.insert(candidate);
+    }
+
+    let mut index = 0usize;
+    loop {
+        for stem in ["item", "key", "entry", "value", "field", "name"] {
+            let candidate = format!("{stem}_{index}");
+            if reserved.contains(&candidate) {
+                continue;
+            }
+            if property_name_matches_schema(&candidate, property_names, root) {
+                return Some(candidate);
+            }
+        }
+        if index > 1024 {
+            break;
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn dynamic_object_placeholders_for_schema(
+    object: &serde_json::Map<String, Value>,
+    root: &Value,
+    reserved: &BTreeSet<String>,
+    count: usize,
+) -> Vec<String> {
+    let mut taken = reserved.clone();
+    let mut placeholders = Vec::with_capacity(count);
+    let constrained_by_property_names = object.contains_key("propertyNames");
+    for _ in 0..count {
+        let placeholder = if constrained_by_property_names {
+            match dynamic_object_placeholder_for_schema(object, root, &taken) {
+                Some(placeholder) => placeholder,
+                None => break,
+            }
+        } else {
+            dynamic_object_placeholder(&taken)
+        };
+        taken.insert(placeholder.clone());
+        placeholders.push(placeholder);
+    }
+    placeholders
+}
+
+fn pattern_property_placeholder_for_schema(
+    pattern: &str,
+    object: &serde_json::Map<String, Value>,
+    root: &Value,
+    reserved: &BTreeSet<String>,
+) -> Option<String> {
+    let regex = Regex::new(pattern).ok()?;
+    let prefix = literal_regex_prefix(pattern);
+    let property_names = object.get("propertyNames");
+
+    let mut candidates = Vec::new();
+    if let Some(property_names) = property_names {
+        candidates.extend(property_name_candidates(property_names));
+    }
+    if let Some(prefix) = &prefix
+        && !prefix.is_empty()
+    {
+        candidates.extend([
+            prefix.clone(),
+            format!("{prefix}item"),
+            format!("{prefix}token"),
+            format!("{prefix}value"),
+            format!("{prefix}example"),
+            format!("{prefix}1"),
+        ]);
+    }
+    candidates.extend(
+        ["item", "key", "entry", "value", "example", "name", "field"]
+            .into_iter()
+            .map(ToOwned::to_owned),
+    );
+
+    for candidate in candidates {
+        if !reserved.contains(&candidate)
+            && regex.is_match(&candidate)
+            && property_names.is_none_or(|property_names| {
+                property_name_matches_schema(&candidate, property_names, root)
+            })
+        {
+            return Some(candidate);
+        }
+    }
+
+    for index in 0..1024 {
+        for stem in ["item", "key", "entry", "value", "example", "name", "field"] {
+            let candidate = match prefix.as_deref() {
+                Some(prefix) if !prefix.is_empty() => format!("{prefix}{stem}{index}"),
+                _ => format!("{stem}_{index}"),
+            };
+            if !reserved.contains(&candidate)
+                && regex.is_match(&candidate)
+                && property_names.is_none_or(|property_names| {
+                    property_name_matches_schema(&candidate, property_names, root)
+                })
+            {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn literal_regex_prefix(pattern: &str) -> Option<String> {
+    let pattern = pattern.strip_prefix('^').unwrap_or(pattern);
+    let mut prefix = String::new();
+    let mut escaped = false;
+
+    for ch in pattern.chars() {
+        if escaped {
+            prefix.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '$' | '.' | '*' | '+' | '?' | '|' | '(' | '[' | '{' => break,
+            _ => prefix.push(ch),
+        }
+    }
+
+    Some(prefix)
+}
+
+fn property_name_candidates(schema: &Value) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Some(constant) = schema.get("const").and_then(Value::as_str) {
+        candidates.push(constant.to_owned());
+    }
+
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        candidates.extend(
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned),
+        );
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn property_name_matches_schema(candidate: &str, schema: &Value, root: &Value) -> bool {
+    example_matches_schema(
+        &Value::String(candidate.to_owned()),
+        schema,
+        root,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn trim_object_example_properties(
+    rendered: &mut serde_json::Map<String, Value>,
+    object: &serde_json::Map<String, Value>,
+) {
+    let Some(max_properties) = object
+        .get("maxProperties")
+        .and_then(Value::as_u64)
+        .map(|max_properties| max_properties as usize)
+    else {
+        return;
+    };
+
+    if rendered.len() <= max_properties {
+        return;
+    }
+
+    let required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let required_present = rendered
+        .keys()
+        .filter(|key| required.contains(key.as_str()))
+        .count();
+    if required_present >= max_properties {
+        rendered.retain(|key, _| required.contains(key.as_str()));
+        return;
+    }
+
+    let mut optional_slots = max_properties - required_present;
+    rendered.retain(|key, _| {
+        if required.contains(key.as_str()) {
+            true
+        } else if optional_slots > 0 {
+            optional_slots -= 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
 fn allows_additional_array_items(
     object: &serde_json::Map<String, Value>,
     fixed_item_count: usize,
@@ -873,6 +1235,53 @@ fn available_additional_array_slots(
         .and_then(Value::as_u64)
         .map_or(usize::MAX, |max_items| max_items as usize)
         .saturating_sub(existing_len)
+}
+
+fn array_requires_unique_items(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("uniqueItems")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn array_item_schema(object: &serde_json::Map<String, Value>, index: usize) -> Option<&Value> {
+    if let Some(prefix_items) = object.get("prefixItems").and_then(Value::as_array)
+        && let Some(schema) = prefix_items.get(index)
+    {
+        return Some(schema);
+    }
+
+    if let Some(item_schemas) = object.get("items").and_then(Value::as_array)
+        && let Some(schema) = item_schemas.get(index)
+    {
+        return Some(schema);
+    }
+
+    object
+        .get("items")
+        .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
+        .or_else(|| {
+            object
+                .get("additionalItems")
+                .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
+        })
+}
+
+fn uniquify_array_example_items(
+    items: &mut [Value],
+    object: &serde_json::Map<String, Value>,
+    root: &Value,
+) {
+    let mut seen = Vec::<Value>::new();
+    for (index, item) in items.iter_mut().enumerate() {
+        if seen.contains(item)
+            && let Some(schema) = array_item_schema(object, index)
+            && let Some(unique) = uniquify_example_value(item.clone(), schema, root, &seen)
+        {
+            *item = unique;
+        }
+        seen.push(item.clone());
+    }
 }
 
 fn additional_example_item_count(
@@ -907,7 +1316,7 @@ pub(crate) fn required_contains_additional_items_for_docs(
     object: &serde_json::Map<String, Value>,
     root: &Value,
 ) -> usize {
-    let Some(contains) = object.get("contains").filter(|value| value.is_object()) else {
+    let Some(contains) = object.get("contains") else {
         return 0;
     };
 
@@ -917,7 +1326,12 @@ pub(crate) fn required_contains_additional_items_for_docs(
     }
 
     let fixed_examples = merged_fixed_example_items(object, root);
-    let existing_matches = count_matching_example_items(&fixed_examples, contains, root);
+    let existing_matches = count_matching_example_items(
+        &fixed_examples,
+        contains,
+        root,
+        array_requires_unique_items(object),
+    );
     required_matches.saturating_sub(existing_matches)
 }
 
@@ -949,11 +1363,159 @@ fn merged_fixed_example_items(object: &serde_json::Map<String, Value>, root: &Va
         .unwrap_or_default()
 }
 
-fn count_matching_example_items(values: &[Value], schema: &Value, root: &Value) -> usize {
-    values
-        .iter()
-        .filter(|value| example_matches_schema(value, schema, root, &mut BTreeSet::new()))
-        .count()
+fn count_matching_example_items(
+    values: &[Value],
+    schema: &Value,
+    root: &Value,
+    unique_items: bool,
+) -> usize {
+    let mut matching = Vec::<Value>::new();
+    for value in values {
+        if !example_matches_schema(value, schema, root, &mut BTreeSet::new()) {
+            continue;
+        }
+        if unique_items && matching.contains(value) {
+            continue;
+        }
+        matching.push(value.clone());
+    }
+    matching.len()
+}
+
+fn build_repeated_example_values(
+    example: Value,
+    schema: &Value,
+    root: &Value,
+    count: usize,
+    unique_items: bool,
+    existing: &[Value],
+) -> Vec<Value> {
+    let mut taken = if unique_items {
+        existing.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut rendered = Vec::with_capacity(count);
+    for _ in 0..count {
+        let value = if unique_items {
+            uniquify_example_value(example.clone(), schema, root, &taken)
+                .unwrap_or_else(|| example.clone())
+        } else {
+            example.clone()
+        };
+        if unique_items {
+            taken.push(value.clone());
+        }
+        rendered.push(value);
+    }
+    rendered
+}
+
+fn uniquify_example_value(
+    value: Value,
+    schema: &Value,
+    root: &Value,
+    existing: &[Value],
+) -> Option<Value> {
+    if !existing.contains(&value) {
+        return Some(value);
+    }
+
+    match value {
+        Value::String(text) => uniquify_string_example(text, schema, root, existing),
+        Value::Number(number) => uniquify_number_example(number, schema, root, existing),
+        Value::Bool(flag) => {
+            let candidate = Value::Bool(!flag);
+            (!existing.contains(&candidate)
+                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new()))
+            .then_some(candidate)
+        }
+        _ => None,
+    }
+}
+
+fn uniquify_string_example(
+    text: String,
+    schema: &Value,
+    root: &Value,
+    existing: &[Value],
+) -> Option<Value> {
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        for value in values {
+            let candidate = value.clone();
+            if !existing.contains(&candidate)
+                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
+            {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for attempt in 1..=1024 {
+        for candidate in [
+            Value::String(format!("{text}-{attempt}")),
+            Value::String(format!("{text}_{attempt}")),
+            Value::String(format!("item{attempt}")),
+            Value::String(format!("value{attempt}")),
+        ] {
+            if !existing.contains(&candidate)
+                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
+            {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn uniquify_number_example(
+    number: serde_json::Number,
+    schema: &Value,
+    root: &Value,
+    existing: &[Value],
+) -> Option<Value> {
+    if let Some(integer) = number.as_i64() {
+        for attempt in 1..=1024i64 {
+            let candidate = Value::Number((integer.saturating_add(attempt)).into());
+            if !existing.contains(&candidate)
+                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
+            {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    if let Some(integer) = number.as_u64() {
+        for attempt in 1..=1024u64 {
+            let candidate = Value::Number((integer.saturating_add(attempt)).into());
+            if !existing.contains(&candidate)
+                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
+            {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    let base = number.as_f64()?;
+    let step = schema
+        .get("multipleOf")
+        .and_then(Value::as_f64)
+        .filter(|step| step.is_normal() && *step > 0.0)
+        .unwrap_or(1.0);
+    for attempt in 1..=1024u64 {
+        let candidate =
+            serde_json::Number::from_f64(base + step * attempt as f64).map(Value::Number)?;
+        if !existing.contains(&candidate)
+            && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
+        {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 fn example_matches_schema(
@@ -974,7 +1536,7 @@ fn example_matches_schema(
     }
 
     let Some(object) = schema.as_object() else {
-        return true;
+        return schema.as_bool().unwrap_or(true);
     };
 
     if let Some(constant) = object.get("const") {
@@ -1088,6 +1650,34 @@ fn example_matches_schema(
             }
         }
         Value::Object(map) => {
+            if object
+                .get("minProperties")
+                .and_then(Value::as_u64)
+                .is_some_and(|min_properties| map.len() < min_properties as usize)
+            {
+                return false;
+            }
+            if object
+                .get("maxProperties")
+                .and_then(Value::as_u64)
+                .is_some_and(|max_properties| map.len() > max_properties as usize)
+            {
+                return false;
+            }
+
+            if let Some(property_names) = object.get("propertyNames")
+                && map.keys().any(|key| {
+                    !example_matches_schema(
+                        &Value::String(key.clone()),
+                        property_names,
+                        root,
+                        &mut visited_refs.clone(),
+                    )
+                })
+            {
+                return false;
+            }
+
             if let Some(required) = object.get("required").and_then(Value::as_array)
                 && required
                     .iter()
@@ -1107,34 +1697,36 @@ fn example_matches_schema(
                 }
             }
 
-            if object
-                .get("additionalProperties")
-                .and_then(Value::as_bool)
-                .is_some_and(|allowed| !allowed)
-            {
-                let properties = object
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .map_or_else(BTreeSet::new, |properties| {
-                        properties.keys().cloned().collect::<BTreeSet<_>>()
-                    });
-                if map.keys().any(|key| !properties.contains(key)) {
-                    return false;
+            let pattern_properties = object.get("patternProperties").and_then(Value::as_object);
+            let fixed_properties = object
+                .get("properties")
+                .and_then(Value::as_object)
+                .map_or_else(BTreeSet::new, |properties| {
+                    properties.keys().cloned().collect::<BTreeSet<_>>()
+                });
+            let mut pattern_matched_keys = BTreeSet::new();
+            if let Some(pattern_properties) = pattern_properties {
+                for (key, child_value) in map {
+                    for (pattern, child_schema) in pattern_properties {
+                        if Regex::new(pattern).is_ok_and(|regex| regex.is_match(key)) {
+                            pattern_matched_keys.insert(key.clone());
+                            if !example_matches_schema(
+                                child_value,
+                                child_schema,
+                                root,
+                                visited_refs,
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
                 }
             }
 
-            if let Some(additional) = object
-                .get("additionalProperties")
-                .filter(|value| value.is_object())
-            {
-                let properties = object
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .map_or_else(BTreeSet::new, |properties| {
-                        properties.keys().cloned().collect::<BTreeSet<_>>()
-                    });
+            if let Some(additional) = object.get("additionalProperties") {
                 for (key, child_value) in map {
-                    if !properties.contains(key)
+                    if !fixed_properties.contains(key)
+                        && !pattern_matched_keys.contains(key)
                         && !example_matches_schema(child_value, additional, root, visited_refs)
                     {
                         return false;
@@ -1156,6 +1748,16 @@ fn example_matches_schema(
                 .is_some_and(|max_items| items.len() > max_items as usize)
             {
                 return false;
+            }
+
+            if array_requires_unique_items(object) {
+                let mut seen = Vec::<Value>::new();
+                for item in items {
+                    if seen.contains(item) {
+                        return false;
+                    }
+                    seen.push(item.clone());
+                }
             }
 
             if let Some(prefix_items) = object.get("prefixItems").and_then(Value::as_array) {
@@ -1189,7 +1791,7 @@ fn example_matches_schema(
                         .map_or(0, Vec::len),
                 );
 
-            if let Some(items_schema) = object.get("items").filter(|value| value.is_object()) {
+            if let Some(items_schema) = object.get("items").filter(|value| !value.is_array()) {
                 for child_value in items.iter().skip(fixed_item_count) {
                     if !example_matches_schema(child_value, items_schema, root, visited_refs) {
                         return false;
@@ -1199,7 +1801,7 @@ fn example_matches_schema(
 
             if let Some(additional_schema) = object
                 .get("additionalItems")
-                .filter(|value| value.is_object())
+                .filter(|value| !value.is_array())
             {
                 for child_value in items.iter().skip(fixed_item_count) {
                     if !example_matches_schema(child_value, additional_schema, root, visited_refs) {
@@ -1208,8 +1810,7 @@ fn example_matches_schema(
                 }
             }
 
-            if let Some(contains_schema) = object.get("contains").filter(|value| value.is_object())
-            {
+            if let Some(contains_schema) = object.get("contains") {
                 let matching_items = items
                     .iter()
                     .filter(|child_value| {
