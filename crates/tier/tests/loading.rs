@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tempfile::tempdir;
 
 use tier::{
@@ -64,6 +65,17 @@ struct StructuredEnvConfig {
     ports: Vec<u16>,
     labels: BTreeMap<String, u16>,
     words: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct ProxyCompatConfig {
+    proxy: ProxyCompatSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct ProxyCompatSettings {
+    url: Option<String>,
+    no_proxy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -888,6 +900,55 @@ fn env_decoders_handle_common_structured_operational_formats() {
     assert_eq!(
         loaded.words,
         vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()]
+    );
+}
+
+#[test]
+fn env_aliases_and_fallbacks_support_standard_operational_variables() {
+    let env = EnvSource::from_pairs([
+        ("HTTP_PROXY", "http://fallback-proxy:8080"),
+        ("NO_PROXY", "localhost,127.0.0.1,.internal.example.com"),
+        ("APP__PROXY__URL", "http://app-proxy:9090"),
+    ])
+    .prefix("APP")
+    .with_fallback("HTTP_PROXY", "proxy.url")
+    .with_fallback_decoder("NO_PROXY", "proxy.no_proxy", EnvDecoder::Csv);
+
+    let loaded = ConfigLoader::new(ProxyCompatConfig::default())
+        .env(env)
+        .load()
+        .expect("config loads");
+
+    assert_eq!(loaded.proxy.url.as_deref(), Some("http://app-proxy:9090"));
+    assert_eq!(
+        loaded.proxy.no_proxy,
+        vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            ".internal.example.com".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn custom_env_decoders_can_handle_application_specific_formats() {
+    let loaded = ConfigLoader::new(StructuredEnvConfig::default())
+        .env_decoder_with("no_proxy", |raw| {
+            Ok(Value::Array(
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| Value::String(segment.to_owned()))
+                    .collect(),
+            ))
+        })
+        .env(EnvSource::from_pairs([("APP__NO_PROXY", "localhost;.svc.internal")]).prefix("APP"))
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.no_proxy,
+        vec!["localhost".to_owned(), ".svc.internal".to_owned()]
     );
 }
 

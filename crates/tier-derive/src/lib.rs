@@ -334,12 +334,18 @@ fn expand_named_field_metadata(
         }]);
     }
 
+    let nested_metadata = if attrs.leaf {
+        quote! { ::tier::ConfigMetadata::new() }
+    } else {
+        quote! { <#metadata_ty as ::tier::TierMetadata>::metadata() }
+    };
+
     Ok(vec![
         quote! {
             #accumulator.extend(::tier::metadata::prefixed_metadata(
                 #canonical_name_lit,
                 ::std::vec![#(::std::string::String::from(#alias_lits)),*],
-                <#metadata_ty as ::tier::TierMetadata>::metadata(),
+                #nested_metadata,
             ));
         },
         direct_field_metadata_tokens(
@@ -450,7 +456,7 @@ fn expand_patch_field_metadata(
     let attrs = parse_patch_attrs(&field.attrs)?;
 
     if serde_attrs.skip_metadata {
-        if attrs.path.is_some() || attrs.nested {
+        if attrs.path.is_some() || attrs.path_expr.is_some() || attrs.nested {
             return Err(syn::Error::new_spanned(
                 field_ident,
                 "skipped fields cannot use tier patch attributes",
@@ -459,21 +465,30 @@ fn expand_patch_field_metadata(
         return Ok(quote! {});
     }
 
-    if serde_attrs.flatten && attrs.path.is_some() {
+    if attrs.path.is_some() && attrs.path_expr.is_some() {
+        return Err(syn::Error::new_spanned(
+            field_ident,
+            "patch fields must use either tier(path = ...) or tier(path_expr = ...), not both",
+        ));
+    }
+
+    if serde_attrs.flatten && (attrs.path.is_some() || attrs.path_expr.is_some()) {
         return Err(syn::Error::new_spanned(
             field_ident,
             "flattened patch fields cannot override their tier path",
         ));
     }
 
-    let default_path = attrs
-        .path
-        .clone()
-        .unwrap_or_else(|| serde_attrs.canonical_name.clone());
-    let path_lit = LitStr::new(&default_path, field_ident.span());
     let path_expr = if serde_attrs.flatten {
         quote! { ::std::string::String::from(__tier_prefix) }
+    } else if let Some(path_expr) = attrs.path_expr {
+        quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_expr) }
     } else {
+        let default_path = attrs
+            .path
+            .clone()
+            .unwrap_or_else(|| serde_attrs.canonical_name.clone());
+        let path_lit = LitStr::new(&default_path, field_ident.span());
         quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_lit) }
     };
     let field_access = quote! { &self.#field_ident };
@@ -554,6 +569,7 @@ fn generate_leaf_patch_tokens(
 #[derive(Debug, Default)]
 struct TierAttrs {
     secret: bool,
+    leaf: bool,
     env: Option<String>,
     doc: Option<String>,
     example: Option<String>,
@@ -575,6 +591,7 @@ struct TierAttrs {
 impl TierAttrs {
     fn has_any(&self) -> bool {
         self.secret
+            || self.leaf
             || self.env.is_some()
             || self.doc.is_some()
             || self.example.is_some()
@@ -597,6 +614,7 @@ impl TierAttrs {
 #[derive(Debug, Default)]
 struct PatchAttrs {
     path: Option<String>,
+    path_expr: Option<Expr>,
     nested: bool,
 }
 
@@ -808,6 +826,11 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
                 attrs.secret = true;
                 return Ok(());
             }
+            if meta.path.is_ident("leaf") {
+                attrs.leaf = true;
+                consume_unused_meta(meta)?;
+                return Ok(());
+            }
             if meta.path.is_ident("env") {
                 attrs.env = Some(parse_string_value(meta)?);
                 return Ok(());
@@ -898,6 +921,10 @@ fn parse_patch_attrs(attributes: &[Attribute]) -> syn::Result<PatchAttrs> {
                 attrs.path = Some(parse_string_value(meta)?);
                 return Ok(());
             }
+            if meta.path.is_ident("path_expr") {
+                attrs.path_expr = Some(parse_expr_value(meta)?);
+                return Ok(());
+            }
             if meta.path.is_ident("nested") {
                 attrs.nested = true;
                 consume_unused_meta(meta)?;
@@ -953,6 +980,10 @@ fn parse_tier_container_attrs(attributes: &[Attribute]) -> syn::Result<TierConta
     }
 
     Ok(attrs)
+}
+
+fn parse_expr_value(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<Expr> {
+    meta.value()?.parse()
 }
 
 fn parse_serde_container_attrs(attributes: &[Attribute]) -> syn::Result<SerdeContainerAttrs> {

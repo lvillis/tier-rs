@@ -48,6 +48,22 @@ struct AppPatch {
     token: Patch<Option<String>>,
 }
 
+#[derive(Debug, Clone, TierPatch, Default)]
+struct CheckedPathPatch {
+    #[tier(path_expr = tier::path!(PatchConfig.db.token))]
+    token: Patch<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PatternConfig {
+    services: std::collections::BTreeMap<String, PatternService>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PatternService {
+    token: String,
+}
+
 #[test]
 fn typed_patches_can_override_nested_fields_and_clear_optionals() {
     let patch = AppPatch {
@@ -94,6 +110,28 @@ fn layer_can_be_constructed_from_a_typed_patch() {
     assert_eq!(loaded.db.token.as_deref(), Some("default-token"));
 }
 
+#[test]
+fn checked_path_macros_can_drive_sparse_patches() {
+    assert_eq!(tier::path!(PatchConfig.db.token), "db.token");
+    assert_eq!(
+        tier::path_pattern!(PatternConfig.services.*.token),
+        "services.*.token"
+    );
+
+    let loaded = ConfigLoader::new(PatchConfig::default())
+        .patch(
+            "checked-patch",
+            &CheckedPathPatch {
+                token: Patch::set(Some("from-checked-path".to_owned())),
+            },
+        )
+        .expect("patch layer is valid")
+        .load()
+        .expect("config loads");
+
+    assert_eq!(loaded.db.token.as_deref(), Some("from-checked-path"));
+}
+
 #[cfg(feature = "clap")]
 mod clap_bridge {
     use clap::{Args, Parser};
@@ -112,7 +150,7 @@ mod clap_bridge {
         #[tier(nested)]
         server: ServerCli,
         #[arg(long = "db-token")]
-        #[tier(path = "db.token")]
+        #[tier(path_expr = tier::path!(PatchConfig.db.token))]
         token: Option<String>,
     }
 

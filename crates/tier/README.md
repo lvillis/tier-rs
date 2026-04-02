@@ -40,6 +40,32 @@ Use `tier` when you want:
 - Primitive targets such as `bool`, integers, floats, and `Option<T>` are coerced during deserialization
 - Use explicit JSON syntax for arrays, objects, or quoted strings when you need structured inline values
 
+## Checked Paths
+
+For refactor-heavy code, `tier` exposes checked path macros that still feed the
+same runtime APIs:
+
+```rust
+use serde::{Deserialize, Serialize};
+use tier::{ConfigMetadata, FieldMetadata};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    proxy: ProxyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProxyConfig {
+    no_proxy: Vec<String>,
+}
+
+let metadata = ConfigMetadata::from_fields([
+    FieldMetadata::new(tier::path!(AppConfig.proxy.no_proxy)),
+]);
+
+assert!(metadata.field("proxy.no_proxy").is_some());
+```
+
 ## Typed Patches
 
 If your application already has typed override structs, derive `TierPatch` and
@@ -60,7 +86,7 @@ struct AppConfig {
 #[derive(Debug, Default, TierPatch)]
 struct CliPatch {
     port: Option<u16>,
-    #[tier(path = "token")]
+    #[tier(path_expr = tier::path!(AppConfig.token))]
     token: Patch<Option<String>>,
 }
 
@@ -85,7 +111,9 @@ assert_eq!(loaded.token, None);
 ```
 
 With both `derive` and `clap`, the same typed CLI struct can be applied as the
-last layer through `ConfigLoader::clap_overrides(&parsed_cli)`.
+last layer through `ConfigLoader::clap_overrides(&parsed_cli)`, and
+`path_expr = tier::path!(...)` keeps CLI-to-config mappings checked during
+refactors.
 
 ## Structured Env Values
 
@@ -119,6 +147,69 @@ assert_eq!(
     ]
 );
 # Ok(())
+# }
+```
+
+You can also bridge standard operational env names directly:
+
+```rust,no_run
+# fn main() -> Result<(), tier::ConfigError> {
+use serde::{Deserialize, Serialize};
+use tier::{ConfigLoader, EnvDecoder, EnvSource};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AppConfig {
+    proxy: ProxyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProxyConfig {
+    url: Option<String>,
+    no_proxy: Vec<String>,
+}
+
+let loaded = ConfigLoader::new(AppConfig::default())
+    .env(
+        EnvSource::from_pairs([
+            ("HTTP_PROXY", "http://proxy.internal:8080"),
+            ("NO_PROXY", "localhost,.svc.internal"),
+        ])
+        .with_fallback("HTTP_PROXY", "proxy.url")
+        .with_fallback_decoder("NO_PROXY", "proxy.no_proxy", EnvDecoder::Csv),
+    )
+    .load()?;
+
+assert_eq!(loaded.proxy.url.as_deref(), Some("http://proxy.internal:8080"));
+assert_eq!(loaded.proxy.no_proxy, vec!["localhost", ".svc.internal"]);
+# Ok(())
+# }
+```
+
+For formats that are not covered by the built-in `EnvDecoder` variants, use
+`ConfigLoader::env_decoder_with(...)` to keep application-specific parsing in
+the config layer instead of pre-normalizing env vars outside `tier`.
+
+## Leaf Enums
+
+Leaf enum fields can opt out of nested metadata requirements with
+`#[tier(leaf)]` on the containing field:
+
+```rust
+# #[cfg(feature = "derive")] {
+use serde::{Deserialize, Serialize};
+use tier::TierConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Backend {
+    Memory,
+    Redis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+struct AppConfig {
+    #[tier(env = "APP_BACKEND", leaf)]
+    backend: Backend,
+}
 # }
 ```
 

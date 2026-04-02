@@ -15,6 +15,9 @@ pub mod metadata;
 /// Internal patch helpers used by the derive macro.
 #[doc(hidden)]
 pub mod patch;
+/// Internal path helpers used by exported path macros.
+#[doc(hidden)]
+pub mod path;
 mod reload;
 mod report;
 #[cfg(feature = "schema")]

@@ -95,12 +95,24 @@ impl<T> From<T> for Patch<T> {
 /// ```no_run
 /// # #[cfg(feature = "derive")] {
 /// # fn main() -> Result<(), tier::ConfigError> {
+/// use serde::{Deserialize, Serialize};
 /// use tier::{Layer, Patch, TierPatch};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct ServerConfig {
+///     port: u16,
+///     tls: TlsConfig,
+/// }
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct TlsConfig {
+///     cert: Option<String>,
+/// }
 ///
 /// #[derive(Debug, TierPatch, Default)]
 /// struct ServerPatch {
 ///     port: Option<u16>,
-///     #[tier(path = "tls.cert")]
+///     #[tier(path_expr = tier::path!(ServerConfig.tls.cert))]
 ///     cert_path: Patch<Option<String>>,
 /// }
 ///
@@ -253,7 +265,8 @@ impl PatchLayerBuilder {
 /// Hidden helper used by the `TierPatch` derive macro.
 #[doc(hidden)]
 #[must_use]
-pub fn join_patch_prefix(prefix: &str, path: &str) -> String {
+pub fn join_patch_prefix(prefix: &str, path: impl AsRef<str>) -> String {
+    let path = path.as_ref();
     match (prefix.is_empty(), path.is_empty()) {
         (true, true) => String::new(),
         (true, false) => path.to_owned(),

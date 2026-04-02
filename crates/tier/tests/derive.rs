@@ -112,6 +112,18 @@ struct DerivedEnvDecodeConfig {
     ports: Vec<u16>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum LeafBackend {
+    Memory,
+    Redis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
+struct LeafEnumConfig {
+    #[tier(env = "APP_BACKEND", doc = "Selected backend mode", leaf)]
+    backend: LeafBackend,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
 #[tier(at_least_one_of("port", "unix_socket"))]
 #[tier(required_if(path = "tls.enabled", equals = true, requires("tls.cert", "tls.key")))]
@@ -522,6 +534,24 @@ fn derive_metadata_can_configure_env_decoders() {
         .expect("config loads");
 
     assert_eq!(loaded.ports, vec![80, 443]);
+}
+
+#[test]
+fn leaf_enums_do_not_require_enum_level_tier_metadata() {
+    let metadata = LeafEnumConfig::metadata();
+    let backend = metadata.field("backend").expect("backend metadata");
+    assert_eq!(backend.env.as_deref(), Some("APP_BACKEND"));
+    assert_eq!(backend.doc.as_deref(), Some("Selected backend mode"));
+
+    let loaded = ConfigLoader::new(LeafEnumConfig {
+        backend: LeafBackend::Memory,
+    })
+    .derive_metadata()
+    .env(EnvSource::from_pairs([("APP_BACKEND", "Redis")]))
+    .load()
+    .expect("config loads");
+
+    assert_eq!(loaded.backend, LeafBackend::Redis);
 }
 
 #[test]

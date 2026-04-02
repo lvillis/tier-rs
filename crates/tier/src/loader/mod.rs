@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::{
@@ -34,6 +35,7 @@ use self::unknown::*;
 
 type Normalizer<T> = Box<dyn Fn(&mut T) -> Result<(), String> + Send + Sync>;
 type Validator<T> = Box<dyn Fn(&T) -> Result<(), ValidationErrors> + Send + Sync>;
+type CustomEnvDecoder = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// Kind of source that contributed configuration values.
@@ -284,6 +286,14 @@ pub struct EnvSource {
     prefix: Option<String>,
     separator: String,
     lowercase_segments: bool,
+    bindings: BTreeMap<String, EnvBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct EnvBinding {
+    path: String,
+    decoder: Option<EnvDecoder>,
+    fallback: bool,
 }
 
 impl EnvSource {
@@ -316,6 +326,7 @@ impl EnvSource {
             prefix: None,
             separator: "__".to_owned(),
             lowercase_segments: true,
+            bindings: BTreeMap::new(),
         }
     }
 
@@ -340,6 +351,80 @@ impl EnvSource {
     #[must_use]
     pub fn preserve_case(mut self) -> Self {
         self.lowercase_segments = false;
+        self
+    }
+
+    /// Maps an explicit environment variable name to a configuration path.
+    ///
+    /// This is useful for compatibility with standard operational variables
+    /// such as `HTTP_PROXY` alongside application-scoped names.
+    #[must_use]
+    pub fn with_alias(mut self, name: impl Into<String>, path: impl Into<String>) -> Self {
+        self.bindings.insert(
+            name.into(),
+            EnvBinding {
+                path: path.into(),
+                decoder: None,
+                fallback: false,
+            },
+        );
+        self
+    }
+
+    /// Maps an explicit environment variable name to a configuration path and
+    /// decodes it with a built-in env decoder.
+    #[must_use]
+    pub fn with_alias_decoder(
+        mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        decoder: EnvDecoder,
+    ) -> Self {
+        self.bindings.insert(
+            name.into(),
+            EnvBinding {
+                path: path.into(),
+                decoder: Some(decoder),
+                fallback: false,
+            },
+        );
+        self
+    }
+
+    /// Registers a lower-priority compatibility env mapping for a path.
+    ///
+    /// Fallback env names only apply when the same configuration path was not
+    /// already written by a more specific env binding from this source.
+    #[must_use]
+    pub fn with_fallback(mut self, name: impl Into<String>, path: impl Into<String>) -> Self {
+        self.bindings.insert(
+            name.into(),
+            EnvBinding {
+                path: path.into(),
+                decoder: None,
+                fallback: true,
+            },
+        );
+        self
+    }
+
+    /// Registers a lower-priority compatibility env mapping with a built-in
+    /// decoder for structured values such as `NO_PROXY`.
+    #[must_use]
+    pub fn with_fallback_decoder(
+        mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        decoder: EnvDecoder,
+    ) -> Self {
+        self.bindings.insert(
+            name.into(),
+            EnvBinding {
+                path: path.into(),
+                decoder: Some(decoder),
+                fallback: true,
+            },
+        );
         self
     }
 }
@@ -638,6 +723,7 @@ pub struct ConfigLoader<T> {
     validators: Vec<NamedValidator<T>>,
     profile: Option<String>,
     unknown_field_policy: UnknownFieldPolicy,
+    custom_env_decoders: BTreeMap<String, CustomEnvDecoder>,
 }
 
 impl<T> ConfigLoader<T>
@@ -659,6 +745,7 @@ where
             validators: Vec::new(),
             profile: None,
             unknown_field_policy: UnknownFieldPolicy::Deny,
+            custom_env_decoders: BTreeMap::new(),
         }
     }
 
@@ -731,6 +818,51 @@ where
     pub fn env_decoder(mut self, path: impl Into<String>, decoder: EnvDecoder) -> Self {
         self.metadata
             .push(crate::FieldMetadata::new(path).env_decoder(decoder));
+        self
+    }
+
+    /// Registers a custom environment decoder for a configuration path.
+    ///
+    /// This keeps application-specific env parsing inside `tier` without
+    /// requiring pre-normalization before building an [`EnvSource`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), tier::ConfigError> {
+    /// use serde::{Deserialize, Serialize};
+    /// use serde_json::Value;
+    /// use tier::{ConfigLoader, EnvSource};
+    ///
+    /// #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    /// struct AppConfig {
+    ///     no_proxy: Vec<String>,
+    /// }
+    ///
+    /// let loaded = ConfigLoader::new(AppConfig { no_proxy: Vec::new() })
+    ///     .env_decoder_with("no_proxy", |raw| {
+    ///         Ok(Value::Array(
+    ///             raw.split(';')
+    ///                 .map(str::trim)
+    ///                 .filter(|segment| !segment.is_empty())
+    ///                 .map(|segment| Value::String(segment.to_owned()))
+    ///                 .collect(),
+    ///         ))
+    ///     })
+    ///     .env(EnvSource::from_pairs([("APP__NO_PROXY", "localhost;.internal")]).prefix("APP"))
+    ///     .load()?;
+    ///
+    /// assert_eq!(loaded.no_proxy, vec!["localhost", ".internal"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn env_decoder_with<F>(mut self, path: impl Into<String>, decoder: F) -> Self
+    where
+        F: Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
+    {
+        self.custom_env_decoders
+            .insert(normalize_path(&path.into()), Arc::new(decoder));
         self
     }
 
@@ -809,20 +941,28 @@ where
     /// #[derive(Debug, Clone, Serialize, Deserialize)]
     /// struct AppConfig {
     ///     port: u16,
+    ///     token: Option<String>,
     /// }
     ///
     /// #[derive(Debug, Parser, TierPatch)]
     /// struct AppCli {
     ///     #[arg(long)]
     ///     port: Option<u16>,
+    ///     #[arg(long = "db-token")]
+    ///     #[tier(path_expr = tier::path!(AppConfig.token))]
+    ///     token: Option<String>,
     /// }
     ///
-    /// let cli = AppCli::parse_from(["app", "--port", "8080"]);
-    /// let loaded = ConfigLoader::new(AppConfig { port: 3000 })
+    /// let cli = AppCli::parse_from(["app", "--port", "8080", "--db-token", "from-cli"]);
+    /// let loaded = ConfigLoader::new(AppConfig {
+    ///         port: 3000,
+    ///         token: None,
+    ///     })
     ///     .clap_overrides(&cli)?
     ///     .load()?;
     ///
     /// assert_eq!(loaded.port, 8080);
+    /// assert_eq!(loaded.token.as_deref(), Some("from-cli"));
     /// # Ok(())
     /// # }
     /// # }
@@ -942,6 +1082,8 @@ where
     pub fn load(self) -> Result<LoadedConfig<T>, ConfigError> {
         let unknown_field_policy = self.unknown_field_policy;
         let metadata = self.metadata.clone();
+        let custom_env_decoders =
+            canonicalize_custom_env_decoders(&self.custom_env_decoders, &metadata)?;
         let parsed_args = match self.args_source {
             Some(source) => Some(parse_args(source)?),
             None => None,
@@ -977,7 +1119,7 @@ where
         }
 
         for env_source in self.env_sources {
-            let layer = env_source.into_layer(&metadata)?;
+            let layer = env_source.into_layer(&metadata, &custom_env_decoders)?;
             if let Some(layer) = layer {
                 layers.push(canonicalize_layer_paths(layer, &metadata)?);
             }
@@ -1146,6 +1288,22 @@ where
 
         Ok(LoadedConfig { config, report })
     }
+}
+
+fn canonicalize_custom_env_decoders(
+    decoders: &BTreeMap<String, CustomEnvDecoder>,
+    metadata: &ConfigMetadata,
+) -> Result<BTreeMap<String, CustomEnvDecoder>, ConfigError> {
+    let aliases = metadata.alias_overrides()?;
+    Ok(decoders
+        .iter()
+        .map(|(path, decoder)| {
+            (
+                canonicalize_path_with_aliases(&normalize_path(path), &aliases),
+                Arc::clone(decoder),
+            )
+        })
+        .collect())
 }
 
 fn validate_indexed_array_paths(base: &Value, layer: &Layer) -> Result<(), ConfigError> {
@@ -2921,16 +3079,24 @@ fn parse_override_value(raw: &str) -> Result<ParsedOverride, String> {
 fn parse_env_override_value(
     raw: &str,
     decoder: Option<EnvDecoder>,
+    custom_decoder: Option<&CustomEnvDecoder>,
 ) -> Result<ParsedOverride, String> {
-    match decoder {
-        Some(decoder) => {
+    match (custom_decoder, decoder) {
+        (Some(custom_decoder), _) => {
+            let value = custom_decoder(raw)?;
+            Ok(ParsedOverride {
+                string_coercion_suffixes: collect_string_leaf_suffixes(&value, ""),
+                value,
+            })
+        }
+        (None, Some(decoder)) => {
             let value = decode_env_override_value(raw, decoder)?;
             Ok(ParsedOverride {
                 string_coercion_suffixes: collect_string_leaf_suffixes(&value, ""),
                 value,
             })
         }
-        None => parse_override_value(raw),
+        (None, None) => parse_override_value(raw),
     }
 }
 
