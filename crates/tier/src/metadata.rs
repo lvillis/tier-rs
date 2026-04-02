@@ -408,6 +408,8 @@ pub struct FieldMetadata {
     pub secret: bool,
     /// Exact environment variable name to map to this path.
     pub env: Option<String>,
+    /// Decoder applied to environment variable values before deserialization.
+    pub env_decode: Option<EnvDecoder>,
     /// Human-readable field documentation.
     pub doc: Option<String>,
     /// Example value rendered in generated docs.
@@ -431,6 +433,7 @@ impl FieldMetadata {
             aliases: Vec::new(),
             secret: false,
             env: None,
+            env_decode: None,
             doc: None,
             example: None,
             deprecated: None,
@@ -458,6 +461,16 @@ impl FieldMetadata {
     #[must_use]
     pub fn env(mut self, env: impl Into<String>) -> Self {
         self.env = Some(env.into());
+        self
+    }
+
+    /// Decodes environment variables for this path with a built-in decoder.
+    ///
+    /// This can be used together with [`ConfigMetadata`] when metadata is
+    /// built manually instead of derived.
+    #[must_use]
+    pub fn env_decoder(mut self, decoder: EnvDecoder) -> Self {
+        self.env_decode = Some(decoder);
         self
     }
 
@@ -577,6 +590,9 @@ impl FieldMetadata {
         if let Some(env) = other.env {
             self.env = Some(env);
         }
+        if let Some(env_decode) = other.env_decode {
+            self.env_decode = Some(env_decode);
+        }
         if let Some(doc) = other.doc {
             self.doc = Some(doc);
         }
@@ -594,6 +610,45 @@ impl FieldMetadata {
             if !self.validations.contains(&rule) {
                 self.validations.push(rule);
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Built-in decoders for structured environment variable values.
+///
+/// These decoders are intended for operational formats that are common in
+/// deployments but inconvenient to express as JSON.
+///
+/// # Examples
+///
+/// ```
+/// use tier::{ConfigMetadata, EnvDecoder, FieldMetadata};
+///
+/// let mut metadata = ConfigMetadata::new();
+/// metadata.push(FieldMetadata::new("no_proxy").env_decoder(EnvDecoder::Csv));
+/// metadata.push(FieldMetadata::new("labels").env_decoder(EnvDecoder::KeyValueMap));
+///
+/// assert_eq!(metadata.fields().len(), 2);
+/// ```
+pub enum EnvDecoder {
+    /// Comma-separated values such as `a,b,c`.
+    Csv,
+    /// Platform-native path list syntax such as `PATH`.
+    PathList,
+    /// Comma-separated `key=value` pairs such as `a=1,b=2`.
+    KeyValueMap,
+    /// Whitespace-separated values such as `a b c`.
+    Whitespace,
+}
+
+impl Display for EnvDecoder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Csv => write!(f, "csv"),
+            Self::PathList => write!(f, "path_list"),
+            Self::KeyValueMap => write!(f, "key_value_map"),
+            Self::Whitespace => write!(f, "whitespace"),
         }
     }
 }

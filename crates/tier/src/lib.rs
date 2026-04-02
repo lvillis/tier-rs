@@ -12,6 +12,9 @@ mod loader;
 /// Internal metadata helpers used by the derive macro.
 #[doc(hidden)]
 pub mod metadata;
+/// Internal patch helpers used by the derive macro.
+#[doc(hidden)]
+pub mod patch;
 mod reload;
 mod report;
 #[cfg(feature = "schema")]
@@ -34,9 +37,10 @@ pub use crate::loader::{
     SourceTrace, UnknownFieldPolicy,
 };
 pub use crate::metadata::{
-    ConfigMetadata, FieldMetadata, MergeStrategy, TierMetadata, ValidationCheck, ValidationNumber,
-    ValidationRule, ValidationValue,
+    ConfigMetadata, EnvDecoder, FieldMetadata, MergeStrategy, TierMetadata, ValidationCheck,
+    ValidationNumber, ValidationRule, ValidationValue,
 };
+pub use crate::patch::{Patch, TierPatch};
 #[cfg(feature = "watch")]
 #[cfg_attr(docsrs, doc(cfg(feature = "watch")))]
 pub use crate::reload::NativeWatcher;
@@ -60,4 +64,4 @@ pub use crate::schema::{
 pub use crate::secret::Secret;
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
-pub use tier_derive::TierConfig;
+pub use tier_derive::{TierConfig, TierPatch};

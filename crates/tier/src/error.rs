@@ -313,6 +313,17 @@ pub enum ConfigError {
         message: String,
     },
 
+    /// A typed sparse patch could not be converted into a configuration layer.
+    #[error("invalid patch {name} for path {path}: {message}")]
+    InvalidPatch {
+        /// Human-readable patch source name.
+        name: String,
+        /// Target configuration path.
+        path: String,
+        /// Human-readable validation failure.
+        message: String,
+    },
+
     /// Multiple input paths resolved to the same canonical path.
     #[error(
         "configuration paths `{first_path}` and `{second_path}` both resolve to `{canonical_path}`"

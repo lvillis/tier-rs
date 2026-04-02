@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,10 @@ use crate::report::{
     collect_diff_paths, collect_paths, get_value_at_path, join_path, normalize_path,
     path_matches_pattern, path_overlaps_pattern, path_starts_with_pattern, redact_value,
 };
-use crate::{ConfigMetadata, MergeStrategy, TierMetadata, ValidationCheck, ValidationRule};
+use crate::{
+    ConfigMetadata, EnvDecoder, MergeStrategy, TierMetadata, TierPatch, ValidationCheck,
+    ValidationRule,
+};
 
 mod canonical;
 mod env;
@@ -444,6 +448,78 @@ impl Layer {
             direct_array_paths: BTreeSet::new(),
         })
     }
+
+    pub(crate) fn from_parts(
+        trace: SourceTrace,
+        value: Value,
+        entries: BTreeMap<String, SourceTrace>,
+        coercible_string_paths: BTreeSet<String>,
+        indexed_array_paths: BTreeSet<String>,
+        indexed_array_base_lengths: BTreeMap<String, usize>,
+        direct_array_paths: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            trace,
+            value,
+            entries,
+            coercible_string_paths,
+            indexed_array_paths,
+            indexed_array_base_lengths,
+            direct_array_paths,
+        }
+    }
+
+    /// Creates a custom configuration layer from a typed sparse patch.
+    ///
+    /// This is the typed alternative to manually building a [`Layer`] from a
+    /// serializable shadow struct.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "derive")] {
+    /// # fn main() -> Result<(), tier::ConfigError> {
+    /// use tier::{Layer, TierPatch};
+    ///
+    /// #[derive(Debug, TierPatch, Default)]
+    /// struct CliPatch {
+    ///     port: Option<u16>,
+    /// }
+    ///
+    /// let _layer = Layer::from_patch("typed-cli", &CliPatch { port: Some(7000) })?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn from_patch<P>(name: impl Into<String>, patch: &P) -> Result<Self, ConfigError>
+    where
+        P: TierPatch,
+    {
+        Self::from_patch_with_trace(
+            SourceTrace {
+                kind: SourceKind::Custom,
+                name: name.into(),
+                location: None,
+            },
+            patch,
+        )
+    }
+
+    pub(crate) fn from_patch_with_trace<P>(
+        trace: SourceTrace,
+        patch: &P,
+    ) -> Result<Self, ConfigError>
+    where
+        P: TierPatch,
+    {
+        let mut builder = crate::patch::PatchLayerBuilder::from_trace(trace);
+        patch.write_layer(&mut builder, "")?;
+        Ok(builder.finish())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 struct NamedNormalizer<T> {
@@ -614,6 +690,50 @@ where
         self
     }
 
+    /// Registers a built-in environment decoder for a configuration path.
+    ///
+    /// This is useful for operational formats such as comma-separated lists or
+    /// `key=value` maps that are common in environment variables but awkward to
+    /// express as JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), tier::ConfigError> {
+    /// use serde::{Deserialize, Serialize};
+    /// use tier::{ConfigLoader, EnvDecoder, EnvSource};
+    ///
+    /// #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    /// struct AppConfig {
+    ///     no_proxy: Vec<String>,
+    /// }
+    ///
+    /// let loaded = ConfigLoader::new(AppConfig { no_proxy: Vec::new() })
+    ///     .env_decoder("no_proxy", EnvDecoder::Csv)
+    ///     .env(EnvSource::from_pairs([(
+    ///         "APP__NO_PROXY",
+    ///         "localhost,127.0.0.1,.internal.example.com",
+    ///     )]).prefix("APP"))
+    ///     .load()?;
+    ///
+    /// assert_eq!(
+    ///     loaded.no_proxy,
+    ///     vec![
+    ///         "localhost".to_owned(),
+    ///         "127.0.0.1".to_owned(),
+    ///         ".internal.example.com".to_owned(),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn env_decoder(mut self, path: impl Into<String>, decoder: EnvDecoder) -> Self {
+        self.metadata
+            .push(crate::FieldMetadata::new(path).env_decoder(decoder));
+        self
+    }
+
     /// Adds CLI overrides from an [`ArgsSource`].
     #[must_use]
     pub fn args(mut self, source: ArgsSource) -> Self {
@@ -625,6 +745,104 @@ where
     pub fn layer(mut self, layer: Layer) -> Self {
         self.custom_layers.push(layer);
         self
+    }
+
+    /// Adds a typed sparse patch as a custom layer.
+    ///
+    /// This keeps sparse overrides typed and avoids maintaining a parallel
+    /// serializable shadow hierarchy just to build a [`Layer`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "derive")] {
+    /// # fn main() -> Result<(), tier::ConfigError> {
+    /// use serde::{Deserialize, Serialize};
+    /// use tier::{ConfigLoader, TierPatch};
+    ///
+    /// #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// struct AppConfig {
+    ///     port: u16,
+    /// }
+    ///
+    /// #[derive(Debug, TierPatch, Default)]
+    /// struct CliPatch {
+    ///     port: Option<u16>,
+    /// }
+    ///
+    /// let loaded = ConfigLoader::new(AppConfig { port: 3000 })
+    ///     .patch("typed-cli", &CliPatch { port: Some(7000) })?
+    ///     .load()?;
+    ///
+    /// assert_eq!(loaded.port, 7000);
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn patch<P>(mut self, name: impl Into<String>, patch: &P) -> Result<Self, ConfigError>
+    where
+        P: TierPatch,
+    {
+        let layer = Layer::from_patch(name, patch)?;
+        if !layer.is_empty() {
+            self.custom_layers.push(layer);
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "clap")]
+    /// Adds a typed `clap`-style sparse override struct as the last CLI layer.
+    ///
+    /// This is the ergonomic bridge for applications that already parse a
+    /// typed `clap` CLI and want to feed the parsed values into `tier` without
+    /// building a manual shadow patch struct.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(all(feature = "derive", feature = "clap"))] {
+    /// # fn main() -> Result<(), tier::ConfigError> {
+    /// use clap::Parser;
+    /// use serde::{Deserialize, Serialize};
+    /// use tier::{ConfigLoader, TierPatch};
+    ///
+    /// #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// struct AppConfig {
+    ///     port: u16,
+    /// }
+    ///
+    /// #[derive(Debug, Parser, TierPatch)]
+    /// struct AppCli {
+    ///     #[arg(long)]
+    ///     port: Option<u16>,
+    /// }
+    ///
+    /// let cli = AppCli::parse_from(["app", "--port", "8080"]);
+    /// let loaded = ConfigLoader::new(AppConfig { port: 3000 })
+    ///     .clap_overrides(&cli)?
+    ///     .load()?;
+    ///
+    /// assert_eq!(loaded.port, 8080);
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn clap_overrides<P>(mut self, patch: &P) -> Result<Self, ConfigError>
+    where
+        P: TierPatch,
+    {
+        let layer = Layer::from_patch_with_trace(
+            SourceTrace {
+                kind: SourceKind::Arguments,
+                name: "typed-clap".to_owned(),
+                location: None,
+            },
+            patch,
+        )?;
+        if !layer.is_empty() {
+            self.custom_layers.push(layer);
+        }
+        Ok(self)
     }
 
     /// Marks a dot-delimited path as sensitive for report redaction.
@@ -1908,8 +2126,12 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
                 message,
             }
         })?;
-        if parsed.allow_string_coercion {
-            coercible_string_paths.insert(path.clone());
+        for suffix in parsed.string_coercion_suffixes {
+            coercible_string_paths.insert(if suffix.is_empty() {
+                path.clone()
+            } else {
+                join_path(&path, &suffix)
+            });
         }
         indexed_array_paths.extend(indexed_array_container_paths(&segments));
         if is_direct_array {
@@ -2490,7 +2712,7 @@ fn merge_indexed_array_patch(
     }
 }
 
-fn indexed_array_container_paths(segments: &[&str]) -> BTreeSet<String> {
+pub(crate) fn indexed_array_container_paths(segments: &[&str]) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for index in 0..segments.len() {
         if segments[index].parse::<usize>().is_ok() && index > 0 {
@@ -2500,7 +2722,7 @@ fn indexed_array_container_paths(segments: &[&str]) -> BTreeSet<String> {
     paths
 }
 
-fn record_indexed_array_state(
+pub(crate) fn record_indexed_array_state(
     current_array_lengths: &mut BTreeMap<String, usize>,
     indexed_array_base_lengths: &mut BTreeMap<String, usize>,
     path: &str,
@@ -2523,7 +2745,7 @@ fn record_indexed_array_state(
     }
 }
 
-fn record_direct_array_state(
+pub(crate) fn record_direct_array_state(
     current_array_lengths: &mut BTreeMap<String, usize>,
     indexed_array_base_lengths: &mut BTreeMap<String, usize>,
     path: &str,
@@ -2665,14 +2887,14 @@ where
 
 struct ParsedOverride {
     value: Value,
-    allow_string_coercion: bool,
+    string_coercion_suffixes: BTreeSet<String>,
 }
 
 fn parse_override_value(raw: &str) -> Result<ParsedOverride, String> {
     if raw.is_empty() {
         return Ok(ParsedOverride {
             value: Value::String(String::new()),
-            allow_string_coercion: true,
+            string_coercion_suffixes: BTreeSet::from([String::new()]),
         });
     }
 
@@ -2686,14 +2908,103 @@ fn parse_override_value(raw: &str) -> Result<ParsedOverride, String> {
             .map_err(|error| format!("invalid explicit JSON override: {error}"))?;
         return Ok(ParsedOverride {
             value,
-            allow_string_coercion: false,
+            string_coercion_suffixes: BTreeSet::new(),
         });
     }
 
     Ok(ParsedOverride {
         value: Value::String(raw.to_owned()),
-        allow_string_coercion: true,
+        string_coercion_suffixes: BTreeSet::from([String::new()]),
     })
+}
+
+fn parse_env_override_value(
+    raw: &str,
+    decoder: Option<EnvDecoder>,
+) -> Result<ParsedOverride, String> {
+    match decoder {
+        Some(decoder) => {
+            let value = decode_env_override_value(raw, decoder)?;
+            Ok(ParsedOverride {
+                string_coercion_suffixes: collect_string_leaf_suffixes(&value, ""),
+                value,
+            })
+        }
+        None => parse_override_value(raw),
+    }
+}
+
+fn decode_env_override_value(raw: &str, decoder: EnvDecoder) -> Result<Value, String> {
+    match decoder {
+        EnvDecoder::Csv => Ok(Value::Array(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| Value::String(segment.to_owned()))
+                .collect(),
+        )),
+        EnvDecoder::Whitespace => Ok(Value::Array(
+            raw.split_whitespace()
+                .map(|segment| Value::String(segment.to_owned()))
+                .collect(),
+        )),
+        EnvDecoder::PathList => {
+            let values = std::env::split_paths(OsStr::new(raw))
+                .map(|path| Value::String(path.to_string_lossy().into_owned()))
+                .collect();
+            Ok(Value::Array(values))
+        }
+        EnvDecoder::KeyValueMap => {
+            let mut map = Map::new();
+            for entry in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+            {
+                let (key, value) = entry.split_once('=').ok_or_else(|| {
+                    format!("invalid key_value_map entry `{entry}`, expected key=value")
+                })?;
+                let key = key.trim();
+                let value = value.trim();
+                if key.is_empty() {
+                    return Err("key_value_map entries must not use an empty key".to_owned());
+                }
+                map.insert(key.to_owned(), Value::String(value.to_owned()));
+            }
+            Ok(Value::Object(map))
+        }
+    }
+}
+
+fn collect_string_leaf_suffixes(value: &Value, prefix: &str) -> BTreeSet<String> {
+    let mut suffixes = BTreeSet::new();
+    collect_string_leaf_suffixes_inner(value, prefix, &mut suffixes);
+    suffixes
+}
+
+fn collect_string_leaf_suffixes_inner(
+    value: &Value,
+    prefix: &str,
+    suffixes: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::String(_) => {
+            suffixes.insert(prefix.to_owned());
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let next = join_path(prefix, &index.to_string());
+                collect_string_leaf_suffixes_inner(value, &next, suffixes);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                let next = join_path(prefix, key);
+                collect_string_leaf_suffixes_inner(value, &next, suffixes);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn unexpected_value(value: &Value) -> de::Unexpected<'_> {
@@ -3247,7 +3558,7 @@ where
     }
 }
 
-fn insert_path(root: &mut Value, segments: &[&str], value: Value) -> Result<(), String> {
+pub(crate) fn insert_path(root: &mut Value, segments: &[&str], value: Value) -> Result<(), String> {
     if segments.is_empty() {
         return Err("configuration path cannot be empty".to_owned());
     }

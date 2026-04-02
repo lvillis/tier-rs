@@ -20,6 +20,16 @@ pub fn derive_tier_config(input: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_derive(TierPatch, attributes(tier, serde))]
+/// Derives `tier::TierPatch` for typed sparse override structs.
+pub fn derive_tier_patch(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match expand_tier_patch(input) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
 fn expand_tier_config(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let tier_attrs = parse_tier_container_attrs(&input.attrs)?;
     let ident = input.ident;
@@ -45,6 +55,55 @@ fn expand_tier_config(input: DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 #(#field_tokens)*
                 #(#check_tokens)*
                 metadata
+            }
+        }
+    })
+}
+
+fn expand_tier_patch(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let ident = input.ident;
+    let generics = input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let container_attrs = parse_serde_container_attrs(&input.attrs)?;
+    ensure_struct_patch_container_attrs(&container_attrs)?;
+
+    let field_tokens = match input.data {
+        Data::Struct(data_struct) => match data_struct.fields {
+            Fields::Named(fields) => expand_patch_fields_metadata(
+                fields,
+                SerdeFieldContext::for_struct(&container_attrs),
+            )?,
+            Fields::Unnamed(fields) => {
+                return Err(syn::Error::new_spanned(
+                    fields,
+                    "TierPatch only supports structs with named fields",
+                ));
+            }
+            Fields::Unit => Vec::new(),
+        },
+        Data::Enum(data_enum) => {
+            return Err(syn::Error::new_spanned(
+                data_enum.enum_token,
+                "TierPatch cannot be derived for enums",
+            ));
+        }
+        Data::Union(union) => {
+            return Err(syn::Error::new_spanned(
+                union.union_token,
+                "TierPatch cannot be derived for unions",
+            ));
+        }
+    };
+
+    Ok(quote! {
+        impl #impl_generics ::tier::TierPatch for #ident #ty_generics #where_clause {
+            fn write_layer(
+                &self,
+                __tier_builder: &mut ::tier::patch::PatchLayerBuilder,
+                __tier_prefix: &str,
+            ) -> ::std::result::Result<(), ::tier::ConfigError> {
+                #(#field_tokens)*
+                Ok(())
             }
         }
     })
@@ -353,6 +412,145 @@ fn expand_newtype_variant_metadata(
     }])
 }
 
+fn ensure_struct_patch_container_attrs(container_attrs: &SerdeContainerAttrs) -> syn::Result<()> {
+    if container_attrs.rename_all_fields_serialize.is_some()
+        || container_attrs.rename_all_fields_deserialize.is_some()
+        || container_attrs.tag.is_some()
+        || container_attrs.content.is_some()
+        || container_attrs.untagged
+    {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "TierPatch only supports struct-style serde container attributes",
+        ));
+    }
+
+    Ok(())
+}
+
+fn expand_patch_fields_metadata(
+    fields: FieldsNamed,
+    context: SerdeFieldContext,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let mut field_tokens = Vec::new();
+
+    for field in fields.named {
+        field_tokens.push(expand_patch_field_metadata(field, context)?);
+    }
+
+    Ok(field_tokens)
+}
+
+fn expand_patch_field_metadata(
+    field: Field,
+    context: SerdeFieldContext,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let field_ident = field.ident.expect("named field");
+    let serde_attrs = parse_serde_field_attrs(&field.attrs, &field_ident, context)?;
+    let attrs = parse_patch_attrs(&field.attrs)?;
+
+    if serde_attrs.skip_metadata {
+        if attrs.path.is_some() || attrs.nested {
+            return Err(syn::Error::new_spanned(
+                field_ident,
+                "skipped fields cannot use tier patch attributes",
+            ));
+        }
+        return Ok(quote! {});
+    }
+
+    if serde_attrs.flatten && attrs.path.is_some() {
+        return Err(syn::Error::new_spanned(
+            field_ident,
+            "flattened patch fields cannot override their tier path",
+        ));
+    }
+
+    let default_path = attrs
+        .path
+        .clone()
+        .unwrap_or_else(|| serde_attrs.canonical_name.clone());
+    let path_lit = LitStr::new(&default_path, field_ident.span());
+    let path_expr = if serde_attrs.flatten {
+        quote! { ::std::string::String::from(__tier_prefix) }
+    } else {
+        quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_lit) }
+    };
+    let field_access = quote! { &self.#field_ident };
+
+    if serde_attrs.flatten || attrs.nested {
+        return Ok(generate_nested_patch_tokens(
+            &field.ty,
+            field_access,
+            path_expr,
+        ));
+    }
+
+    Ok(generate_leaf_patch_tokens(
+        &field.ty,
+        field_access,
+        path_expr,
+    ))
+}
+
+fn generate_nested_patch_tokens(
+    field_ty: &Type,
+    field_access: proc_macro2::TokenStream,
+    path_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if option_inner_type(field_ty).is_some() {
+        quote! {
+            if let ::std::option::Option::Some(value) = #field_access {
+                let __tier_path = #path_expr;
+                ::tier::TierPatch::write_layer(value, __tier_builder, &__tier_path)?;
+            }
+        }
+    } else if patch_inner_type(field_ty).is_some() {
+        quote! {
+            if let ::std::option::Option::Some(value) = #field_access.as_ref() {
+                let __tier_path = #path_expr;
+                ::tier::TierPatch::write_layer(value, __tier_builder, &__tier_path)?;
+            }
+        }
+    } else {
+        quote! {
+            {
+                let __tier_path = #path_expr;
+                ::tier::TierPatch::write_layer(#field_access, __tier_builder, &__tier_path)?;
+            }
+        }
+    }
+}
+
+fn generate_leaf_patch_tokens(
+    field_ty: &Type,
+    field_access: proc_macro2::TokenStream,
+    path_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if option_inner_type(field_ty).is_some() {
+        quote! {
+            if let ::std::option::Option::Some(value) = #field_access {
+                let __tier_path = #path_expr;
+                __tier_builder.insert_serialized(&__tier_path, value)?;
+            }
+        }
+    } else if patch_inner_type(field_ty).is_some() {
+        quote! {
+            if let ::std::option::Option::Some(value) = #field_access.as_ref() {
+                let __tier_path = #path_expr;
+                __tier_builder.insert_serialized(&__tier_path, value)?;
+            }
+        }
+    } else {
+        quote! {
+            {
+                let __tier_path = #path_expr;
+                __tier_builder.insert_serialized(&__tier_path, #field_access)?;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TierAttrs {
     secret: bool,
@@ -371,6 +569,7 @@ struct TierAttrs {
     ip_addr: bool,
     socket_addr: bool,
     absolute_path: bool,
+    env_decode: Option<String>,
 }
 
 impl TierAttrs {
@@ -391,7 +590,14 @@ impl TierAttrs {
             || self.ip_addr
             || self.socket_addr
             || self.absolute_path
+            || self.env_decode.is_some()
     }
+}
+
+#[derive(Debug, Default)]
+struct PatchAttrs {
+    path: Option<String>,
+    nested: bool,
 }
 
 #[derive(Debug, Default)]
@@ -671,7 +877,33 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
                 consume_unused_meta(meta)?;
                 return Ok(());
             }
+            if meta.path.is_ident("env_decode") {
+                attrs.env_decode = Some(parse_string_value(meta)?);
+                return Ok(());
+            }
             Err(meta.error("unsupported tier attribute"))
+        })?;
+    }
+    Ok(attrs)
+}
+
+fn parse_patch_attrs(attributes: &[Attribute]) -> syn::Result<PatchAttrs> {
+    let mut attrs = PatchAttrs::default();
+    for attribute in attributes {
+        if !attribute.path().is_ident("tier") {
+            continue;
+        }
+        attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("path") {
+                attrs.path = Some(parse_string_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("nested") {
+                attrs.nested = true;
+                consume_unused_meta(meta)?;
+                return Ok(());
+            }
+            Err(meta.error("unsupported tier patch attribute"))
         })?;
     }
     Ok(attrs)
@@ -1554,6 +1786,21 @@ fn direct_field_metadata_tokens(
     if attrs.absolute_path {
         builder = quote! { #builder.absolute_path() };
     }
+    if let Some(env_decode) = &attrs.env_decode {
+        let env_decode = match env_decode.as_str() {
+            "csv" => quote! { ::tier::EnvDecoder::Csv },
+            "path_list" => quote! { ::tier::EnvDecoder::PathList },
+            "key_value_map" => quote! { ::tier::EnvDecoder::KeyValueMap },
+            "whitespace" => quote! { ::tier::EnvDecoder::Whitespace },
+            _ => {
+                return Err(syn::Error::new(
+                    field_name.span(),
+                    "unsupported tier env decoder, expected csv|path_list|key_value_map|whitespace",
+                ));
+            }
+        };
+        builder = quote! { #builder.env_decoder(#env_decode) };
+    }
 
     Ok(quote! {
         #accumulator.push(#builder);
@@ -1589,6 +1836,34 @@ fn metadata_inner_type(ty: &Type) -> Option<&Type> {
             }
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn option_inner_type(ty: &Type) -> Option<&Type> {
+    wrapper_inner_type(ty, "Option")
+}
+
+fn patch_inner_type(ty: &Type) -> Option<&Type> {
+    wrapper_inner_type(ty, "Patch")
+}
+
+fn wrapper_inner_type<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != wrapper {
+        return None;
+    }
+    match &segment.arguments {
+        PathArguments::AngleBracketed(arguments) => arguments.args.iter().find_map(|argument| {
+            if let GenericArgument::Type(ty) = argument {
+                Some(ty)
+            } else {
+                None
+            }
+        }),
         _ => None,
     }
 }

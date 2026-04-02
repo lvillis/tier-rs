@@ -40,6 +40,88 @@ Use `tier` when you want:
 - Primitive targets such as `bool`, integers, floats, and `Option<T>` are coerced during deserialization
 - Use explicit JSON syntax for arrays, objects, or quoted strings when you need structured inline values
 
+## Typed Patches
+
+If your application already has typed override structs, derive `TierPatch` and
+apply them directly instead of maintaining a serializable shadow layer.
+
+```rust,no_run
+# #[cfg(feature = "derive")] {
+# fn main() -> Result<(), tier::ConfigError> {
+use serde::{Deserialize, Serialize};
+use tier::{ConfigLoader, Patch, TierPatch};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    port: u16,
+    token: Option<String>,
+}
+
+#[derive(Debug, Default, TierPatch)]
+struct CliPatch {
+    port: Option<u16>,
+    #[tier(path = "token")]
+    token: Patch<Option<String>>,
+}
+
+let loaded = ConfigLoader::new(AppConfig {
+        port: 3000,
+        token: Some("default".to_owned()),
+    })
+    .patch(
+        "typed-cli",
+        &CliPatch {
+            port: Some(8080),
+            token: Patch::set(None),
+        },
+    )?
+    .load()?;
+
+assert_eq!(loaded.port, 8080);
+assert_eq!(loaded.token, None);
+# Ok(())
+# }
+# }
+```
+
+With both `derive` and `clap`, the same typed CLI struct can be applied as the
+last layer through `ConfigLoader::clap_overrides(&parsed_cli)`.
+
+## Structured Env Values
+
+`tier` can decode common operational env formats without forcing applications
+to pre-normalize them into JSON.
+
+```rust,no_run
+# fn main() -> Result<(), tier::ConfigError> {
+use serde::{Deserialize, Serialize};
+use tier::{ConfigLoader, EnvDecoder, EnvSource};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AppConfig {
+    no_proxy: Vec<String>,
+}
+
+let loaded = ConfigLoader::new(AppConfig { no_proxy: Vec::new() })
+    .env_decoder("no_proxy", EnvDecoder::Csv)
+    .env(EnvSource::from_pairs([(
+        "APP__NO_PROXY",
+        "localhost,127.0.0.1,.internal.example.com",
+    )]).prefix("APP"))
+    .load()?;
+
+assert_eq!(
+    loaded.no_proxy,
+    vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        ".internal.example.com".to_owned(),
+    ]
+);
+# Ok(())
+# }
+```
+
 ## Quick Start
 
 The smallest useful setup is defaults plus a TOML file:
@@ -359,13 +441,3 @@ struct DbConfig {
 let password = Secret::new("super-secret".to_owned());
 assert_eq!(format!("{password}"), "***redacted***");
 ```
-
-## Status
-
-This crate focuses on typed layered loading, metadata, diagnostics, validation,
-schema/docs output, and reload support.
-
-Deliberately out of scope in the current crate line:
-
-1. remote configuration backends
-2. derive-driven full CLI generation for application-specific flags

@@ -106,6 +106,12 @@ struct DerivedValidationConfig {
     listen_addr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq, Default)]
+struct DerivedEnvDecodeConfig {
+    #[tier(env = "APP_PORTS", env_decode = "csv")]
+    ports: Vec<u16>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
 #[tier(at_least_one_of("port", "unix_socket"))]
 #[tier(required_if(path = "tls.enabled", equals = true, requires("tls.cert", "tls.key")))]
@@ -505,6 +511,17 @@ fn loader_can_use_derived_metadata_for_redaction_env_mapping_and_warnings() {
             .to_string()
             .contains("deprecated field `server.port`")
     }));
+}
+
+#[test]
+fn derive_metadata_can_configure_env_decoders() {
+    let loaded = ConfigLoader::new(DerivedEnvDecodeConfig::default())
+        .derive_metadata()
+        .env(EnvSource::from_pairs([("APP_PORTS", "80,443")]))
+        .load()
+        .expect("config loads");
+
+    assert_eq!(loaded.ports, vec![80, 443]);
 }
 
 #[test]

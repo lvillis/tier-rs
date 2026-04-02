@@ -78,11 +78,13 @@ struct MapExampleService {
     token: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct LiteralPlaceholderKeySchemaConfig {
     settings: LiteralPlaceholderKeySettings,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct LiteralPlaceholderKeySettings {
     #[serde(rename = "{item}")]
@@ -120,9 +122,11 @@ struct TupleSchemaConfig {
     pair: (String, u16),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct RootTupleSchemaConfig(String, u16);
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct PrimitiveArraySchemaConfig {
     ports: Vec<u16>,
@@ -161,6 +165,7 @@ struct PropertyNamesFalseAdditionalPropertiesSchemaConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PropertyNamesFalsePatternPropertiesSchemaConfig;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct NestedPrimitiveArraySchemaConfig {
     matrix: Vec<Vec<u16>>,
@@ -171,21 +176,25 @@ struct IndexedPrimitiveArraySchemaConfig {
     ports: Vec<u16>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct IndexedArrayTableCommentSchemaConfig {
     users: Vec<IndexedArrayTableCommentUser>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct IndexedArrayTableCommentUser {
     name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct SpecificArrayTableFieldCommentSchemaConfig {
     users: Vec<SpecificArrayTableFieldCommentUser>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct SpecificArrayTableFieldCommentUser {
     name: String,
@@ -246,6 +255,7 @@ struct PropertyNamesEnumDynamicMapSchemaConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AllOfRequiredUnionSchemaConfig;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MixedArrayTomlSchemaConfig;
 

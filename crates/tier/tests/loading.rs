@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
 use tier::{
-    ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, ConfigWarning, EnvSource, FieldMetadata,
-    FileFormat, FileSource, Layer, MergeStrategy, REPORT_FORMAT_VERSION, SourceKind,
+    ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, ConfigWarning, EnvDecoder, EnvSource,
+    FieldMetadata, FileFormat, FileSource, Layer, MergeStrategy, REPORT_FORMAT_VERSION, SourceKind,
     ValidationErrors,
 };
 
@@ -56,6 +56,14 @@ struct MergeTls {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StringValueConfig {
     value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct StructuredEnvConfig {
+    no_proxy: Vec<String>,
+    ports: Vec<u16>,
+    labels: BTreeMap<String, u16>,
+    words: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -843,6 +851,44 @@ fn env_and_args_keep_string_inputs_but_still_coerce_numeric_targets() {
         .load()
         .expect("whitespace-only CLI override should load");
     assert_eq!(whitespace_from_args.value, "   ");
+}
+
+#[test]
+fn env_decoders_handle_common_structured_operational_formats() {
+    let loaded = ConfigLoader::new(StructuredEnvConfig::default())
+        .env_decoder("no_proxy", EnvDecoder::Csv)
+        .env_decoder("ports", EnvDecoder::Csv)
+        .env_decoder("labels", EnvDecoder::KeyValueMap)
+        .env_decoder("words", EnvDecoder::Whitespace)
+        .env(
+            EnvSource::from_pairs([
+                ("APP__NO_PROXY", "localhost,127.0.0.1,.internal.example.com"),
+                ("APP__PORTS", "80,443"),
+                ("APP__LABELS", "http=80,https=443"),
+                ("APP__WORDS", "alpha beta   gamma"),
+            ])
+            .prefix("APP"),
+        )
+        .load()
+        .expect("structured env overrides should decode");
+
+    assert_eq!(
+        loaded.no_proxy,
+        vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            ".internal.example.com".to_owned()
+        ]
+    );
+    assert_eq!(loaded.ports, vec![80, 443]);
+    assert_eq!(
+        loaded.labels,
+        BTreeMap::from([("http".to_owned(), 80_u16), ("https".to_owned(), 443_u16),])
+    );
+    assert_eq!(
+        loaded.words,
+        vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()]
+    );
 }
 
 #[test]

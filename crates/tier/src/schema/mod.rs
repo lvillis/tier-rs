@@ -238,6 +238,12 @@ fn annotate_schema_node(node: &mut Value, field: &FieldMetadata) {
     if let Some(env) = &field.env {
         object.insert("x-tier-env".to_owned(), Value::String(env.clone()));
     }
+    if let Some(env_decode) = &field.env_decode {
+        object.insert(
+            "x-tier-env-decode".to_owned(),
+            Value::String(env_decode.to_string()),
+        );
+    }
     if !field.aliases.is_empty() {
         object.insert(
             "x-tier-aliases".to_owned(),

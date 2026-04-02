@@ -41,12 +41,14 @@ impl EnvSource {
                 continue;
             }
 
-            let parsed =
-                parse_override_value(&raw_value).map_err(|message| ConfigError::InvalidEnv {
+            let decoder = metadata.field(&path).and_then(|field| field.env_decode);
+            let parsed = parse_env_override_value(&raw_value, decoder).map_err(|message| {
+                ConfigError::InvalidEnv {
                     name: name.clone(),
                     path: path.clone(),
                     message,
-                })?;
+                }
+            })?;
             let is_direct_array = parsed.value.is_array();
             let segments = path.split('.').collect::<Vec<_>>();
             record_indexed_array_state(
@@ -70,8 +72,12 @@ impl EnvSource {
                     message,
                 }
             })?;
-            if parsed.allow_string_coercion {
-                coercible_string_paths.insert(path.clone());
+            for suffix in parsed.string_coercion_suffixes {
+                coercible_string_paths.insert(if suffix.is_empty() {
+                    path.clone()
+                } else {
+                    join_path(&path, &suffix)
+                });
             }
             indexed_array_paths.extend(indexed_array_container_paths(&segments));
             if is_direct_array {
