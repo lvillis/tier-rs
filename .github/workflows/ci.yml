@@ -30,11 +30,11 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Docs
-        run: cargo doc --workspace --no-deps --all-features --locked
+        run: cargo doc --workspace --no-deps --all-features
       - name: Publish Dry Run tier-derive
-        run: cargo publish --dry-run -p tier-derive --locked
+        run: cargo publish --dry-run -p tier-derive
 
   feature-checks:
     name: Check ${{ matrix.name }}
@@ -45,23 +45,23 @@ jobs:
       matrix:
         include:
           - name: default
-            command: cargo check --workspace --locked
+            command: cargo check --workspace
           - name: no-default-features
-            command: cargo check --workspace --no-default-features --locked
+            command: cargo check --workspace --no-default-features
           - name: all-features
-            command: cargo check --workspace --all-features --locked
+            command: cargo check --workspace --all-features
           - name: clap
-            command: cargo check --workspace --no-default-features --features clap --locked
+            command: cargo check --workspace --no-default-features --features clap
           - name: derive
-            command: cargo check --workspace --no-default-features --features derive --locked
+            command: cargo check --workspace --no-default-features --features derive
           - name: json
-            command: cargo check --workspace --no-default-features --features json --locked
+            command: cargo check --workspace --no-default-features --features json
           - name: schema
-            command: cargo check --workspace --no-default-features --features schema --locked
+            command: cargo check --workspace --no-default-features --features schema
           - name: watch
-            command: cargo check --workspace --no-default-features --features watch --locked
+            command: cargo check --workspace --no-default-features --features watch
           - name: yaml
-            command: cargo check --workspace --no-default-features --features yaml --locked
+            command: cargo check --workspace --no-default-features --features yaml
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
@@ -80,17 +80,17 @@ jobs:
       matrix:
         include:
           - name: default
-            command: cargo test --workspace --locked
+            command: cargo test --workspace
           - name: no-default-features
-            command: cargo test --workspace --no-default-features --locked
+            command: cargo test --workspace --no-default-features
           - name: all-features
-            command: cargo test --workspace --all-features --locked
+            command: cargo test --workspace --all-features
           - name: clap
-            command: cargo test --workspace --no-default-features --features clap --locked
+            command: cargo test --workspace --no-default-features --features clap
           - name: derive
-            command: cargo test --workspace --no-default-features --features derive --locked
+            command: cargo test --workspace --no-default-features --features derive
           - name: schema
-            command: cargo test --workspace --no-default-features --features schema --locked
+            command: cargo test --workspace --no-default-features --features schema
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master

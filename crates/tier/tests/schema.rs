@@ -2575,6 +2575,7 @@ fn commented_toml_examples_include_tuple_item_metadata() {
     assert!(example.contains(r#"pair = ["edge", 8080]"#));
 }
 
+#[cfg(feature = "toml")]
 #[test]
 fn commented_toml_examples_respect_max_items_for_tuples_without_additional_items() {
     let example = config_example_toml::<TupleWithoutAdditionalItemsSchemaConfig>();
@@ -2583,6 +2584,7 @@ fn commented_toml_examples_respect_max_items_for_tuples_without_additional_items
     assert!(!example.contains("8080"));
 }
 
+#[cfg(feature = "toml")]
 #[test]
 fn commented_toml_examples_satisfy_min_items_for_required_additional_tuple_items() {
     let example = config_example_toml::<TupleWithRequiredAdditionalItemsSchemaConfig>();
@@ -2590,6 +2592,7 @@ fn commented_toml_examples_satisfy_min_items_for_required_additional_tuple_items
     assert!(example.contains(r#"pair = ["edge", 8080, 8080]"#));
 }
 
+#[cfg(feature = "toml")]
 #[test]
 fn commented_toml_examples_include_legacy_additional_item_metadata() {
     let example = config_example_toml::<LegacyAdditionalItemsSchemaConfig>();
