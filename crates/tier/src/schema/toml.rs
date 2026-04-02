@@ -1,5 +1,10 @@
+use std::collections::BTreeMap;
+
+use crate::report::path_matches_pattern;
+
 use super::*;
 
+#[cfg(feature = "toml")]
 pub(super) fn render_example_toml(value: &Value, metadata: &ConfigMetadata) -> String {
     let mut output = String::new();
     render_toml_root_comments(metadata, &mut output);

@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::report::path_matches_pattern;
 use crate::{ConfigMetadata, FieldMetadata, TierMetadata};
 use regex::Regex;
 use serde_json::Value;
+#[cfg(feature = "toml")]
 mod toml;
 
+#[cfg(feature = "toml")]
 use self::toml::render_example_toml;
 
 /// Re-export of `schemars::JsonSchema` used by `tier` schema helpers.
