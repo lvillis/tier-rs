@@ -287,13 +287,21 @@ pub struct EnvSource {
     separator: String,
     lowercase_segments: bool,
     bindings: BTreeMap<String, EnvBinding>,
+    binding_conflicts: Vec<EnvBindingConflict>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EnvBinding {
     path: String,
     decoder: Option<EnvDecoder>,
     fallback: bool,
+}
+
+#[derive(Debug, Clone)]
+struct EnvBindingConflict {
+    name: String,
+    first: EnvBinding,
+    second: EnvBinding,
 }
 
 impl EnvSource {
@@ -327,6 +335,7 @@ impl EnvSource {
             separator: "__".to_owned(),
             lowercase_segments: true,
             bindings: BTreeMap::new(),
+            binding_conflicts: Vec::new(),
         }
     }
 
@@ -360,7 +369,7 @@ impl EnvSource {
     /// such as `HTTP_PROXY` alongside application-scoped names.
     #[must_use]
     pub fn with_alias(mut self, name: impl Into<String>, path: impl Into<String>) -> Self {
-        self.bindings.insert(
+        self.insert_binding(
             name.into(),
             EnvBinding {
                 path: path.into(),
@@ -380,7 +389,7 @@ impl EnvSource {
         path: impl Into<String>,
         decoder: EnvDecoder,
     ) -> Self {
-        self.bindings.insert(
+        self.insert_binding(
             name.into(),
             EnvBinding {
                 path: path.into(),
@@ -397,7 +406,7 @@ impl EnvSource {
     /// already written by a more specific env binding from this source.
     #[must_use]
     pub fn with_fallback(mut self, name: impl Into<String>, path: impl Into<String>) -> Self {
-        self.bindings.insert(
+        self.insert_binding(
             name.into(),
             EnvBinding {
                 path: path.into(),
@@ -417,7 +426,7 @@ impl EnvSource {
         path: impl Into<String>,
         decoder: EnvDecoder,
     ) -> Self {
-        self.bindings.insert(
+        self.insert_binding(
             name.into(),
             EnvBinding {
                 path: path.into(),
@@ -426,6 +435,21 @@ impl EnvSource {
             },
         );
         self
+    }
+
+    fn insert_binding(&mut self, name: String, binding: EnvBinding) {
+        if let Some(existing) = self.bindings.get(&name) {
+            if existing != &binding {
+                self.binding_conflicts.push(EnvBindingConflict {
+                    name: name.clone(),
+                    first: existing.clone(),
+                    second: binding,
+                });
+            }
+            return;
+        }
+
+        self.bindings.insert(name, binding);
     }
 }
 
@@ -602,6 +626,19 @@ impl Layer {
         Ok(builder.finish())
     }
 
+    pub(crate) fn from_patch_with_trace_and_shape<P>(
+        trace: SourceTrace,
+        patch: &P,
+        shape: Value,
+    ) -> Result<Self, ConfigError>
+    where
+        P: TierPatch,
+    {
+        let mut builder = crate::patch::PatchLayerBuilder::from_trace_with_shape(trace, shape);
+        patch.write_layer(&mut builder, "")?;
+        Ok(builder.finish())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -717,12 +754,14 @@ pub struct ConfigLoader<T> {
     env_sources: Vec<EnvSource>,
     args_source: Option<ArgsSource>,
     custom_layers: Vec<Layer>,
+    typed_arg_layers: Vec<Layer>,
     metadata: ConfigMetadata,
     secret_paths: BTreeSet<String>,
     normalizers: Vec<NamedNormalizer<T>>,
     validators: Vec<NamedValidator<T>>,
     profile: Option<String>,
     unknown_field_policy: UnknownFieldPolicy,
+    env_decoders: BTreeMap<String, EnvDecoder>,
     custom_env_decoders: BTreeMap<String, CustomEnvDecoder>,
 }
 
@@ -739,12 +778,14 @@ where
             env_sources: Vec::new(),
             args_source: None,
             custom_layers: Vec::new(),
+            typed_arg_layers: Vec::new(),
             metadata: ConfigMetadata::default(),
             secret_paths: BTreeSet::new(),
             normalizers: Vec::new(),
             validators: Vec::new(),
             profile: None,
             unknown_field_policy: UnknownFieldPolicy::Deny,
+            env_decoders: BTreeMap::new(),
             custom_env_decoders: BTreeMap::new(),
         }
     }
@@ -816,8 +857,9 @@ where
     /// ```
     #[must_use]
     pub fn env_decoder(mut self, path: impl Into<String>, decoder: EnvDecoder) -> Self {
-        self.metadata
-            .push(crate::FieldMetadata::new(path).env_decoder(decoder));
+        let path = path.into();
+        self.env_decoders
+            .insert(normalize_decoder_registration_path(&path), decoder);
         self
     }
 
@@ -861,8 +903,11 @@ where
     where
         F: Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
     {
-        self.custom_env_decoders
-            .insert(normalize_path(&path.into()), Arc::new(decoder));
+        let path = path.into();
+        self.custom_env_decoders.insert(
+            normalize_decoder_registration_path(&path),
+            Arc::new(decoder),
+        );
         self
     }
 
@@ -915,7 +960,15 @@ where
     where
         P: TierPatch,
     {
-        let layer = Layer::from_patch(name, patch)?;
+        let layer = Layer::from_patch_with_trace_and_shape(
+            SourceTrace {
+                kind: SourceKind::Custom,
+                name: name.into(),
+                location: None,
+            },
+            patch,
+            self.custom_patch_shape_value()?,
+        )?;
         if !layer.is_empty() {
             self.custom_layers.push(layer);
         }
@@ -971,18 +1024,51 @@ where
     where
         P: TierPatch,
     {
-        let layer = Layer::from_patch_with_trace(
+        let layer = Layer::from_patch_with_trace_and_shape(
             SourceTrace {
                 kind: SourceKind::Arguments,
                 name: "typed-clap".to_owned(),
                 location: None,
             },
             patch,
+            self.typed_arg_shape_value()?,
         )?;
         if !layer.is_empty() {
-            self.custom_layers.push(layer);
+            self.typed_arg_layers.push(layer);
         }
         Ok(self)
+    }
+
+    fn custom_patch_shape_value(&self) -> Result<Value, ConfigError> {
+        let mut shape = serde_json::to_value(&self.defaults)?;
+        ensure_root_object(&shape)?;
+        for layer in &self.custom_layers {
+            merge_values(
+                &mut shape,
+                layer.value.clone(),
+                "",
+                &self.metadata,
+                &layer.indexed_array_paths,
+                &layer.direct_array_paths,
+            );
+        }
+        Ok(shape)
+    }
+
+    #[cfg(feature = "clap")]
+    fn typed_arg_shape_value(&self) -> Result<Value, ConfigError> {
+        let mut shape = self.custom_patch_shape_value()?;
+        for layer in &self.typed_arg_layers {
+            merge_values(
+                &mut shape,
+                layer.value.clone(),
+                "",
+                &self.metadata,
+                &layer.indexed_array_paths,
+                &layer.direct_array_paths,
+            );
+        }
+        Ok(shape)
     }
 
     /// Marks a dot-delimited path as sensitive for report redaction.
@@ -1081,9 +1167,8 @@ where
     /// Loads configuration from all configured layers.
     pub fn load(self) -> Result<LoadedConfig<T>, ConfigError> {
         let unknown_field_policy = self.unknown_field_policy;
-        let metadata = self.metadata.clone();
-        let custom_env_decoders =
-            canonicalize_custom_env_decoders(&self.custom_env_decoders, &metadata)?;
+        let mut metadata = self.metadata.clone();
+        metadata.canonicalize_env_decoder_paths()?;
         let parsed_args = match self.args_source {
             Some(source) => Some(parse_args(source)?),
             None => None,
@@ -1119,10 +1204,19 @@ where
         }
 
         for env_source in self.env_sources {
-            let layer = env_source.into_layer(&metadata, &custom_env_decoders)?;
+            metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
+            let env_decoders = canonicalize_env_decoders(&self.env_decoders, &metadata, &layers)?;
+            let custom_env_decoders =
+                canonicalize_custom_env_decoders(&self.custom_env_decoders, &metadata, &layers)?;
+            let layer =
+                env_source.into_layer(&metadata, &env_decoders, &custom_env_decoders, &layers)?;
             if let Some(layer) = layer {
                 layers.push(canonicalize_layer_paths(layer, &metadata)?);
             }
+        }
+
+        for layer in self.typed_arg_layers {
+            layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
         if let Some(parsed) = parsed_args
@@ -1293,17 +1387,65 @@ where
 fn canonicalize_custom_env_decoders(
     decoders: &BTreeMap<String, CustomEnvDecoder>,
     metadata: &ConfigMetadata,
+    layers: &[Layer],
 ) -> Result<BTreeMap<String, CustomEnvDecoder>, ConfigError> {
     let aliases = metadata.alias_overrides()?;
-    Ok(decoders
-        .iter()
-        .map(|(path, decoder)| {
-            (
-                canonicalize_path_with_aliases(&normalize_path(path), &aliases),
-                Arc::clone(decoder),
-            )
-        })
-        .collect())
+    let mut canonicalized = BTreeMap::new();
+    let mut origins = BTreeMap::<String, String>::new();
+
+    for (path, decoder) in decoders {
+        let normalized = canonicalize_runtime_path_across_layers(&normalize_path(path), layers);
+        let canonical = canonicalize_path_with_aliases(&normalized, &aliases);
+        if let Some(first_path) = origins.get(&canonical)
+            && first_path != &normalized
+        {
+            return Err(ConfigError::MetadataConflict {
+                kind: "environment decoder",
+                name: canonical,
+                first_path: first_path.clone(),
+                second_path: normalized,
+            });
+        }
+
+        origins.insert(canonical.clone(), normalized);
+        canonicalized.insert(canonical, Arc::clone(decoder));
+    }
+
+    Ok(canonicalized)
+}
+
+fn canonicalize_env_decoders(
+    decoders: &BTreeMap<String, EnvDecoder>,
+    metadata: &ConfigMetadata,
+    layers: &[Layer],
+) -> Result<BTreeMap<String, EnvDecoder>, ConfigError> {
+    let aliases = metadata.alias_overrides()?;
+    let mut canonicalized = BTreeMap::new();
+    let mut origins = BTreeMap::<String, (String, EnvDecoder)>::new();
+
+    for (path, decoder) in decoders {
+        let normalized = canonicalize_runtime_path_across_layers(&normalize_path(path), layers);
+        let canonical = canonicalize_path_with_aliases(&normalized, &aliases);
+        if let Some((first_path, first_decoder)) = origins.get(&canonical)
+            && (first_path != &normalized || *first_decoder != *decoder)
+        {
+            return Err(ConfigError::MetadataConflict {
+                kind: "environment decoder",
+                name: canonical,
+                first_path: first_path.clone(),
+                second_path: normalized,
+            });
+        }
+
+        origins.insert(canonical.clone(), (normalized, *decoder));
+        canonicalized.insert(canonical, *decoder);
+    }
+
+    Ok(canonicalized)
+}
+
+fn normalize_decoder_registration_path(path: &str) -> String {
+    try_normalize_external_path(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 fn validate_indexed_array_paths(base: &Value, layer: &Layer) -> Result<(), ConfigError> {

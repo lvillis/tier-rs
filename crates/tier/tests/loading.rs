@@ -111,6 +111,16 @@ struct UserRecord {
     password: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct IndexedDecoderConfig {
+    users: Vec<IndexedDecoderUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct IndexedDecoderUser {
+    no_proxy: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct WildcardCheckConfig {
     users: Vec<WildcardCheckUser>,
@@ -904,6 +914,298 @@ fn env_decoders_handle_common_structured_operational_formats() {
 }
 
 #[test]
+fn env_decoders_reject_unrepresentable_nested_object_keys() {
+    let error = ConfigLoader::new(StructuredEnvConfig::default())
+        .env_decoder("labels", EnvDecoder::KeyValueMap)
+        .env(EnvSource::from_pairs([("APP__LABELS", "bad.key=1")]).prefix("APP"))
+        .load()
+        .expect_err("decoded env maps with reserved path syntax should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("labels"));
+    assert!(message.contains("bad.key"));
+    assert!(message.contains("unsupported object key"));
+}
+
+#[test]
+fn env_decoder_paths_are_canonicalized_through_alias_metadata() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("proxy.no_proxy").alias("proxy.legacy_no_proxy")
+    ]);
+
+    let loaded = ConfigLoader::new(ProxyCompatConfig::default())
+        .env_decoder("proxy.legacy_no_proxy", EnvDecoder::Csv)
+        .metadata(metadata)
+        .env(EnvSource::from_pairs([("APP__PROXY__NO_PROXY", "localhost,.internal")]).prefix("APP"))
+        .load()
+        .expect("alias-based env decoders should canonicalize to the target field");
+
+    assert_eq!(
+        loaded.proxy.no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn conflicting_env_decoder_paths_that_canonicalize_to_the_same_field_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("proxy.no_proxy").alias("proxy.legacy_no_proxy")
+    ]);
+
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .env_decoder("proxy.no_proxy", EnvDecoder::Csv)
+        .env_decoder("proxy.legacy_no_proxy", EnvDecoder::Whitespace)
+        .metadata(metadata)
+        .env(EnvSource::from_pairs([("APP__PROXY__NO_PROXY", "ignored")]).prefix("APP"))
+        .load()
+        .expect_err("conflicting canonical env decoders should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("environment decoder"));
+    assert!(message.contains("proxy.no_proxy"));
+    assert!(message.contains("proxy.legacy_no_proxy"));
+}
+
+#[test]
+fn env_decoder_paths_are_runtime_canonicalized_against_existing_array_layers() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder("users.00.no_proxy", EnvDecoder::Csv)
+    .env(EnvSource::from_pairs([("APP__USERS__0__NO_PROXY", "localhost,.internal")]).prefix("APP"))
+    .load()
+    .expect("indexed decoder paths should canonicalize against existing array values");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn env_decoder_paths_accept_external_bracket_syntax() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder("users[0].no_proxy", EnvDecoder::Csv)
+    .env(EnvSource::from_pairs([("APP__USERS__0__NO_PROXY", "localhost,.internal")]).prefix("APP"))
+    .load()
+    .expect("bracket-style env decoder paths should normalize to canonical array paths");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn env_decoder_paths_match_leading_zero_indices_from_env_variables() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder("users[0].no_proxy", EnvDecoder::Csv)
+    .env(EnvSource::from_pairs([("APP__USERS__00__NO_PROXY", "localhost,.internal")]).prefix("APP"))
+    .load()
+    .expect("leading-zero env indices should still match canonical env decoder paths");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn custom_env_decoder_paths_are_runtime_canonicalized_against_existing_array_layers() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder_with("users.00.no_proxy", |raw| {
+        Ok(Value::Array(
+            raw.split(';')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| Value::String(segment.to_owned()))
+                .collect(),
+        ))
+    })
+    .env(EnvSource::from_pairs([("APP__USERS__0__NO_PROXY", "localhost;.internal")]).prefix("APP"))
+    .load()
+    .expect("indexed custom decoder paths should canonicalize against existing array values");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn custom_env_decoder_paths_accept_external_bracket_syntax() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder_with("users[0].no_proxy", |raw| {
+        Ok(Value::Array(
+            raw.split(';')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| Value::String(segment.to_owned()))
+                .collect(),
+        ))
+    })
+    .env(EnvSource::from_pairs([("APP__USERS__0__NO_PROXY", "localhost;.internal")]).prefix("APP"))
+    .load()
+    .expect("bracket-style custom env decoder paths should normalize to canonical array paths");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn custom_env_decoder_paths_match_leading_zero_indices_from_env_variables() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder_with("users[0].no_proxy", |raw| {
+        Ok(Value::Array(
+            raw.split(';')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| Value::String(segment.to_owned()))
+                .collect(),
+        ))
+    })
+    .env(EnvSource::from_pairs([("APP__USERS__00__NO_PROXY", "localhost;.internal")]).prefix("APP"))
+    .load()
+    .expect("leading-zero env indices should still match canonical custom env decoder paths");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn explicit_env_binding_paths_are_runtime_canonicalized_before_decoder_lookup() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder("users[0].no_proxy", EnvDecoder::Csv)
+    .env(
+        EnvSource::from_pairs([("NO_PROXY", "localhost,.internal")])
+            .with_alias("NO_PROXY", "users.00.no_proxy"),
+    )
+    .load()
+    .expect("explicit env bindings should canonicalize array indices before decoder lookup");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn env_decoder_paths_are_runtime_canonicalized_across_multiple_env_sources() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig::default())
+        .env_decoder("users.00.no_proxy", EnvDecoder::Csv)
+        .env(
+            EnvSource::from_pairs([(
+                "BASE__USERS",
+                r#"[{"no_proxy":[]}]"#,
+            )])
+            .prefix("BASE"),
+        )
+        .env(
+            EnvSource::from_pairs([("PATCH__USERS__0__NO_PROXY", "localhost,.internal")])
+                .prefix("PATCH"),
+        )
+        .load()
+        .expect("decoder paths should canonicalize against array shapes introduced by earlier env sources");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn custom_env_decoder_paths_are_runtime_canonicalized_across_multiple_env_sources() {
+    let loaded = ConfigLoader::new(IndexedDecoderConfig::default())
+        .env_decoder_with("users.00.no_proxy", |raw| {
+            Ok(Value::Array(
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| Value::String(segment.to_owned()))
+                    .collect(),
+            ))
+        })
+        .env(
+            EnvSource::from_pairs([(
+                "BASE__USERS",
+                r#"[{"no_proxy":[]}]"#,
+            )])
+            .prefix("BASE"),
+        )
+        .env(
+            EnvSource::from_pairs([("PATCH__USERS__0__NO_PROXY", "localhost;.internal")])
+                .prefix("PATCH"),
+        )
+        .load()
+        .expect("custom decoder paths should canonicalize against array shapes introduced by earlier env sources");
+
+    assert_eq!(
+        loaded.users[0].no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn explicit_alias_decoders_take_precedence_over_path_level_custom_env_decoders() {
+    let loaded = ConfigLoader::new(ProxyCompatConfig::default())
+        .env_decoder_with("proxy.no_proxy", |raw| {
+            Ok(Value::Array(vec![Value::String(raw.to_owned())]))
+        })
+        .env(
+            EnvSource::from_pairs([("NO_PROXY", "localhost,.internal")]).with_alias_decoder(
+                "NO_PROXY",
+                "proxy.no_proxy",
+                EnvDecoder::Csv,
+            ),
+        )
+        .load()
+        .expect("explicit alias decoder should override path-level custom decoder");
+
+    assert_eq!(
+        loaded.proxy.no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
+fn explicit_fallback_decoders_take_precedence_over_path_level_custom_env_decoders() {
+    let loaded = ConfigLoader::new(ProxyCompatConfig::default())
+        .env_decoder_with("proxy.no_proxy", |raw| {
+            Ok(Value::Array(vec![Value::String(raw.to_owned())]))
+        })
+        .env(
+            EnvSource::from_pairs([("NO_PROXY", "localhost,.internal")]).with_fallback_decoder(
+                "NO_PROXY",
+                "proxy.no_proxy",
+                EnvDecoder::Csv,
+            ),
+        )
+        .load()
+        .expect("explicit fallback decoder should override path-level custom decoder");
+
+    assert_eq!(
+        loaded.proxy.no_proxy,
+        vec!["localhost".to_owned(), ".internal".to_owned()]
+    );
+}
+
+#[test]
 fn env_aliases_and_fallbacks_support_standard_operational_variables() {
     let env = EnvSource::from_pairs([
         ("HTTP_PROXY", "http://fallback-proxy:8080"),
@@ -931,6 +1233,161 @@ fn env_aliases_and_fallbacks_support_standard_operational_variables() {
 }
 
 #[test]
+fn env_fallbacks_do_not_reapply_when_alias_bindings_already_target_the_same_field() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new("proxy.url").alias("proxy.legacy_url")]);
+    let env = EnvSource::from_pairs([
+        ("APP_PROXY_URL", "http://alias-proxy:8080"),
+        ("HTTP_PROXY", "http://fallback-proxy:9090"),
+    ])
+    .with_alias("APP_PROXY_URL", "proxy.legacy_url")
+    .with_fallback("HTTP_PROXY", "proxy.url");
+
+    let loaded = ConfigLoader::new(ProxyCompatConfig::default())
+        .metadata(metadata)
+        .env(env)
+        .load()
+        .expect("alias-bound values should suppress same-path fallbacks");
+
+    assert_eq!(loaded.proxy.url.as_deref(), Some("http://alias-proxy:8080"));
+    assert_eq!(
+        loaded
+            .report()
+            .explain("proxy.url")
+            .and_then(|explanation| explanation
+                .steps
+                .last()
+                .map(|step| step.source.name.clone())),
+        Some("APP_PROXY_URL".to_owned())
+    );
+}
+
+#[test]
+fn conflicting_explicit_env_bindings_are_rejected() {
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .env(
+            EnvSource::from_pairs([("HTTP_PROXY", "http://proxy:8080")])
+                .with_alias("HTTP_PROXY", "proxy.url")
+                .with_fallback("HTTP_PROXY", "proxy.no_proxy"),
+        )
+        .load()
+        .expect_err("conflicting env bindings should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("HTTP_PROXY"));
+    assert!(message.contains("conflicting explicit env bindings"));
+    assert!(message.contains("proxy.url"));
+    assert!(message.contains("proxy.no_proxy"));
+}
+
+#[test]
+fn conflicting_explicit_and_metadata_env_bindings_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new("proxy.url").env("HTTP_PROXY")]);
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .metadata(metadata)
+        .env(
+            EnvSource::from_pairs([("HTTP_PROXY", "localhost,.internal")]).with_alias_decoder(
+                "HTTP_PROXY",
+                "proxy.no_proxy",
+                EnvDecoder::Csv,
+            ),
+        )
+        .load()
+        .expect_err("explicit env bindings must not silently override metadata env bindings");
+
+    let message = error.to_string();
+    assert!(message.contains("HTTP_PROXY"));
+    assert!(message.contains("proxy.url"));
+    assert!(message.contains("proxy.no_proxy"));
+    assert!(message.contains("conflicting environment bindings"));
+}
+
+#[test]
+fn explicit_and_metadata_env_bindings_can_share_the_same_canonical_field() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new("proxy.url")
+        .env("HTTP_PROXY")
+        .alias("proxy.legacy_url")]);
+    let loaded = ConfigLoader::new(ProxyCompatConfig::default())
+        .metadata(metadata)
+        .env(
+            EnvSource::from_pairs([("HTTP_PROXY", "http://compat-proxy:8080")])
+                .with_alias("HTTP_PROXY", "proxy.legacy_url"),
+        )
+        .load()
+        .expect("equivalent metadata and explicit env bindings should be allowed");
+
+    assert_eq!(
+        loaded.proxy.url.as_deref(),
+        Some("http://compat-proxy:8080")
+    );
+}
+
+#[test]
+fn conflicting_explicit_env_variables_for_the_same_canonical_path_are_rejected() {
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .env(
+            EnvSource::from_pairs([
+                ("APP__PROXY__URL", "http://app-proxy:8080"),
+                ("HTTP_PROXY", "http://compat-proxy:9090"),
+            ])
+            .prefix("APP")
+            .with_alias("HTTP_PROXY", "proxy.url"),
+        )
+        .load()
+        .expect_err("different env vars targeting the same canonical path should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("APP__PROXY__URL"));
+    assert!(message.contains("HTTP_PROXY"));
+    assert!(message.contains("proxy.url"));
+}
+
+#[test]
+fn conflicting_alias_based_env_variables_for_the_same_canonical_path_are_rejected() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new("proxy.url").alias("proxy.legacy_url")]);
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .metadata(metadata)
+        .env(
+            EnvSource::from_pairs([
+                ("APP_PROXY_URL", "http://app-proxy:8080"),
+                ("HTTP_PROXY", "http://compat-proxy:9090"),
+            ])
+            .with_alias("APP_PROXY_URL", "proxy.legacy_url")
+            .with_alias("HTTP_PROXY", "proxy.url"),
+        )
+        .load()
+        .expect_err("alias and canonical env vars targeting the same field should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("APP_PROXY_URL"));
+    assert!(message.contains("HTTP_PROXY"));
+    assert!(message.contains("proxy.url"));
+}
+
+#[test]
+fn conflicting_env_variables_with_overlapping_paths_are_rejected() {
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .env(
+            EnvSource::from_pairs([
+                ("APP__PROXY", r#"{"url":"http://parent-proxy:8080"}"#),
+                ("HTTP_PROXY", "http://child-proxy:9090"),
+            ])
+            .prefix("APP")
+            .with_alias("HTTP_PROXY", "proxy.url"),
+        )
+        .load()
+        .expect_err("parent and child env paths in the same source should not be order-dependent");
+
+    let message = error.to_string();
+    assert!(message.contains("APP__PROXY"));
+    assert!(message.contains("HTTP_PROXY"));
+    assert!(message.contains("proxy"));
+    assert!(message.contains("proxy.url"));
+    assert!(message.contains("overlapping configuration paths"));
+}
+
+#[test]
 fn custom_env_decoders_can_handle_application_specific_formats() {
     let loaded = ConfigLoader::new(StructuredEnvConfig::default())
         .env_decoder_with("no_proxy", |raw| {
@@ -948,6 +1405,61 @@ fn custom_env_decoders_can_handle_application_specific_formats() {
 
     assert_eq!(
         loaded.no_proxy,
+        vec!["localhost".to_owned(), ".svc.internal".to_owned()]
+    );
+}
+
+#[test]
+fn conflicting_custom_env_decoders_that_canonicalize_to_the_same_field_are_rejected() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new("proxy.url").alias("proxy.legacy_url")]);
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .metadata(metadata)
+        .env_decoder_with("proxy.url", |_| Ok(Value::String("canonical".to_owned())))
+        .env_decoder_with("proxy.legacy_url", |_| {
+            Ok(Value::String("alias".to_owned()))
+        })
+        .env(EnvSource::from_pairs([("APP__PROXY__URL", "ignored")]).prefix("APP"))
+        .load()
+        .expect_err("conflicting custom env decoders should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("environment decoder"));
+    assert!(message.contains("proxy.url"));
+    assert!(message.contains("proxy.legacy_url"));
+}
+
+#[test]
+fn custom_env_decoders_support_wildcard_paths_for_dynamic_entries() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct DynamicProxyConfig {
+        services: BTreeMap<String, DynamicProxyEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct DynamicProxyEntry {
+        no_proxy: Vec<String>,
+    }
+
+    let loaded = ConfigLoader::new(DynamicProxyConfig::default())
+        .env_decoder_with("services.*.no_proxy", |raw| {
+            Ok(Value::Array(
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| Value::String(segment.to_owned()))
+                    .collect(),
+            ))
+        })
+        .env(
+            EnvSource::from_pairs([("APP__SERVICES__api__NO_PROXY", "localhost;.svc.internal")])
+                .prefix("APP"),
+        )
+        .load()
+        .expect("wildcard custom env decoders should apply to dynamic entries");
+
+    assert_eq!(
+        loaded.services["api"].no_proxy,
         vec!["localhost".to_owned(), ".svc.internal".to_owned()]
     );
 }

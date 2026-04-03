@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::ConfigError;
-use crate::report::{normalize_path, path_matches_pattern};
+use crate::report::{canonicalize_path_with_aliases, normalize_path, path_matches_pattern};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Structured metadata describing configuration fields.
@@ -373,6 +373,49 @@ impl ConfigMetadata {
         best.map(|(_, merge)| merge)
     }
 
+    pub(crate) fn canonicalize_env_decoder_paths(&mut self) -> Result<(), ConfigError> {
+        let alias_source_fields = self
+            .fields
+            .iter()
+            .filter(|field| !field.is_env_decoder_only())
+            .cloned()
+            .collect::<Vec<_>>();
+        let aliases = ConfigMetadata {
+            fields: alias_source_fields,
+            checks: Vec::new(),
+        }
+        .alias_overrides()?;
+
+        let mut seen = BTreeMap::<String, (String, EnvDecoder)>::new();
+        for field in &mut self.fields {
+            if !field.is_env_decoder_only() {
+                continue;
+            }
+
+            let original_path = field.path.clone();
+            let canonical = canonicalize_path_with_aliases(&original_path, &aliases);
+            let decoder = field
+                .env_decode
+                .expect("decoder-only fields must have a decoder");
+            if let Some((first_path, first_decoder)) = seen.get(&canonical)
+                && (first_path != &original_path || *first_decoder != decoder)
+            {
+                return Err(ConfigError::MetadataConflict {
+                    kind: "environment decoder",
+                    name: canonical,
+                    first_path: first_path.clone(),
+                    second_path: original_path,
+                });
+            }
+
+            seen.insert(canonical.clone(), (original_path, decoder));
+            field.path = canonical;
+        }
+
+        self.normalize();
+        Ok(())
+    }
+
     fn normalize(&mut self) {
         let mut merged = BTreeMap::<String, FieldMetadata>::new();
         for mut field in self.fields.drain(..) {
@@ -611,6 +654,19 @@ impl FieldMetadata {
                 self.validations.push(rule);
             }
         }
+    }
+
+    fn is_env_decoder_only(&self) -> bool {
+        self.env_decode.is_some()
+            && self.aliases.is_empty()
+            && !self.secret
+            && self.env.is_none()
+            && self.doc.is_none()
+            && self.example.is_none()
+            && self.deprecated.is_none()
+            && !self.has_default
+            && self.merge == MergeStrategy::Merge
+            && self.validations.is_empty()
     }
 }
 

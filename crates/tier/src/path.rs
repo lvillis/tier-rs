@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher;
+use std::sync::Arc;
 
 /// Hidden helper trait used by [`path_pattern!`](macro@crate::path_pattern).
 #[doc(hidden)]
@@ -10,6 +11,27 @@ pub trait PathPatternItem {
 
 impl<T> PathPatternItem for Vec<T> {
     type Item = T;
+}
+
+impl<C> PathPatternItem for Option<C>
+where
+    C: PathPatternItem,
+{
+    type Item = C::Item;
+}
+
+impl<C> PathPatternItem for Box<C>
+where
+    C: PathPatternItem,
+{
+    type Item = C::Item;
+}
+
+impl<C> PathPatternItem for Arc<C>
+where
+    C: PathPatternItem,
+{
+    type Item = C::Item;
 }
 
 impl<T, const N: usize> PathPatternItem for [T; N] {
@@ -52,7 +74,11 @@ where
 #[doc(hidden)]
 #[must_use]
 pub fn normalize_macro_path(path: &str) -> String {
-    path.chars().filter(|ch| !ch.is_whitespace()).collect()
+    path.split('.')
+        .map(str::trim)
+        .map(|segment| segment.strip_prefix("r#").unwrap_or(segment))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Builds a compile-time checked dot path from a config type.
