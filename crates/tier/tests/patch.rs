@@ -190,11 +190,13 @@ struct NumericObjectKeyPatch {
     password: Option<String>,
 }
 
+#[cfg(feature = "clap")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DeferredArrayShapeConfig {
     users: serde_json::Value,
 }
 
+#[cfg(feature = "clap")]
 impl Default for DeferredArrayShapeConfig {
     fn default() -> Self {
         Self {
@@ -203,11 +205,13 @@ impl Default for DeferredArrayShapeConfig {
     }
 }
 
+#[cfg(feature = "clap")]
 #[derive(Debug, Clone, TierPatch, Default)]
 struct DeferredArrayShapePatch {
     users: Patch<serde_json::Value>,
 }
 
+#[cfg(feature = "clap")]
 #[derive(Debug, Clone, TierPatch, Default)]
 struct DeferredArrayItemPatch {
     #[tier(path = "users.0.token")]
@@ -438,6 +442,7 @@ fn typed_patches_preserve_numeric_object_keys_when_prior_layers_define_object_sh
     );
 }
 
+#[cfg(feature = "clap")]
 #[test]
 fn typed_clap_overrides_preserve_array_shape_from_prior_typed_clap_layers() {
     let loaded = ConfigLoader::new(DeferredArrayShapeConfig::default())

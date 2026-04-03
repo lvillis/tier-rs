@@ -6,13 +6,16 @@ ci:
   cargo check --workspace
   cargo check --workspace --no-default-features
   cargo check --workspace --no-default-features --features clap
+  cargo check --workspace --no-default-features --features derive
   cargo check --workspace --no-default-features --features json
   cargo check --workspace --no-default-features --features schema
   cargo check --workspace --no-default-features --features watch
+  cargo check --workspace --no-default-features --features yaml
   cargo nextest run --workspace --all-features
   cargo nextest run --workspace
   cargo nextest run --workspace --no-default-features --no-tests pass
   cargo nextest run --workspace --no-default-features --features clap
+  cargo nextest run --workspace --no-default-features --features derive
   cargo nextest run --workspace --no-default-features --features schema
   cargo clippy --workspace --all-targets --all-features -- -D warnings
   cargo test --workspace --doc --all-features
