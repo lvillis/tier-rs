@@ -848,8 +848,7 @@ where
     #[must_use]
     pub fn env_decoder(mut self, path: impl Into<String>, decoder: EnvDecoder) -> Self {
         let path = path.into();
-        self.env_decoders
-            .insert(normalize_decoder_registration_path(&path), decoder);
+        self.env_decoders.insert(path, decoder);
         self
     }
 
@@ -894,10 +893,7 @@ where
         F: Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
     {
         let path = path.into();
-        self.custom_env_decoders.insert(
-            normalize_decoder_registration_path(&path),
-            Arc::new(decoder),
-        );
+        self.custom_env_decoders.insert(path, Arc::new(decoder));
         self
     }
 
@@ -1030,8 +1026,8 @@ where
     /// Marks a dot-delimited path as sensitive for report redaction.
     #[must_use]
     pub fn secret_path(mut self, path: impl Into<String>) -> Self {
-        let path = normalize_path(&path.into());
-        if !path.is_empty() {
+        let path = path.into();
+        if !path.is_empty() && path != "." {
             self.secret_paths.insert(path);
         }
         self
@@ -1125,6 +1121,7 @@ where
         let unknown_field_policy = self.unknown_field_policy;
         let mut metadata = self.metadata.clone();
         metadata.canonicalize_env_decoder_paths()?;
+        metadata.validate_paths()?;
         let parsed_args = match self.args_source {
             Some(source) => Some(parse_args(source)?),
             None => None,
@@ -1180,6 +1177,12 @@ where
             }
         }
 
+        if let Some(parsed) = parsed_args
+            && let Some(layer) = parsed.layer
+        {
+            layers.push(canonicalize_layer_paths(layer, &metadata)?);
+        }
+
         for patch in self.typed_arg_layers {
             metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
             let layer = patch.into_layer_with_shape(merged_shape_from_layers(
@@ -1190,15 +1193,12 @@ where
             layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
-        if let Some(parsed) = parsed_args
-            && let Some(layer) = parsed.layer
-        {
-            layers.push(canonicalize_layer_paths(layer, &metadata)?);
-        }
-
         let mut metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
         let mut alias_overrides = metadata.alias_overrides()?;
-        let pending_secret_paths = canonicalize_secret_paths(&self.secret_paths, &alias_overrides);
+        let pending_secret_paths = canonicalize_secret_paths(
+            &normalize_secret_registration_paths(&self.secret_paths)?,
+            &alias_overrides,
+        );
         let mut secret_paths = canonicalize_secret_paths_against_layers(
             &pending_secret_paths,
             &layers,
@@ -1365,7 +1365,10 @@ fn canonicalize_custom_env_decoders(
     let mut origins = BTreeMap::<String, String>::new();
 
     for (path, decoder) in decoders {
-        let normalized = canonicalize_runtime_path_across_layers(&normalize_path(path), layers);
+        let normalized = canonicalize_runtime_path_across_layers(
+            &normalize_decoder_registration_path(path)?,
+            layers,
+        );
         let canonical = canonicalize_path_with_aliases(&normalized, &aliases);
         if let Some(first_path) = origins.get(&canonical)
             && first_path != &normalized
@@ -1395,7 +1398,10 @@ fn canonicalize_env_decoders(
     let mut origins = BTreeMap::<String, (String, EnvDecoder)>::new();
 
     for (path, decoder) in decoders {
-        let normalized = canonicalize_runtime_path_across_layers(&normalize_path(path), layers);
+        let normalized = canonicalize_runtime_path_across_layers(
+            &normalize_decoder_registration_path(path)?,
+            layers,
+        );
         let canonical = canonicalize_path_with_aliases(&normalized, &aliases);
         if let Some((first_path, first_decoder)) = origins.get(&canonical)
             && (first_path != &normalized || *first_decoder != *decoder)
@@ -1415,8 +1421,43 @@ fn canonicalize_env_decoders(
     Ok(canonicalized)
 }
 
-fn normalize_decoder_registration_path(path: &str) -> String {
-    try_normalize_external_path(path).unwrap_or_else(|_| normalize_path(path))
+fn normalize_decoder_registration_path(path: &str) -> Result<String, ConfigError> {
+    let normalized =
+        try_normalize_external_path(path).map_err(|message| ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: format!("invalid environment decoder path: {message}"),
+        })?;
+    if normalized.is_empty() {
+        return Err(ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: "invalid environment decoder path: configuration path cannot be empty"
+                .to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_secret_registration_paths(
+    secret_paths: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, ConfigError> {
+    secret_paths
+        .iter()
+        .map(|path| {
+            let normalized = try_normalize_external_path(path).map_err(|message| {
+                ConfigError::MetadataInvalid {
+                    path: path.clone(),
+                    message: format!("invalid secret path: {message}"),
+                }
+            })?;
+            if normalized.is_empty() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: path.clone(),
+                    message: "invalid secret path: configuration path cannot be empty".to_owned(),
+                });
+            }
+            Ok(normalized)
+        })
+        .collect()
 }
 
 fn validate_indexed_array_paths(base: &Value, layer: &Layer) -> Result<(), ConfigError> {
@@ -2520,14 +2561,15 @@ fn is_valid_url_scheme(scheme: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
 }
 
-fn is_valid_hierarchical_url(_scheme: &str, authority_and_tail: &str) -> bool {
+fn is_valid_hierarchical_url(scheme: &str, authority_and_tail: &str) -> bool {
     let split_at = authority_and_tail
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_tail.len());
     let (authority, tail) = authority_and_tail.split_at(split_at);
 
     if authority.is_empty() {
-        return !tail.is_empty()
+        return matches!(scheme, "file" | "unix")
+            && !tail.is_empty()
             && tail
                 .chars()
                 .all(|ch| !ch.is_whitespace() && !ch.is_control());
@@ -2614,7 +2656,7 @@ fn is_valid_email(value: &str) -> bool {
         return ip_literal.parse::<IpAddr>().is_ok();
     }
 
-    domain.parse::<IpAddr>().is_ok() || is_valid_hostname(domain)
+    domain.parse::<std::net::Ipv4Addr>().is_err() && is_valid_hostname(domain)
 }
 
 fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
@@ -2628,6 +2670,7 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
     let mut indexed_array_base_lengths = BTreeMap::new();
     let mut current_array_lengths = BTreeMap::new();
     let mut direct_array_paths = BTreeSet::new();
+    let mut claimed_paths = BTreeMap::<String, String>::new();
 
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--config=") {
@@ -2694,7 +2737,15 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
                 arg: format!("--set {path}={raw_value}"),
                 message,
             })?;
+        let arg_trace_name = format!("--set {raw_path}={raw_value}");
         let is_direct_array = parsed.value.is_array();
+        claim_arg_path(
+            &arg_trace_name,
+            &path,
+            is_direct_array,
+            &direct_array_paths,
+            &mut claimed_paths,
+        )?;
         record_indexed_array_state(
             &mut current_array_lengths,
             &mut indexed_array_base_lengths,
@@ -2727,7 +2778,6 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
             direct_array_paths.insert(path.clone());
         }
 
-        let arg_trace_name = format!("--set {raw_path}={raw_value}");
         entries.insert(
             path.clone(),
             SourceTrace::new(SourceKind::Arguments, arg_trace_name.clone()),
@@ -2767,6 +2817,85 @@ fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
         files,
         layer,
     })
+}
+
+fn claim_arg_path(
+    arg: &str,
+    path: &str,
+    is_direct_array: bool,
+    direct_array_paths: &BTreeSet<String>,
+    claimed_paths: &mut BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (existing_path, existing_arg) in claimed_paths.iter() {
+        if existing_path == path {
+            return Err(ConfigError::InvalidArg {
+                arg: arg.to_owned(),
+                message: format!(
+                    "conflicting CLI overrides `{existing_arg}` and `{arg}` both target `{path}`"
+                ),
+            });
+        }
+
+        if existing_path
+            .strip_prefix(path)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+            || path
+                .strip_prefix(existing_path)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        {
+            if direct_array_overlap_allowed(
+                existing_path,
+                path,
+                is_direct_array,
+                direct_array_paths,
+            ) {
+                continue;
+            }
+            return Err(ConfigError::InvalidArg {
+                arg: arg.to_owned(),
+                message: format!(
+                    "conflicting CLI overrides `{existing_arg}` and `{arg}` target overlapping configuration paths `{existing_path}` and `{path}`"
+                ),
+            });
+        }
+    }
+
+    claimed_paths.insert(path.to_owned(), arg.to_owned());
+    Ok(())
+}
+
+fn direct_array_overlap_allowed(
+    existing_path: &str,
+    new_path: &str,
+    new_is_direct_array: bool,
+    direct_array_paths: &BTreeSet<String>,
+) -> bool {
+    direct_array_prefix_allows(
+        existing_path,
+        new_path,
+        direct_array_paths.contains(existing_path),
+    ) || direct_array_prefix_allows(new_path, existing_path, new_is_direct_array)
+}
+
+fn direct_array_prefix_allows(prefix: &str, other: &str, is_direct_array: bool) -> bool {
+    if !is_direct_array {
+        return false;
+    }
+    let remainder = if prefix.is_empty() {
+        other
+    } else {
+        let Some(remainder) = other.strip_prefix(prefix) else {
+            return false;
+        };
+        let Some(remainder) = remainder.strip_prefix('.') else {
+            return false;
+        };
+        remainder
+    };
+    remainder
+        .split('.')
+        .next()
+        .is_some_and(|segment| segment.parse::<usize>().is_ok())
 }
 
 fn load_file_layer(file: FileSource, profile: Option<&str>) -> Result<Option<Layer>, ConfigError> {

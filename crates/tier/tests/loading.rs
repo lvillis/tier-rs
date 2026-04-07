@@ -443,6 +443,156 @@ fn manual_secret_paths_are_canonicalized_through_alias_metadata() {
 }
 
 #[test]
+fn manual_secret_paths_accept_external_bracket_syntax() {
+    let loaded = ConfigLoader::new(UserArrayConfig::default())
+        .secret_path("users[0].password")
+        .load()
+        .expect("config loads");
+
+    let rendered = loaded.report().redacted_pretty_json();
+    assert!(rendered.contains("***redacted***"));
+    assert!(!rendered.contains("default-a"));
+
+    let explanation = loaded
+        .report()
+        .explain("users[0].password")
+        .expect("bracket path explanation");
+    assert_eq!(explanation.path, "users.0.password");
+    assert!(explanation.redacted);
+}
+
+#[test]
+fn field_metadata_paths_accept_external_bracket_syntax() {
+    let loaded = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(ConfigMetadata::from_fields([FieldMetadata::new(
+            "users[0].password",
+        )
+        .secret()]))
+        .load()
+        .expect("config loads");
+
+    let explanation = loaded
+        .report()
+        .explain("users[0].password")
+        .expect("bracket metadata explanation");
+    assert_eq!(explanation.path, "users.0.password");
+    assert!(explanation.redacted);
+}
+
+#[test]
+fn malformed_manual_secret_paths_are_rejected() {
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .secret_path("users[foo].password")
+        .load()
+        .expect_err("malformed secret paths should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("invalid secret path"));
+    assert!(message.contains("users[foo].password"));
+}
+
+#[test]
+fn secret_paths_with_leading_or_trailing_dots_are_rejected() {
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .secret_path(".users[0].password")
+        .secret_path("users[0].password.")
+        .load()
+        .expect_err("leading and trailing dots in secret paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".users[0].password");
+    assert!(message.contains("invalid secret path"));
+}
+
+#[test]
+fn malformed_manual_metadata_paths_are_rejected() {
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(ConfigMetadata::from_fields([FieldMetadata::new(
+            "users[foo].password",
+        )
+        .secret()]))
+        .load()
+        .expect_err("malformed metadata paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, "users[foo].password");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
+fn metadata_paths_with_leading_or_trailing_dots_are_rejected() {
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new(".users[0].password").secret(),
+            FieldMetadata::new("users[0].name.").doc("bad trailing dot"),
+        ]))
+        .load()
+        .expect_err("leading and trailing dots in metadata paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".users[0].password");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
+fn cross_field_checks_with_leading_or_trailing_dots_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new("users.*.password").secret()])
+        .required_if(".users[0].enabled", true, ["users[0].password"])
+        .required_with("users[0].enabled.", ["users[0].password"]);
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("malformed cross-field check paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".users[0].enabled");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
+fn root_paths_in_cross_field_checks_are_rejected() {
+    let metadata = ConfigMetadata::default()
+        .at_least_one_of(["."])
+        .required_with("users[0].enabled", ["."]);
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root paths in cross-field checks should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert!(path.is_empty());
+    assert!(message.contains("cross-field checks cannot use the root path"));
+}
+
+#[test]
+fn root_trigger_paths_in_cross_field_checks_are_rejected() {
+    let metadata = ConfigMetadata::default().required_if(".", true, ["users[0].password"]);
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root trigger paths in cross-field checks should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert!(path.is_empty());
+    assert!(message.contains("cross-field checks cannot use the root path"));
+}
+
+#[test]
 fn empty_manual_secret_paths_are_ignored() {
     let loaded = ConfigLoader::new(AppConfig::default())
         .secret_path("")
@@ -999,6 +1149,21 @@ fn env_decoder_paths_accept_external_bracket_syntax() {
 }
 
 #[test]
+fn malformed_builtin_env_decoder_paths_are_rejected() {
+    let error = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder("users[foo].no_proxy", EnvDecoder::Csv)
+    .env(EnvSource::from_pairs([("APP__USERS__0__NO_PROXY", "localhost,.internal")]).prefix("APP"))
+    .load()
+    .expect_err("malformed decoder registration paths should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("invalid environment decoder path"));
+    assert!(message.contains("users[foo].no_proxy"));
+}
+
+#[test]
 fn env_decoder_paths_match_leading_zero_indices_from_env_variables() {
     let loaded = ConfigLoader::new(IndexedDecoderConfig {
         users: vec![IndexedDecoderUser::default()],
@@ -1012,6 +1177,29 @@ fn env_decoder_paths_match_leading_zero_indices_from_env_variables() {
         loaded.users[0].no_proxy,
         vec!["localhost".to_owned(), ".internal".to_owned()]
     );
+}
+
+#[test]
+fn malformed_custom_env_decoder_paths_are_rejected() {
+    let error = ConfigLoader::new(IndexedDecoderConfig {
+        users: vec![IndexedDecoderUser::default()],
+    })
+    .env_decoder_with("users[foo].no_proxy", |raw| {
+        Ok(Value::Array(
+            raw.split(';')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| Value::String(segment.to_owned()))
+                .collect(),
+        ))
+    })
+    .env(EnvSource::from_pairs([("APP__USERS__0__NO_PROXY", "localhost;.internal")]).prefix("APP"))
+    .load()
+    .expect_err("malformed custom decoder registration paths should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("invalid environment decoder path"));
+    assert!(message.contains("users[foo].no_proxy"));
 }
 
 #[test]
@@ -1410,6 +1598,22 @@ fn custom_env_decoders_can_handle_application_specific_formats() {
 }
 
 #[test]
+fn invalid_explicit_env_binding_paths_are_rejected_even_when_unset() {
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .env(
+            EnvSource::from_pairs([("UNRELATED", "1")])
+                .with_alias("HTTP_PROXY", ".")
+                .with_fallback("NO_PROXY", ""),
+        )
+        .load()
+        .expect_err("invalid explicit env binding paths should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("HTTP_PROXY"));
+    assert!(message.contains("environment binding path cannot be empty"));
+}
+
+#[test]
 fn conflicting_custom_env_decoders_that_canonicalize_to_the_same_field_are_rejected() {
     let metadata =
         ConfigMetadata::from_fields([FieldMetadata::new("proxy.url").alias("proxy.legacy_url")]);
@@ -1710,6 +1914,43 @@ fn args_accept_bracket_array_paths() {
     assert!(explanation.steps.iter().any(|step| {
         step.source.to_string() == r#"cli(--set users[0].password="rotated-secret")"#
     }));
+}
+
+#[test]
+fn conflicting_duplicate_cli_override_paths_are_rejected() {
+    let error = ConfigLoader::new(AppConfig::default())
+        .args(ArgsSource::from_args([
+            "app",
+            "--set",
+            "server.port=7000",
+            "--set",
+            "server.port=8000",
+        ]))
+        .load()
+        .expect_err("duplicate --set paths should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("conflicting CLI overrides"));
+    assert!(message.contains("server.port"));
+}
+
+#[test]
+fn conflicting_overlapping_cli_override_paths_are_rejected() {
+    let error = ConfigLoader::new(AppConfig::default())
+        .args(ArgsSource::from_args([
+            "app",
+            "--set",
+            "server.port=7000",
+            "--set",
+            "server={\"host\":\"0.0.0.0\",\"port\":9000}",
+        ]))
+        .load()
+        .expect_err("overlapping --set paths should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("conflicting CLI overrides"));
+    assert!(message.contains("server.port"));
+    assert!(message.contains("server"));
 }
 
 #[test]
@@ -2343,6 +2584,84 @@ fn url_validation_accepts_common_absolute_url_forms_without_external_parser() {
 }
 
 #[test]
+fn url_validation_rejects_hierarchical_urls_without_authority() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct UrlValidationConfig {
+        service_url: String,
+    }
+
+    impl Default for UrlValidationConfig {
+        fn default() -> Self {
+            Self {
+                service_url: "http:///missing-host".to_owned(),
+            }
+        }
+    }
+
+    let error = ConfigLoader::new(UrlValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([FieldMetadata::new(
+            "service_url",
+        )
+        .url()]))
+        .load()
+        .expect_err("hierarchical URLs without authority should fail");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+    let error = errors.iter().next().expect("url validation error");
+    assert_eq!(error.path, "service_url");
+    assert_eq!(error.rule.as_deref(), Some("url"));
+}
+
+#[test]
+fn email_validation_accepts_bracketed_ip_literals_and_rejects_bare_ip_domains() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct EmailValidationConfig {
+        bracketed_ipv4_email: String,
+        bracketed_ipv6_email: String,
+        bare_ipv4_email: String,
+        bare_ipv6_email: String,
+    }
+
+    impl Default for EmailValidationConfig {
+        fn default() -> Self {
+            Self {
+                bracketed_ipv4_email: "ops@[127.0.0.1]".to_owned(),
+                bracketed_ipv6_email: "ops@[2001:db8::1]".to_owned(),
+                bare_ipv4_email: "ops@127.0.0.1".to_owned(),
+                bare_ipv6_email: "ops@2001:db8::1".to_owned(),
+            }
+        }
+    }
+
+    let error = ConfigLoader::new(EmailValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("bracketed_ipv4_email").email(),
+            FieldMetadata::new("bracketed_ipv6_email").email(),
+            FieldMetadata::new("bare_ipv4_email").email(),
+            FieldMetadata::new("bare_ipv6_email").email(),
+        ]))
+        .load()
+        .expect_err("bare IP email domains should fail validation");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.path == "bare_ipv4_email" && error.rule.as_deref() == Some("email"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.path == "bare_ipv6_email" && error.rule.as_deref() == Some("email"))
+    );
+}
+
+#[test]
 fn declared_validation_supports_cross_field_checks_and_extended_rules() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct AdvancedValidationConfig {
@@ -2606,6 +2925,34 @@ fn wildcard_required_if_binds_to_the_matching_collection_item() {
 }
 
 #[test]
+fn manual_required_if_checks_accept_external_bracket_paths() {
+    let error = ConfigLoader::new(WildcardCheckConfig {
+        users: vec![WildcardCheckUser {
+            enabled: true,
+            password: None,
+            cert: None,
+            key: None,
+        }],
+    })
+    .metadata(ConfigMetadata::new().required_if("users[0].enabled", true, ["users[0].password"]))
+    .load()
+    .expect_err("missing password for a bracket-addressed item should fail");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    let required_if = errors
+        .iter()
+        .find(|entry| entry.rule.as_deref() == Some("required_if"))
+        .expect("required_if error");
+    assert_eq!(
+        required_if.related_paths,
+        vec!["users.0.enabled".to_owned(), "users.0.password".to_owned()]
+    );
+}
+
+#[test]
 fn wildcard_required_with_binds_to_the_matching_collection_item() {
     let error = ConfigLoader::new(WildcardCheckConfig {
         users: vec![
@@ -2767,6 +3114,25 @@ fn duplicate_explicit_env_names_are_rejected() {
         [first_path.as_str(), second_path.as_str()],
         ["db.password", "db.url"]
     );
+}
+
+#[test]
+fn root_explicit_env_names_are_rejected() {
+    let env = EnvSource::from_pairs([("APP_CONFIG", r#"{"server":{"port":7000}}"#)]);
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new(".").env("APP_CONFIG")]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .env(env)
+        .load()
+        .expect_err("root explicit env names should fail");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("explicit environment variable names cannot target the root path"));
 }
 
 #[test]

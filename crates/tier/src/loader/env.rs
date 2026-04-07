@@ -28,6 +28,7 @@ impl EnvSource {
             });
         }
         let alias_overrides = metadata.alias_overrides()?;
+        validate_binding_paths(&bindings, &alias_overrides)?;
         let env_overrides = metadata.env_overrides()?;
         validate_binding_override_conflicts(
             &bindings,
@@ -177,6 +178,16 @@ impl EnvSource {
             direct_array_paths,
         }))
     }
+}
+
+fn validate_binding_paths(
+    bindings: &BTreeMap<String, EnvBinding>,
+    alias_overrides: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (name, binding) in bindings {
+        canonical_env_target_path(name, &binding.path, alias_overrides)?;
+    }
+    Ok(())
 }
 
 fn validate_binding_override_conflicts(
@@ -329,13 +340,20 @@ fn canonical_env_target_path(
     path: &str,
     alias_overrides: &BTreeMap<String, String>,
 ) -> Result<String, ConfigError> {
-    try_normalize_external_path(path)
-        .map(|path| canonicalize_path_with_aliases(&path, alias_overrides))
-        .map_err(|message| ConfigError::InvalidEnv {
+    let normalized =
+        try_normalize_external_path(path).map_err(|message| ConfigError::InvalidEnv {
             name: name.to_owned(),
             path: path.to_owned(),
             message,
-        })
+        })?;
+    if normalized.is_empty() {
+        return Err(ConfigError::InvalidEnv {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            message: "environment binding path cannot be empty".to_owned(),
+        });
+    }
+    Ok(canonicalize_path_with_aliases(&normalized, alias_overrides))
 }
 
 fn canonicalize_runtime_env_target_path(

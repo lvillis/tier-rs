@@ -686,4 +686,31 @@ mod clap_bridge {
         let port_step = explanation.steps.last().expect("latest step");
         assert!(port_step.source.to_string().contains("typed-clap"));
     }
+
+    #[test]
+    fn typed_clap_overrides_win_over_raw_args_sources() {
+        let cli = AppCli::parse_from(["app", "--port", "8123", "--db-token", "from-cli"]);
+
+        let loaded = ConfigLoader::new(PatchConfig::default())
+            .args(tier::ArgsSource::from_args([
+                "tier",
+                "--set",
+                "server.port=9000",
+                "--set",
+                "db.token=from-args",
+            ]))
+            .clap_overrides(&cli)
+            .expect("typed clap overrides are valid")
+            .load()
+            .expect("config loads");
+
+        assert_eq!(loaded.server.port, 8123);
+        assert_eq!(loaded.db.token.as_deref(), Some("from-cli"));
+        let explanation = loaded
+            .report()
+            .explain("server.port")
+            .expect("server.port explanation");
+        let port_step = explanation.steps.last().expect("latest step");
+        assert!(port_step.source.to_string().contains("typed-clap"));
+    }
 }

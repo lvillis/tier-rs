@@ -86,7 +86,7 @@ impl ConfigMetadata {
     /// Returns the metadata entry for a normalized configuration path or alias.
     #[must_use]
     pub fn field(&self, path: &str) -> Option<&FieldMetadata> {
-        let normalized = normalize_path(path);
+        let normalized = normalize_metadata_path(path);
         let mut best = None::<(MetadataMatchScore, &FieldMetadata)>;
         for field in &self.fields {
             for candidate in
@@ -245,6 +245,13 @@ impl ConfigMetadata {
             let Some(env) = &field.env else {
                 continue;
             };
+            if field.path.is_empty() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "explicit environment variable names cannot target the root path"
+                        .to_owned(),
+                });
+            }
             if field.path.split('.').any(|segment| segment == "*") {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
@@ -345,7 +352,7 @@ impl ConfigMetadata {
     /// Resolves the effective merge strategy for a concrete configuration path.
     #[must_use]
     pub fn merge_strategy_for(&self, path: &str) -> Option<MergeStrategy> {
-        let normalized = normalize_path(path);
+        let normalized = normalize_metadata_path(path);
         if normalized.is_empty() {
             return None;
         }
@@ -416,14 +423,44 @@ impl ConfigMetadata {
         Ok(())
     }
 
+    pub(crate) fn validate_paths(&self) -> Result<(), ConfigError> {
+        for field in &self.fields {
+            validate_metadata_path(&field.path)?;
+            for alias in &field.aliases {
+                validate_metadata_path(alias)?;
+            }
+        }
+
+        for check in &self.checks {
+            match check {
+                ValidationCheck::AtLeastOneOf { paths }
+                | ValidationCheck::ExactlyOneOf { paths }
+                | ValidationCheck::MutuallyExclusive { paths } => {
+                    for path in paths {
+                        validate_check_path(path)?;
+                    }
+                }
+                ValidationCheck::RequiredWith { path, requires }
+                | ValidationCheck::RequiredIf { path, requires, .. } => {
+                    validate_check_path(path)?;
+                    for required in requires {
+                        validate_check_path(required)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn normalize(&mut self) {
         let mut merged = BTreeMap::<String, FieldMetadata>::new();
         for mut field in self.fields.drain(..) {
-            field.path = normalize_path(&field.path);
+            field.path = normalize_metadata_path(&field.path);
             field.aliases = field
                 .aliases
                 .into_iter()
-                .map(|alias| normalize_path(&alias))
+                .map(|alias| normalize_metadata_path(&alias))
                 .filter(|alias| !alias.is_empty() && alias != &field.path)
                 .collect();
             field.aliases.sort();
@@ -472,7 +509,7 @@ impl FieldMetadata {
     #[must_use]
     pub fn new(path: impl Into<String>) -> Self {
         Self {
-            path: normalize_path(&path.into()),
+            path: normalize_metadata_path(&path.into()),
             aliases: Vec::new(),
             secret: false,
             env: None,
@@ -1105,27 +1142,27 @@ impl ValidationCheck {
     fn normalize(self) -> Option<Self> {
         match self {
             Self::AtLeastOneOf { paths } => {
-                normalize_path_group(paths).map(|paths| Self::AtLeastOneOf { paths })
+                normalize_check_path_group(paths).map(|paths| Self::AtLeastOneOf { paths })
             }
             Self::ExactlyOneOf { paths } => {
-                normalize_path_group(paths).map(|paths| Self::ExactlyOneOf { paths })
+                normalize_check_path_group(paths).map(|paths| Self::ExactlyOneOf { paths })
             }
             Self::MutuallyExclusive { paths } => {
-                normalize_path_group(paths).map(|paths| Self::MutuallyExclusive { paths })
+                normalize_check_path_group(paths).map(|paths| Self::MutuallyExclusive { paths })
             }
             Self::RequiredWith { path, requires } => {
-                let path = normalize_path(&path);
-                let requires = normalize_path_group(requires)?;
-                (!path.is_empty()).then_some(Self::RequiredWith { path, requires })
+                let path = normalize_metadata_path(&path);
+                let requires = normalize_check_path_group(requires)?;
+                Some(Self::RequiredWith { path, requires })
             }
             Self::RequiredIf {
                 path,
                 equals,
                 requires,
             } => {
-                let path = normalize_path(&path);
-                let requires = normalize_path_group(requires)?;
-                (!path.is_empty()).then_some(Self::RequiredIf {
+                let path = normalize_metadata_path(&path);
+                let requires = normalize_check_path_group(requires)?;
+                Some(Self::RequiredIf {
                     path,
                     equals,
                     requires,
@@ -1135,7 +1172,7 @@ impl ValidationCheck {
     }
 
     fn prefixed(self, prefix: &str) -> Option<Self> {
-        let prefix = normalize_path(prefix);
+        let prefix = normalize_metadata_path(prefix);
         if prefix.is_empty() {
             return self.normalize();
         }
@@ -1426,19 +1463,156 @@ where
     normalized
 }
 
-fn normalize_path_group<I>(paths: I) -> Option<Vec<String>>
+fn normalize_check_path_group<I>(paths: I) -> Option<Vec<String>>
 where
     I: IntoIterator<Item = String>,
 {
     let mut normalized = Vec::new();
     for path in paths {
-        let path = normalize_path(&path);
-        if path.is_empty() || normalized.contains(&path) {
+        let path = normalize_metadata_path(&path);
+        if normalized.contains(&path) {
             continue;
         }
         normalized.push(path);
     }
     (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalize_metadata_path(path: &str) -> String {
+    try_normalize_metadata_path(path).unwrap_or_else(|_| path.to_owned())
+}
+
+fn validate_metadata_path(path: &str) -> Result<(), ConfigError> {
+    try_normalize_metadata_path(path)
+        .map(|_| ())
+        .map_err(|message| ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: format!("invalid metadata path: {message}"),
+        })
+}
+
+fn validate_check_path(path: &str) -> Result<(), ConfigError> {
+    validate_metadata_path(path)?;
+    if normalize_metadata_path(path).is_empty() {
+        return Err(ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: "invalid metadata path: cross-field checks cannot use the root path"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn try_normalize_metadata_path(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    if path == "." {
+        return Ok(String::new());
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = path.chars().peekable();
+    let mut after_index = false;
+    let mut expecting_segment = true;
+
+    while let Some(ch) = chars.next() {
+        if after_index {
+            match ch {
+                '.' => {
+                    if chars.peek().is_none() {
+                        return Err("configuration path cannot end with `.`".to_owned());
+                    }
+                    after_index = false;
+                    expecting_segment = true;
+                }
+                '[' => {
+                    let index = parse_metadata_array_index(&mut chars)?;
+                    segments.push(index);
+                    after_index = true;
+                    expecting_segment = false;
+                }
+                _ => {
+                    return Err(
+                        "expected `.` or `[` after an array index in configuration path".to_owned(),
+                    );
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '.' => {
+                if current.is_empty() {
+                    return Err("empty path segment in configuration path".to_owned());
+                }
+                segments.push(std::mem::take(&mut current));
+                expecting_segment = true;
+            }
+            '[' => {
+                if current.is_empty() {
+                    return Err("array indices must follow a field name".to_owned());
+                }
+                segments.push(std::mem::take(&mut current));
+                let index = parse_metadata_array_index(&mut chars)?;
+                segments.push(index);
+                after_index = true;
+                expecting_segment = false;
+            }
+            ']' => return Err("unexpected `]` in configuration path".to_owned()),
+            _ => {
+                current.push(ch);
+                expecting_segment = false;
+            }
+        }
+    }
+
+    if expecting_segment && !segments.is_empty() && current.is_empty() && !after_index {
+        return Err("configuration path cannot end with `.`".to_owned());
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+
+    for segment in &segments {
+        if segment.contains('*') && segment != "*" {
+            return Err("wildcard path segments must be exactly `*`".to_owned());
+        }
+    }
+
+    Ok(segments.join("."))
+}
+
+fn parse_metadata_array_index<I>(chars: &mut std::iter::Peekable<I>) -> Result<String, String>
+where
+    I: Iterator<Item = char>,
+{
+    let mut index = String::new();
+    let mut closed = false;
+    for next in chars.by_ref() {
+        if next == ']' {
+            closed = true;
+            break;
+        }
+        index.push(next);
+    }
+
+    if !closed {
+        return Err("unclosed `[` in configuration path".to_owned());
+    }
+    if index.is_empty() {
+        return Err("empty array index in configuration path".to_owned());
+    }
+    if !index.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("array indices in configuration paths must be numeric".to_owned());
+    }
+
+    Ok(index
+        .parse::<usize>()
+        .expect("checked numeric array indices")
+        .to_string())
 }
 
 fn metadata_match_score(path: &str, candidate: &str) -> Option<MetadataMatchScore> {

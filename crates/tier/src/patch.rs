@@ -250,6 +250,41 @@ impl PatchLayerBuilder {
             });
         }
         if let Some(writes) = &mut self.deferred_writes {
+            let shape_snapshot = self.shape.clone();
+            let (segments, array_segments) =
+                canonicalize_patch_path(&shape_snapshot, &segments, &explicit_array_segments);
+            let canonical_path = normalize_path(&segments.join("."));
+            claim_patch_path(&self.trace.name, &canonical_path, &mut self.claimed_paths)?;
+
+            let indexed_array_container_paths =
+                patch_indexed_array_container_paths(&segments, &array_segments);
+            record_patch_indexed_array_state(
+                &mut self.current_array_lengths,
+                &mut self.indexed_array_base_lengths,
+                &canonical_path,
+                &indexed_array_container_paths,
+            );
+            if value.is_array() {
+                record_direct_array_state(
+                    &mut self.current_array_lengths,
+                    &mut self.indexed_array_base_lengths,
+                    &canonical_path,
+                    &value,
+                );
+            }
+            insert_path_with_shape(
+                &mut self.shape,
+                Some(&shape_snapshot),
+                &segments,
+                &array_segments,
+                0,
+                value.clone(),
+            )
+            .map_err(|message| ConfigError::InvalidPatch {
+                name: self.trace.name.clone(),
+                path: canonical_path,
+                message,
+            })?;
             writes.push((path.to_owned(), value));
             return Ok(());
         }
