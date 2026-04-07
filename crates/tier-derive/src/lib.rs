@@ -580,8 +580,16 @@ struct TierAttrs {
     max: Option<NumericLiteral>,
     min_length: Option<usize>,
     max_length: Option<usize>,
+    min_items: Option<usize>,
+    max_items: Option<usize>,
+    min_properties: Option<usize>,
+    max_properties: Option<usize>,
+    pattern: Option<String>,
+    unique_items: bool,
     one_of: Vec<Expr>,
     hostname: bool,
+    url: bool,
+    email: bool,
     ip_addr: bool,
     socket_addr: bool,
     absolute_path: bool,
@@ -602,8 +610,16 @@ impl TierAttrs {
             || self.max.is_some()
             || self.min_length.is_some()
             || self.max_length.is_some()
+            || self.min_items.is_some()
+            || self.max_items.is_some()
+            || self.min_properties.is_some()
+            || self.max_properties.is_some()
+            || self.pattern.is_some()
+            || self.unique_items
             || !self.one_of.is_empty()
             || self.hostname
+            || self.url
+            || self.email
             || self.ip_addr
             || self.socket_addr
             || self.absolute_path
@@ -876,12 +892,47 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
                 attrs.max_length = Some(parse_usize_value(meta)?);
                 return Ok(());
             }
+            if meta.path.is_ident("min_items") {
+                attrs.min_items = Some(parse_usize_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("max_items") {
+                attrs.max_items = Some(parse_usize_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("min_properties") {
+                attrs.min_properties = Some(parse_usize_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("max_properties") {
+                attrs.max_properties = Some(parse_usize_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("pattern") {
+                attrs.pattern = Some(parse_string_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("unique_items") {
+                attrs.unique_items = true;
+                consume_unused_meta(meta)?;
+                return Ok(());
+            }
             if meta.path.is_ident("one_of") {
                 attrs.one_of = parse_literal_expr_list(meta)?;
                 return Ok(());
             }
             if meta.path.is_ident("hostname") {
                 attrs.hostname = true;
+                consume_unused_meta(meta)?;
+                return Ok(());
+            }
+            if meta.path.is_ident("url") {
+                attrs.url = true;
+                consume_unused_meta(meta)?;
+                return Ok(());
+            }
+            if meta.path.is_ident("email") {
+                attrs.email = true;
                 consume_unused_meta(meta)?;
                 return Ok(());
             }
@@ -1378,8 +1429,39 @@ fn validate_validation_attrs(attrs: &TierAttrs, field_ident: &syn::Ident) -> syn
         ));
     }
 
+    if let (Some(min_items), Some(max_items)) = (attrs.min_items, attrs.max_items)
+        && min_items > max_items
+    {
+        return Err(syn::Error::new_spanned(
+            field_ident,
+            "tier(min_items = ...) cannot be greater than tier(max_items = ...)",
+        ));
+    }
+
+    if let (Some(min_properties), Some(max_properties)) =
+        (attrs.min_properties, attrs.max_properties)
+        && min_properties > max_properties
+    {
+        return Err(syn::Error::new_spanned(
+            field_ident,
+            "tier(min_properties = ...) cannot be greater than tier(max_properties = ...)",
+        ));
+    }
+
+    if attrs.pattern.as_deref() == Some("") {
+        return Err(syn::Error::new_spanned(
+            field_ident,
+            "tier(pattern = ...) cannot be empty",
+        ));
+    }
+
     if attrs.one_of.is_empty()
-        && (attrs.hostname || attrs.ip_addr || attrs.socket_addr || attrs.absolute_path)
+        && (attrs.hostname
+            || attrs.url
+            || attrs.email
+            || attrs.ip_addr
+            || attrs.socket_addr
+            || attrs.absolute_path)
     {
         return Ok(());
     }
@@ -1801,12 +1883,37 @@ fn direct_field_metadata_tokens(
     if let Some(max_length) = attrs.max_length {
         builder = quote! { #builder.max_length(#max_length) };
     }
+    if let Some(min_items) = attrs.min_items {
+        builder = quote! { #builder.min_items(#min_items) };
+    }
+    if let Some(max_items) = attrs.max_items {
+        builder = quote! { #builder.max_items(#max_items) };
+    }
+    if let Some(min_properties) = attrs.min_properties {
+        builder = quote! { #builder.min_properties(#min_properties) };
+    }
+    if let Some(max_properties) = attrs.max_properties {
+        builder = quote! { #builder.max_properties(#max_properties) };
+    }
+    if let Some(pattern) = &attrs.pattern {
+        let pattern = LitStr::new(pattern, field_name.span());
+        builder = quote! { #builder.pattern(#pattern) };
+    }
+    if attrs.unique_items {
+        builder = quote! { #builder.unique_items() };
+    }
     if !attrs.one_of.is_empty() {
         let one_of = &attrs.one_of;
         builder = quote! { #builder.one_of([#(#one_of),*]) };
     }
     if attrs.hostname {
         builder = quote! { #builder.hostname() };
+    }
+    if attrs.url {
+        builder = quote! { #builder.url() };
+    }
+    if attrs.email {
+        builder = quote! { #builder.email() };
     }
     if attrs.ip_addr {
         builder = quote! { #builder.ip_addr() };

@@ -589,6 +589,42 @@ impl FieldMetadata {
         self.validate(ValidationRule::MaxLength(max))
     }
 
+    /// Requires the field to be an array with at least `min` items.
+    #[must_use]
+    pub fn min_items(self, min: usize) -> Self {
+        self.validate(ValidationRule::MinItems(min))
+    }
+
+    /// Requires the field to be an array with at most `max` items.
+    #[must_use]
+    pub fn max_items(self, max: usize) -> Self {
+        self.validate(ValidationRule::MaxItems(max))
+    }
+
+    /// Requires the field to be an object with at least `min` properties.
+    #[must_use]
+    pub fn min_properties(self, min: usize) -> Self {
+        self.validate(ValidationRule::MinProperties(min))
+    }
+
+    /// Requires the field to be an object with at most `max` properties.
+    #[must_use]
+    pub fn max_properties(self, max: usize) -> Self {
+        self.validate(ValidationRule::MaxProperties(max))
+    }
+
+    /// Requires the field to match a regular expression.
+    #[must_use]
+    pub fn pattern(self, pattern: impl Into<String>) -> Self {
+        self.validate(ValidationRule::Pattern(pattern.into()))
+    }
+
+    /// Requires the field to be an array with unique items.
+    #[must_use]
+    pub fn unique_items(self) -> Self {
+        self.validate(ValidationRule::UniqueItems)
+    }
+
     /// Requires the field to match one of the provided scalar values.
     #[must_use]
     pub fn one_of<I, V>(self, values: I) -> Self
@@ -605,6 +641,18 @@ impl FieldMetadata {
     #[must_use]
     pub fn hostname(self) -> Self {
         self.validate(ValidationRule::Hostname)
+    }
+
+    /// Requires the field to be a valid absolute URL string.
+    #[must_use]
+    pub fn url(self) -> Self {
+        self.validate(ValidationRule::Url)
+    }
+
+    /// Requires the field to be a valid email address.
+    #[must_use]
+    pub fn email(self) -> Self {
+        self.validate(ValidationRule::Email)
     }
 
     /// Requires the field to be a valid IP address.
@@ -931,10 +979,26 @@ pub enum ValidationRule {
     MinLength(usize),
     /// The field length must be at most the given number of units.
     MaxLength(usize),
+    /// The field must be an array with at least the given number of items.
+    MinItems(usize),
+    /// The field must be an array with at most the given number of items.
+    MaxItems(usize),
+    /// The field must be an object with at least the given number of properties.
+    MinProperties(usize),
+    /// The field must be an object with at most the given number of properties.
+    MaxProperties(usize),
+    /// The field must match the given regular expression.
+    Pattern(String),
+    /// The field must be an array whose items are unique.
+    UniqueItems,
     /// The field must equal one of the provided scalar values.
     OneOf(Vec<ValidationValue>),
     /// The field must be a valid hostname.
     Hostname,
+    /// The field must be a valid absolute URL string.
+    Url,
+    /// The field must be a valid email address.
+    Email,
     /// The field must be a valid IP address.
     IpAddr,
     /// The field must be a valid socket address.
@@ -953,8 +1017,16 @@ impl ValidationRule {
             Self::Max(_) => "max",
             Self::MinLength(_) => "min_length",
             Self::MaxLength(_) => "max_length",
+            Self::MinItems(_) => "min_items",
+            Self::MaxItems(_) => "max_items",
+            Self::MinProperties(_) => "min_properties",
+            Self::MaxProperties(_) => "max_properties",
+            Self::Pattern(_) => "pattern",
+            Self::UniqueItems => "unique_items",
             Self::OneOf(_) => "one_of",
             Self::Hostname => "hostname",
+            Self::Url => "url",
+            Self::Email => "email",
             Self::IpAddr => "ip_addr",
             Self::SocketAddr => "socket_addr",
             Self::AbsolutePath => "absolute_path",
@@ -970,6 +1042,12 @@ impl Display for ValidationRule {
             Self::Max(value) => write!(f, "max={value}"),
             Self::MinLength(value) => write!(f, "min_length={value}"),
             Self::MaxLength(value) => write!(f, "max_length={value}"),
+            Self::MinItems(value) => write!(f, "min_items={value}"),
+            Self::MaxItems(value) => write!(f, "max_items={value}"),
+            Self::MinProperties(value) => write!(f, "min_properties={value}"),
+            Self::MaxProperties(value) => write!(f, "max_properties={value}"),
+            Self::Pattern(value) => write!(f, "pattern={value:?}"),
+            Self::UniqueItems => write!(f, "unique_items"),
             Self::OneOf(values) => write!(
                 f,
                 "one_of=[{}]",
@@ -980,6 +1058,8 @@ impl Display for ValidationRule {
                     .join(", ")
             ),
             Self::Hostname => write!(f, "hostname"),
+            Self::Url => write!(f, "url"),
+            Self::Email => write!(f, "email"),
             Self::IpAddr => write!(f, "ip_addr"),
             Self::SocketAddr => write!(f, "socket_addr"),
             Self::AbsolutePath => write!(f, "absolute_path"),

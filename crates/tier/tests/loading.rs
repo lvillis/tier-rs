@@ -2311,6 +2311,35 @@ fn invalid_declarative_numeric_bounds_return_structured_errors() {
 }
 
 #[test]
+fn url_validation_accepts_common_absolute_url_forms_without_external_parser() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct UrlValidationConfig {
+        database_url: String,
+        socket_url: String,
+        contact_url: String,
+    }
+
+    impl Default for UrlValidationConfig {
+        fn default() -> Self {
+            Self {
+                database_url: "postgres://localhost/app".to_owned(),
+                socket_url: "file:///var/run/tier.sock".to_owned(),
+                contact_url: "mailto:ops@example.com".to_owned(),
+            }
+        }
+    }
+
+    ConfigLoader::new(UrlValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("database_url").url(),
+            FieldMetadata::new("socket_url").url(),
+            FieldMetadata::new("contact_url").url(),
+        ]))
+        .load()
+        .expect("common absolute URL forms must validate");
+}
+
+#[test]
 fn declared_validation_supports_cross_field_checks_and_extended_rules() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct AdvancedValidationConfig {
@@ -2322,6 +2351,9 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct AdvancedEndpoint {
         host: String,
+        slug: String,
+        service_url: String,
+        contact_email: String,
         listen: String,
         ip: String,
         mode: String,
@@ -2339,6 +2371,9 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct AdvancedRuntime {
         state_dir: String,
+        proxies: Vec<String>,
+        labels: std::collections::BTreeMap<String, String>,
+        tags: Vec<String>,
     }
 
     impl Default for AdvancedValidationConfig {
@@ -2346,6 +2381,9 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
             Self {
                 endpoint: AdvancedEndpoint {
                     host: "api.internal".to_owned(),
+                    slug: "api-service".to_owned(),
+                    service_url: "https://api.internal".to_owned(),
+                    contact_email: "ops@api.internal".to_owned(),
                     listen: "127.0.0.1:8080".to_owned(),
                     ip: "127.0.0.1".to_owned(),
                     mode: "memory".to_owned(),
@@ -2359,6 +2397,12 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
                 },
                 runtime: AdvancedRuntime {
                     state_dir: "/var/lib/tier".to_owned(),
+                    proxies: vec!["127.0.0.1".to_owned()],
+                    labels: std::collections::BTreeMap::from([(
+                        "region".to_owned(),
+                        "cn".to_owned(),
+                    )]),
+                    tags: vec!["edge".to_owned()],
                 },
             }
         }
@@ -2366,10 +2410,21 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
 
     let metadata = ConfigMetadata::from_fields([
         FieldMetadata::new("endpoint.host").hostname(),
+        FieldMetadata::new("endpoint.slug").pattern("^[a-z0-9-]+$"),
+        FieldMetadata::new("endpoint.service_url").url(),
+        FieldMetadata::new("endpoint.contact_email").email(),
         FieldMetadata::new("endpoint.listen").socket_addr(),
         FieldMetadata::new("endpoint.ip").ip_addr(),
         FieldMetadata::new("endpoint.mode").one_of(["memory", "redis"]),
         FieldMetadata::new("runtime.state_dir").absolute_path(),
+        FieldMetadata::new("runtime.proxies")
+            .min_items(1)
+            .max_items(2),
+        FieldMetadata::new("runtime.labels")
+            .min_properties(1)
+            .max_properties(2)
+            .merge_strategy(MergeStrategy::Replace),
+        FieldMetadata::new("runtime.tags").unique_items(),
     ])
     .exactly_one_of(["endpoint.port", "endpoint.unix_socket"])
     .required_if("tls.enabled", true, ["tls.cert", "tls.key"]);
@@ -2379,6 +2434,12 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
         "--set",
         r#"endpoint.host="bad host""#,
         "--set",
+        r#"endpoint.slug="Bad Slug""#,
+        "--set",
+        r#"endpoint.service_url="not a url""#,
+        "--set",
+        r#"endpoint.contact_email="not-an-email""#,
+        "--set",
         r#"endpoint.listen="localhost""#,
         "--set",
         r#"endpoint.ip="not-an-ip""#,
@@ -2386,6 +2447,12 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
         r#"endpoint.mode="disk""#,
         "--set",
         r#"runtime.state_dir="relative/path""#,
+        "--set",
+        "runtime.proxies=[]",
+        "--set",
+        "runtime.labels={}",
+        "--set",
+        r#"runtime.tags=["edge","edge"]"#,
         "--set",
         "endpoint.port=8080",
         "--set",
@@ -2412,6 +2479,21 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
     assert!(
         errors
             .iter()
+            .any(|error| error.rule.as_deref() == Some("pattern"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("url"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("email"))
+    );
+    assert!(
+        errors
+            .iter()
             .any(|error| error.rule.as_deref() == Some("socket_addr"))
     );
     assert!(
@@ -2428,6 +2510,21 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
         errors
             .iter()
             .any(|error| error.rule.as_deref() == Some("absolute_path"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("min_items"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("min_properties"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("unique_items"))
     );
 
     let exactly_one = errors

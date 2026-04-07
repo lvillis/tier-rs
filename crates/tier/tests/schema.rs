@@ -18,6 +18,9 @@ use tier::{
 struct SchemaConfig {
     server: SchemaServer,
     secrets: SchemaSecrets,
+    website: String,
+    contact_email: String,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -323,6 +326,7 @@ impl TierMetadata for SchemaConfig {
                 .doc("Address exposed by the service")
                 .example("0.0.0.0")
                 .non_empty()
+                .pattern("^[a-z0-9.-]+$")
                 .min_length(3)
                 .defaulted(),
             FieldMetadata::new("server.port")
@@ -332,6 +336,15 @@ impl TierMetadata for SchemaConfig {
                 .min(1)
                 .max(65_535),
             FieldMetadata::new("secrets.password").secret(),
+            FieldMetadata::new("website")
+                .doc("Public service URL")
+                .example("https://api.example.com")
+                .url(),
+            FieldMetadata::new("contact_email")
+                .doc("Operations contact address")
+                .example("ops@example.com")
+                .email(),
+            FieldMetadata::new("tags").unique_items(),
         ])
         .required_if("server.port", 8080, ["server.host"])
     }
@@ -2258,12 +2271,37 @@ fn exports_json_schema() {
 fn annotated_schema_includes_tier_metadata_extensions() {
     let schema = annotated_json_schema_for::<SchemaConfig>();
     let rendered = serde_json::to_string(&schema).expect("annotated schema json");
+    let tag_rules = schema["properties"]["tags"]["x-tier-validate"]
+        .as_array()
+        .expect("tags validation rules");
+    let website_rules = schema["properties"]["website"]["x-tier-validate"]
+        .as_array()
+        .expect("website validation rules");
+    let contact_email_rules = schema["properties"]["contact_email"]["x-tier-validate"]
+        .as_array()
+        .expect("contact_email validation rules");
 
     assert!(rendered.contains("\"x-tier-env\":\"APP_SERVER_HOSTNAME\""));
     assert!(rendered.contains("\"x-tier-aliases\":[\"server.hostname\"]"));
     assert!(rendered.contains("\"x-tier-has-default\":true"));
     assert!(rendered.contains("\"x-tier-merge\":\"replace\""));
     assert!(rendered.contains("\"x-tier-validate\""));
+    assert!(rendered.contains("^[a-z0-9.-]+$"));
+    assert!(
+        tag_rules
+            .iter()
+            .any(|rule| rule.as_str() == Some("UniqueItems"))
+    );
+    assert!(
+        website_rules
+            .iter()
+            .any(|rule| rule.as_str() == Some("Url"))
+    );
+    assert!(
+        contact_email_rules
+            .iter()
+            .any(|rule| rule.as_str() == Some("Email"))
+    );
     assert!(rendered.contains("\"x-tier-checks\""));
     assert!(rendered.contains("\"x-tier-deprecated-note\":\"use server.bind_port instead\""));
 }
@@ -2523,7 +2561,12 @@ fn generates_environment_docs_from_schema() {
     assert!(docs.iter().any(|entry| {
         entry.path == "server.host"
             && entry.aliases == vec!["server.hostname".to_owned()]
-            && entry.validations == vec![ValidationRule::NonEmpty, ValidationRule::MinLength(3)]
+            && entry.validations
+                == vec![
+                    ValidationRule::NonEmpty,
+                    ValidationRule::Pattern("^[a-z0-9.-]+$".to_owned()),
+                    ValidationRule::MinLength(3),
+                ]
             && entry.has_default
     }));
     assert!(docs.iter().any(|entry| entry.env == "APP__SERVER__PORT"));
@@ -2531,6 +2574,20 @@ fn generates_environment_docs_from_schema() {
         docs.iter()
             .any(|entry| entry.env == "APP__SECRETS__PASSWORD" && entry.secret)
     );
+    assert!(docs.iter().any(|entry| {
+        entry.path == "website"
+            && entry.env == "APP__WEBSITE"
+            && entry.description.as_deref() == Some("Public service URL")
+            && entry.example.as_deref() == Some("https://api.example.com")
+            && entry.validations == vec![ValidationRule::Url]
+    }));
+    assert!(docs.iter().any(|entry| {
+        entry.path == "contact_email"
+            && entry.env == "APP__CONTACT_EMAIL"
+            && entry.description.as_deref() == Some("Operations contact address")
+            && entry.example.as_deref() == Some("ops@example.com")
+            && entry.validations == vec![ValidationRule::Email]
+    }));
     assert!(
         docs.iter()
             .any(|entry| { entry.path == "server.port" && entry.merge == MergeStrategy::Replace })
@@ -2597,6 +2654,10 @@ fn generates_environment_docs_from_schema() {
     assert!(markdown.contains("server.hostname"));
     assert!(markdown.contains("replace"));
     assert!(markdown.contains("non_empty"));
+    assert!(markdown.contains("https://api.example.com"));
+    assert!(markdown.contains("ops@example.com"));
+    assert!(markdown.contains("url"));
+    assert!(markdown.contains("email"));
     assert!(markdown.contains("min=1"));
 
     let docs_json = env_docs_json::<SchemaConfig>(&EnvDocOptions::prefixed("APP"));
@@ -2605,7 +2666,7 @@ fn generates_environment_docs_from_schema() {
         entry["path"].as_str() == Some("server.host")
             && entry["env"].as_str() == Some("APP_SERVER_HOSTNAME")
             && entry["has_default"].as_bool() == Some(true)
-            && entry["validations"].as_array().map(Vec::len) == Some(2)
+            && entry["validations"].as_array().map(Vec::len) == Some(3)
     }));
 
     let array_docs_json = env_docs_json::<ArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));
@@ -3460,6 +3521,8 @@ fn generates_example_configuration_from_schema() {
     assert_eq!(example["server"]["host"].as_str(), Some("0.0.0.0"));
     assert_eq!(example["server"]["port"].as_i64(), Some(8080));
     assert_eq!(example["secrets"]["password"].as_str(), Some("<secret>"));
+    assert_eq!(example["website"].as_str(), Some("https://api.example.com"));
+    assert_eq!(example["contact_email"].as_str(), Some("ops@example.com"));
 }
 
 #[test]
@@ -3557,7 +3620,7 @@ fn generates_commented_toml_example_configuration() {
     assert!(example.contains("# env: APP_SERVER_HOSTNAME"));
     assert!(example.contains("# aliases: server.hostname"));
     assert!(example.contains("# default: provided by serde"));
-    assert!(example.contains("# validate: non_empty, min_length=3"));
+    assert!(example.contains("# validate: non_empty, pattern=\"^[a-z0-9.-]+$\", min_length=3"));
     assert!(example.contains("# validate: required_if(server.port == 8080 -> server.host)"));
     assert!(example.contains("# merge: replace"));
     assert!(example.contains("# validate: min=1, max=65535"));
@@ -3565,6 +3628,12 @@ fn generates_commented_toml_example_configuration() {
     assert!(example.contains("[secrets]"));
     assert!(example.contains("password = \"<secret>\""));
     assert!(example.contains("# secret: true"));
+    assert!(example.contains("website = \"https://api.example.com\""));
+    assert!(example.contains("# Public service URL"));
+    assert!(example.contains("# validate: url"));
+    assert!(example.contains("contact_email = \"ops@example.com\""));
+    assert!(example.contains("# Operations contact address"));
+    assert!(example.contains("# validate: email"));
 }
 
 #[cfg(feature = "toml")]

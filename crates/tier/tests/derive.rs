@@ -1,5 +1,7 @@
 #![cfg(feature = "derive")]
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use tier::{
@@ -96,12 +98,24 @@ struct WrappedTls(SerdeDefaultTls);
 struct DerivedValidationConfig {
     #[tier(non_empty, min_length = 3, max_length = 32)]
     service_name: String,
+    #[tier(pattern = "^[a-z0-9-]+$")]
+    service_slug: String,
     #[tier(min = -10, max = 100)]
     health_score: i32,
+    #[tier(min_items = 1, max_items = 4)]
+    ports: Vec<u16>,
+    #[tier(min_properties = 1, max_properties = 3)]
+    labels: BTreeMap<String, String>,
+    #[tier(unique_items)]
+    tags: Vec<String>,
     #[tier(one_of("memory", "redis"), non_empty)]
     backend: String,
     #[tier(hostname)]
     hostname: String,
+    #[tier(url)]
+    service_url: String,
+    #[tier(email)]
+    contact_email: String,
     #[tier(socket_addr)]
     listen_addr: String,
 }
@@ -737,6 +751,32 @@ fn derive_metadata_collects_declared_validation_rules() {
         ]
     );
 
+    let service_slug = metadata
+        .field("service_slug")
+        .expect("service_slug metadata");
+    assert_eq!(
+        service_slug.validations,
+        vec![ValidationRule::Pattern("^[a-z0-9-]+$".to_owned())]
+    );
+
+    let ports = metadata.field("ports").expect("ports metadata");
+    assert_eq!(
+        ports.validations,
+        vec![ValidationRule::MinItems(1), ValidationRule::MaxItems(4)]
+    );
+
+    let labels = metadata.field("labels").expect("labels metadata");
+    assert_eq!(
+        labels.validations,
+        vec![
+            ValidationRule::MinProperties(1),
+            ValidationRule::MaxProperties(3),
+        ]
+    );
+
+    let tags = metadata.field("tags").expect("tags metadata");
+    assert_eq!(tags.validations, vec![ValidationRule::UniqueItems]);
+
     let backend = metadata.field("backend").expect("backend metadata");
     assert_eq!(
         backend.validations,
@@ -748,6 +788,14 @@ fn derive_metadata_collects_declared_validation_rules() {
 
     let hostname = metadata.field("hostname").expect("hostname metadata");
     assert_eq!(hostname.validations, vec![ValidationRule::Hostname]);
+
+    let service_url = metadata.field("service_url").expect("service_url metadata");
+    assert_eq!(service_url.validations, vec![ValidationRule::Url]);
+
+    let contact_email = metadata
+        .field("contact_email")
+        .expect("contact_email metadata");
+    assert_eq!(contact_email.validations, vec![ValidationRule::Email]);
 
     let listen_addr = metadata.field("listen_addr").expect("listen_addr metadata");
     assert_eq!(listen_addr.validations, vec![ValidationRule::SocketAddr]);

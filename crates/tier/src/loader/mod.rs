@@ -4,8 +4,9 @@ use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use regex::Regex;
 use serde::Serialize;
 use serde::de::{
     self, DeserializeOwned, IntoDeserializer, MapAccess, SeqAccess, Visitor,
@@ -1951,6 +1952,147 @@ fn validate_declared_rule(
                 )),
             }
         }
+        ValidationRule::MinItems(min) => match actual {
+            Value::Array(values) if values.len() >= *min => None,
+            Value::Array(_) => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                &format!("item count must be >= {min}"),
+                Some(Value::Number((*min as u64).into())),
+            )),
+            _ => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                "must be an array to apply item-count validation",
+                Some(Value::Number((*min as u64).into())),
+            )),
+        },
+        ValidationRule::MaxItems(max) => match actual {
+            Value::Array(values) if values.len() <= *max => None,
+            Value::Array(_) => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                &format!("item count must be <= {max}"),
+                Some(Value::Number((*max as u64).into())),
+            )),
+            _ => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                "must be an array to apply item-count validation",
+                Some(Value::Number((*max as u64).into())),
+            )),
+        },
+        ValidationRule::MinProperties(min) => match actual {
+            Value::Object(values) if values.len() >= *min => None,
+            Value::Object(_) => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                &format!("property count must be >= {min}"),
+                Some(Value::Number((*min as u64).into())),
+            )),
+            _ => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                "must be an object to apply property-count validation",
+                Some(Value::Number((*min as u64).into())),
+            )),
+        },
+        ValidationRule::MaxProperties(max) => match actual {
+            Value::Object(values) if values.len() <= *max => None,
+            Value::Object(_) => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                &format!("property count must be <= {max}"),
+                Some(Value::Number((*max as u64).into())),
+            )),
+            _ => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                "must be an object to apply property-count validation",
+                Some(Value::Number((*max as u64).into())),
+            )),
+        },
+        ValidationRule::Pattern(pattern) => {
+            let Some(value) = actual.as_str() else {
+                return Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "must be a string to apply pattern validation",
+                    Some(Value::String(pattern.clone())),
+                ));
+            };
+            let regex = match Regex::new(pattern) {
+                Ok(regex) => regex,
+                Err(error) => {
+                    return Some(validation_error(
+                        path,
+                        actual,
+                        rule,
+                        secret_paths,
+                        &format!("declared pattern must be a valid regex: {error}"),
+                        Some(Value::String(pattern.clone())),
+                    ));
+                }
+            };
+            (!regex.is_match(value)).then(|| {
+                validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    &format!("must match pattern {pattern:?}"),
+                    Some(Value::String(pattern.clone())),
+                )
+            })
+        }
+        ValidationRule::UniqueItems => match actual {
+            Value::Array(values) => {
+                let mut seen = Vec::<&Value>::new();
+                let duplicate = values.iter().any(|value| {
+                    let duplicate = seen.contains(&value);
+                    if !duplicate {
+                        seen.push(value);
+                    }
+                    duplicate
+                });
+                duplicate.then(|| {
+                    validation_error(
+                        path,
+                        actual,
+                        rule,
+                        secret_paths,
+                        "items must be unique",
+                        Some(Value::Bool(true)),
+                    )
+                })
+            }
+            _ => Some(validation_error(
+                path,
+                actual,
+                rule,
+                secret_paths,
+                "must be an array to apply unique-items validation",
+                Some(Value::Bool(true)),
+            )),
+        },
         ValidationRule::OneOf(values) => {
             let expected = Value::Array(values.iter().map(|value| value.0.clone()).collect());
             values
@@ -1996,6 +2138,50 @@ fn validate_declared_rule(
                     rule,
                     secret_paths,
                     "must be a valid hostname",
+                    None,
+                )
+            })
+        }
+        ValidationRule::Url => {
+            let Some(value) = actual.as_str() else {
+                return Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "must be a URL string",
+                    None,
+                ));
+            };
+            (!is_valid_url(value)).then(|| {
+                validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "must be a valid URL",
+                    None,
+                )
+            })
+        }
+        ValidationRule::Email => {
+            let Some(value) = actual.as_str() else {
+                return Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "must be an email address string",
+                    None,
+                ));
+            };
+            (!is_valid_email(value)).then(|| {
+                validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "must be a valid email address",
                     None,
                 )
             })
@@ -2326,6 +2512,141 @@ fn is_valid_hostname(value: &str) -> bool {
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
     })
+}
+
+fn is_valid_url(value: &str) -> bool {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return false;
+    }
+
+    let Some((scheme, rest)) = value.split_once(':') else {
+        return false;
+    };
+    if !is_valid_url_scheme(scheme) || rest.is_empty() {
+        return false;
+    }
+
+    if let Some(authority_and_tail) = rest.strip_prefix("//") {
+        return is_valid_hierarchical_url(scheme, authority_and_tail);
+    }
+
+    if rest.starts_with('/') {
+        return scheme.eq_ignore_ascii_case("file")
+            && rest
+                .chars()
+                .all(|ch| !ch.is_whitespace() && !ch.is_control());
+    }
+
+    rest.chars()
+        .all(|ch| !ch.is_whitespace() && !ch.is_control())
+}
+
+fn is_valid_url_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn is_valid_hierarchical_url(scheme: &str, authority_and_tail: &str) -> bool {
+    let split_at = authority_and_tail
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_tail.len());
+    let (authority, tail) = authority_and_tail.split_at(split_at);
+
+    if authority.is_empty() {
+        return scheme.eq_ignore_ascii_case("file")
+            && !tail.is_empty()
+            && tail
+                .chars()
+                .all(|ch| !ch.is_whitespace() && !ch.is_control());
+    }
+
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    if !is_valid_url_host_port(host_port) {
+        return false;
+    }
+
+    tail.chars()
+        .all(|ch| !ch.is_whitespace() && !ch.is_control())
+}
+
+fn is_valid_url_host_port(host_port: &str) -> bool {
+    if host_port.is_empty() {
+        return false;
+    }
+
+    if let Some(ipv6) = host_port.strip_prefix('[') {
+        let Some((host, suffix)) = ipv6.split_once(']') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return suffix.is_empty() || parse_url_port(suffix.strip_prefix(':')).is_some();
+    }
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (host, Some(port)),
+        Some(_) => return false,
+        None => (host_port, None),
+    };
+
+    if host.is_empty() || !(host.parse::<IpAddr>().is_ok() || is_valid_hostname(host)) {
+        return false;
+    }
+
+    port.is_none_or(|port| parse_url_port(Some(port)).is_some())
+}
+
+fn parse_url_port(port: Option<&str>) -> Option<u16> {
+    let port = port?;
+    if port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>().ok()
+}
+
+fn is_valid_email(value: &str) -> bool {
+    if value.is_empty() || value.contains(char::is_whitespace) || value.matches('@').count() != 1 {
+        return false;
+    }
+
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+
+    if local.is_empty()
+        || domain.is_empty()
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+    {
+        return false;
+    }
+
+    static LOCAL_PART_RE: OnceLock<Regex> = OnceLock::new();
+    let local_part_re = LOCAL_PART_RE.get_or_init(|| {
+        Regex::new(r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$")
+            .expect("email local-part regex must compile")
+    });
+    if !local_part_re.is_match(local) {
+        return false;
+    }
+
+    if let Some(ip_literal) = domain
+        .strip_prefix('[')
+        .and_then(|domain| domain.strip_suffix(']'))
+    {
+        return ip_literal.parse::<IpAddr>().is_ok();
+    }
+
+    domain.parse::<IpAddr>().is_ok() || is_valid_hostname(domain)
 }
 
 fn parse_args(source: ArgsSource) -> Result<ParsedArgs, ConfigError> {
