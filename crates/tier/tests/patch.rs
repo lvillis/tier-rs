@@ -1,8 +1,14 @@
 #![cfg(feature = "derive")]
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "toml")]
+use std::fs;
 use std::sync::Arc;
+#[cfg(feature = "toml")]
+use tempfile::tempdir;
 
+#[cfg(feature = "toml")]
+use tier::FileSource;
 use tier::{ConfigLoader, Layer, Patch, TierPatch};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,13 +196,12 @@ struct NumericObjectKeyPatch {
     password: Option<String>,
 }
 
-#[cfg(feature = "clap")]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DeferredArrayShapeConfig {
     users: serde_json::Value,
 }
 
-#[cfg(feature = "clap")]
 impl Default for DeferredArrayShapeConfig {
     fn default() -> Self {
         Self {
@@ -205,13 +210,13 @@ impl Default for DeferredArrayShapeConfig {
     }
 }
 
-#[cfg(feature = "clap")]
+#[allow(dead_code)]
 #[derive(Debug, Clone, TierPatch, Default)]
 struct DeferredArrayShapePatch {
     users: Patch<serde_json::Value>,
 }
 
-#[cfg(feature = "clap")]
+#[allow(dead_code)]
 #[derive(Debug, Clone, TierPatch, Default)]
 struct DeferredArrayItemPatch {
     #[tier(path = "users.0.token")]
@@ -442,6 +447,31 @@ fn typed_patches_preserve_numeric_object_keys_when_prior_layers_define_object_sh
     );
 }
 
+#[cfg(feature = "toml")]
+#[test]
+fn typed_patches_preserve_array_shape_from_prior_file_layers() {
+    let dir = tempdir().expect("temporary directory");
+    let path = dir.path().join("app.toml");
+    fs::write(&path, "users = [{ token = \"seed-token\" }]\n").expect("write config file");
+
+    let loaded = ConfigLoader::new(DeferredArrayShapeConfig::default())
+        .with_file(FileSource::new(&path))
+        .patch(
+            "typed-patch",
+            &DeferredArrayItemPatch {
+                token: Some("patched-token".to_owned()),
+            },
+        )
+        .expect("patch layer is valid")
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.users,
+        serde_json::json!([{ "token": "patched-token" }])
+    );
+}
+
 #[cfg(feature = "clap")]
 #[test]
 fn typed_clap_overrides_preserve_array_shape_from_prior_typed_clap_layers() {
@@ -466,6 +496,46 @@ fn typed_clap_overrides_preserve_array_shape_from_prior_typed_clap_layers() {
         .explain("users[0].token")
         .expect("users[0].token explanation");
     assert_eq!(explanation.path, "users.0.token");
+}
+
+#[cfg(all(feature = "clap", feature = "toml"))]
+#[test]
+fn typed_clap_overrides_preserve_array_shape_from_prior_file_layers() {
+    let dir = tempdir().expect("temporary directory");
+    let path = dir.path().join("app.toml");
+    fs::write(&path, "users = [{ token = \"seed-token\" }]\n").expect("write config file");
+
+    let loaded = ConfigLoader::new(DeferredArrayShapeConfig::default())
+        .with_file(FileSource::new(&path))
+        .clap_overrides(&DeferredArrayItemPatch {
+            token: Some("patched-token".to_owned()),
+        })
+        .expect("typed clap overrides are valid")
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.users,
+        serde_json::json!([{ "token": "patched-token" }])
+    );
+}
+
+#[cfg(feature = "clap")]
+#[test]
+fn typed_clap_overrides_preserve_array_shape_from_prior_env_layers() {
+    let loaded = ConfigLoader::new(DeferredArrayShapeConfig::default())
+        .env(tier::EnvSource::from_pairs([("APP__USERS__0__token", "seed-token")]).prefix("APP"))
+        .clap_overrides(&DeferredArrayItemPatch {
+            token: Some("patched-token".to_owned()),
+        })
+        .expect("typed clap overrides are valid")
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.users,
+        serde_json::json!([{ "token": "patched-token" }])
+    );
 }
 
 #[test]

@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 #[cfg(any(feature = "json", feature = "toml", feature = "yaml"))]
 use crate::error::LineColumn;
 use crate::error::{ConfigError, UnknownField, ValidationError, ValidationErrors};
+use crate::patch::DeferredPatchLayer;
 use crate::report::{
     ConfigReport, ConfigWarning, DeprecatedField, ResolutionStep, canonicalize_path_with_aliases,
     collect_diff_paths, collect_paths, get_value_at_path, join_path, normalize_path,
@@ -626,23 +627,6 @@ impl Layer {
         patch.write_layer(&mut builder, "")?;
         Ok(builder.finish())
     }
-
-    pub(crate) fn from_patch_with_trace_and_shape<P>(
-        trace: SourceTrace,
-        patch: &P,
-        shape: Value,
-    ) -> Result<Self, ConfigError>
-    where
-        P: TierPatch,
-    {
-        let mut builder = crate::patch::PatchLayerBuilder::from_trace_with_shape(trace, shape);
-        patch.write_layer(&mut builder, "")?;
-        Ok(builder.finish())
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 struct NamedNormalizer<T> {
@@ -653,6 +637,11 @@ struct NamedNormalizer<T> {
 struct NamedValidator<T> {
     name: String,
     run: Validator<T>,
+}
+
+enum PendingCustomLayer {
+    Immediate(Layer),
+    DeferredPatch(DeferredPatchLayer),
 }
 
 #[derive(Debug, Clone)]
@@ -754,8 +743,8 @@ pub struct ConfigLoader<T> {
     files: Vec<FileSource>,
     env_sources: Vec<EnvSource>,
     args_source: Option<ArgsSource>,
-    custom_layers: Vec<Layer>,
-    typed_arg_layers: Vec<Layer>,
+    custom_layers: Vec<PendingCustomLayer>,
+    typed_arg_layers: Vec<DeferredPatchLayer>,
     metadata: ConfigMetadata,
     secret_paths: BTreeSet<String>,
     normalizers: Vec<NamedNormalizer<T>>,
@@ -921,7 +910,8 @@ where
 
     /// Adds a custom serializable layer.
     pub fn layer(mut self, layer: Layer) -> Self {
-        self.custom_layers.push(layer);
+        self.custom_layers
+            .push(PendingCustomLayer::Immediate(layer));
         self
     }
 
@@ -961,17 +951,16 @@ where
     where
         P: TierPatch,
     {
-        let layer = Layer::from_patch_with_trace_and_shape(
-            SourceTrace {
-                kind: SourceKind::Custom,
-                name: name.into(),
-                location: None,
-            },
-            patch,
-            self.custom_patch_shape_value()?,
-        )?;
+        let mut builder = crate::patch::PatchLayerBuilder::from_trace_deferred(SourceTrace {
+            kind: SourceKind::Custom,
+            name: name.into(),
+            location: None,
+        });
+        patch.write_layer(&mut builder, "")?;
+        let layer = builder.finish_deferred();
         if !layer.is_empty() {
-            self.custom_layers.push(layer);
+            self.custom_layers
+                .push(PendingCustomLayer::DeferredPatch(layer));
         }
         Ok(self)
     }
@@ -1025,51 +1014,17 @@ where
     where
         P: TierPatch,
     {
-        let layer = Layer::from_patch_with_trace_and_shape(
-            SourceTrace {
-                kind: SourceKind::Arguments,
-                name: "typed-clap".to_owned(),
-                location: None,
-            },
-            patch,
-            self.typed_arg_shape_value()?,
-        )?;
+        let mut builder = crate::patch::PatchLayerBuilder::from_trace_deferred(SourceTrace {
+            kind: SourceKind::Arguments,
+            name: "typed-clap".to_owned(),
+            location: None,
+        });
+        patch.write_layer(&mut builder, "")?;
+        let layer = builder.finish_deferred();
         if !layer.is_empty() {
             self.typed_arg_layers.push(layer);
         }
         Ok(self)
-    }
-
-    fn custom_patch_shape_value(&self) -> Result<Value, ConfigError> {
-        let mut shape = serde_json::to_value(&self.defaults)?;
-        ensure_root_object(&shape)?;
-        for layer in &self.custom_layers {
-            merge_values(
-                &mut shape,
-                layer.value.clone(),
-                "",
-                &self.metadata,
-                &layer.indexed_array_paths,
-                &layer.direct_array_paths,
-            );
-        }
-        Ok(shape)
-    }
-
-    #[cfg(feature = "clap")]
-    fn typed_arg_shape_value(&self) -> Result<Value, ConfigError> {
-        let mut shape = self.custom_patch_shape_value()?;
-        for layer in &self.typed_arg_layers {
-            merge_values(
-                &mut shape,
-                layer.value.clone(),
-                "",
-                &self.metadata,
-                &layer.indexed_array_paths,
-                &layer.direct_array_paths,
-            );
-        }
-        Ok(shape)
     }
 
     /// Marks a dot-delimited path as sensitive for report redaction.
@@ -1179,6 +1134,8 @@ where
             .as_ref()
             .and_then(|args| args.profile.clone())
             .or(self.profile);
+        let defaults_shape = serde_json::to_value(&self.defaults)?;
+        ensure_root_object(&defaults_shape)?;
 
         let mut layers = Vec::new();
         layers.push(canonicalize_layer_paths(
@@ -1200,7 +1157,14 @@ where
             }
         }
 
-        for layer in self.custom_layers {
+        for pending in self.custom_layers {
+            metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
+            let layer = match pending {
+                PendingCustomLayer::Immediate(layer) => layer,
+                PendingCustomLayer::DeferredPatch(patch) => patch.into_layer_with_shape(
+                    merged_shape_from_layers(&defaults_shape, &layers, &metadata)?,
+                )?,
+            };
             layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
@@ -1216,7 +1180,13 @@ where
             }
         }
 
-        for layer in self.typed_arg_layers {
+        for patch in self.typed_arg_layers {
+            metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
+            let layer = patch.into_layer_with_shape(merged_shape_from_layers(
+                &defaults_shape,
+                &layers,
+                &metadata,
+            )?)?;
             layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
@@ -2535,10 +2505,9 @@ fn is_valid_url(value: &str) -> bool {
     }
 
     if rest.starts_with('/') {
-        return scheme.eq_ignore_ascii_case("file")
-            && rest
-                .chars()
-                .all(|ch| !ch.is_whitespace() && !ch.is_control());
+        return rest
+            .chars()
+            .all(|ch| !ch.is_whitespace() && !ch.is_control());
     }
 
     rest.chars()
@@ -2551,15 +2520,14 @@ fn is_valid_url_scheme(scheme: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
 }
 
-fn is_valid_hierarchical_url(scheme: &str, authority_and_tail: &str) -> bool {
+fn is_valid_hierarchical_url(_scheme: &str, authority_and_tail: &str) -> bool {
     let split_at = authority_and_tail
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_tail.len());
     let (authority, tail) = authority_and_tail.split_at(split_at);
 
     if authority.is_empty() {
-        return scheme.eq_ignore_ascii_case("file")
-            && !tail.is_empty()
+        return !tail.is_empty()
             && tail
                 .chars()
                 .all(|ch| !ch.is_whitespace() && !ch.is_control());
@@ -3222,6 +3190,26 @@ fn value_kind(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
+}
+
+fn merged_shape_from_layers(
+    defaults: &Value,
+    layers: &[Layer],
+    metadata: &ConfigMetadata,
+) -> Result<Value, ConfigError> {
+    let mut shape = defaults.clone();
+    ensure_root_object(&shape)?;
+    for layer in layers {
+        merge_values(
+            &mut shape,
+            layer.value.clone(),
+            "",
+            metadata,
+            &layer.indexed_array_paths,
+            &layer.direct_array_paths,
+        );
+    }
+    Ok(shape)
 }
 
 fn merge_values(

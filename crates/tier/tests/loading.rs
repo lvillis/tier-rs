@@ -2316,6 +2316,7 @@ fn url_validation_accepts_common_absolute_url_forms_without_external_parser() {
     struct UrlValidationConfig {
         database_url: String,
         socket_url: String,
+        unix_socket_url: String,
         contact_url: String,
     }
 
@@ -2324,6 +2325,7 @@ fn url_validation_accepts_common_absolute_url_forms_without_external_parser() {
             Self {
                 database_url: "postgres://localhost/app".to_owned(),
                 socket_url: "file:///var/run/tier.sock".to_owned(),
+                unix_socket_url: "unix:///var/run/tier.sock".to_owned(),
                 contact_url: "mailto:ops@example.com".to_owned(),
             }
         }
@@ -2333,6 +2335,7 @@ fn url_validation_accepts_common_absolute_url_forms_without_external_parser() {
         .metadata(ConfigMetadata::from_fields([
             FieldMetadata::new("database_url").url(),
             FieldMetadata::new("socket_url").url(),
+            FieldMetadata::new("unix_socket_url").url(),
             FieldMetadata::new("contact_url").url(),
         ]))
         .load()

@@ -141,6 +141,25 @@ pub trait TierPatch {
     }
 }
 
+pub(crate) struct DeferredPatchLayer {
+    trace: SourceTrace,
+    writes: Vec<(String, Value)>,
+}
+
+impl DeferredPatchLayer {
+    pub(crate) fn into_layer_with_shape(self, shape: Value) -> Result<Layer, ConfigError> {
+        let mut builder = PatchLayerBuilder::from_trace_with_shape(self.trace, shape);
+        for (path, value) in self.writes {
+            builder.insert_value(&path, value)?;
+        }
+        Ok(builder.finish())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.writes.is_empty()
+    }
+}
+
 /// Hidden helper used by the `TierPatch` derive macro.
 #[doc(hidden)]
 pub struct PatchLayerBuilder {
@@ -153,6 +172,7 @@ pub struct PatchLayerBuilder {
     indexed_array_base_lengths: BTreeMap<String, usize>,
     current_array_lengths: BTreeMap<String, usize>,
     direct_array_paths: BTreeSet<String>,
+    deferred_writes: Option<Vec<(String, Value)>>,
 }
 
 impl PatchLayerBuilder {
@@ -172,6 +192,22 @@ impl PatchLayerBuilder {
         Self::from_trace_with_shape(trace, Value::Object(Map::new()))
     }
 
+    #[must_use]
+    pub(crate) fn from_trace_deferred(trace: SourceTrace) -> Self {
+        Self {
+            trace,
+            value: Value::Object(Map::new()),
+            shape: Value::Object(Map::new()),
+            entries: BTreeMap::new(),
+            claimed_paths: BTreeSet::new(),
+            indexed_array_paths: BTreeSet::new(),
+            indexed_array_base_lengths: BTreeMap::new(),
+            current_array_lengths: BTreeMap::new(),
+            direct_array_paths: BTreeSet::new(),
+            deferred_writes: Some(Vec::new()),
+        }
+    }
+
     /// Creates a builder from an explicit source trace and an existing shape.
     #[must_use]
     pub fn from_trace_with_shape(trace: SourceTrace, shape: Value) -> Self {
@@ -185,6 +221,7 @@ impl PatchLayerBuilder {
             indexed_array_base_lengths: BTreeMap::new(),
             current_array_lengths: BTreeMap::new(),
             direct_array_paths: BTreeSet::new(),
+            deferred_writes: None,
         }
     }
 
@@ -211,6 +248,10 @@ impl PatchLayerBuilder {
                 path: String::new(),
                 message: "configuration path cannot be empty".to_owned(),
             });
+        }
+        if let Some(writes) = &mut self.deferred_writes {
+            writes.push((path.to_owned(), value));
+            return Ok(());
         }
         let shape_snapshot = self.shape.clone();
         let (segments, array_segments) =
@@ -292,6 +333,13 @@ impl PatchLayerBuilder {
             self.indexed_array_base_lengths,
             self.direct_array_paths,
         )
+    }
+
+    pub(crate) fn finish_deferred(self) -> DeferredPatchLayer {
+        DeferredPatchLayer {
+            trace: self.trace,
+            writes: self.deferred_writes.unwrap_or_default(),
+        }
     }
 }
 
