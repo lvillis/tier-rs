@@ -580,6 +580,44 @@ fn prefixed_metadata_does_not_silently_fix_malformed_prefixes() {
 }
 
 #[test]
+fn prefixed_metadata_allows_empty_prefix_aliases_as_unprefixed_aliases() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct PrefixedAliasConfig {
+        service: PrefixedAliasService,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct PrefixedAliasService {
+        token: String,
+    }
+
+    let metadata = prefixed_metadata(
+        "service",
+        vec![String::new()],
+        ConfigMetadata::from_fields([FieldMetadata::new("token").secret()]),
+    );
+
+    let field = metadata
+        .field("token")
+        .expect("unprefixed alias should be preserved");
+    assert_eq!(field.path, "service.token");
+    assert!(field.aliases.iter().any(|alias| alias == "token"));
+
+    let loaded = ConfigLoader::new(PrefixedAliasConfig::default())
+        .metadata(metadata)
+        .args(ArgsSource::from_args(["--set", "token=alias-secret"]))
+        .load()
+        .expect("unprefixed alias should resolve at runtime");
+
+    assert_eq!(loaded.service.token, "alias-secret");
+    let explanation = loaded
+        .report()
+        .explain("service.token")
+        .or_else(|| loaded.report().explain("token"));
+    assert!(explanation.is_some());
+}
+
+#[test]
 fn root_paths_in_cross_field_checks_are_rejected() {
     let metadata = ConfigMetadata::default()
         .at_least_one_of(["."])

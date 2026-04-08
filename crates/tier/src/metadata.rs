@@ -1423,7 +1423,11 @@ pub fn prefixed_metadata(
                 continue;
             }
             for suffix in &alias_suffixes {
-                aliases.push(format!("{prefix_alias}.{suffix}"));
+                if prefix_alias.is_empty() {
+                    aliases.push(suffix.clone());
+                } else {
+                    aliases.push(format!("{prefix_alias}.{suffix}"));
+                }
             }
         }
 
