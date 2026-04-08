@@ -16,6 +16,15 @@ impl EnvSource {
             bindings,
             binding_conflicts,
         } = self;
+        for (name, binding) in &bindings {
+            if name.is_empty() {
+                return Err(ConfigError::InvalidEnv {
+                    name: name.clone(),
+                    path: binding.path.clone(),
+                    message: "environment variable names cannot be empty".to_owned(),
+                });
+            }
+        }
         if let Some(conflict) = binding_conflicts.into_iter().next() {
             let path = conflict.second.path.clone();
             return Err(ConfigError::InvalidEnv {
@@ -185,6 +194,13 @@ fn validate_binding_paths(
     alias_overrides: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
     for (name, binding) in bindings {
+        if name.is_empty() {
+            return Err(ConfigError::InvalidEnv {
+                name: name.clone(),
+                path: binding.path.clone(),
+                message: "environment variable names cannot be empty".to_owned(),
+            });
+        }
         canonical_env_target_path(name, &binding.path, alias_overrides)?;
     }
     Ok(())

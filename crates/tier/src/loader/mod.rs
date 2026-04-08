@@ -2543,6 +2543,7 @@ fn is_valid_url(value: &str) -> bool {
 
     if scheme == "mailto" {
         return !rest.starts_with('/')
+            && has_valid_percent_escapes(rest)
             && rest
                 .chars()
                 .all(|ch| !ch.is_whitespace() && !ch.is_control());
@@ -2554,6 +2555,7 @@ fn is_valid_url(value: &str) -> bool {
 
     if rest.starts_with('/') {
         return matches!(scheme, "file" | "unix")
+            && has_valid_percent_escapes(rest)
             && rest
                 .chars()
                 .all(|ch| !ch.is_whitespace() && !ch.is_control());
@@ -2577,14 +2579,25 @@ fn is_valid_hierarchical_url(scheme: &str, authority_and_tail: &str) -> bool {
     if authority.is_empty() {
         return matches!(scheme, "file" | "unix")
             && !tail.is_empty()
+            && has_valid_percent_escapes(tail)
             && tail
                 .chars()
                 .all(|ch| !ch.is_whitespace() && !ch.is_control());
     }
 
+    if !has_valid_percent_escapes(authority) || !has_valid_percent_escapes(tail) {
+        return false;
+    }
+
     let host_port = authority
         .rsplit_once('@')
-        .map_or(authority, |(_, host_port)| host_port);
+        .map_or(authority, |(userinfo, host_port)| {
+            if userinfo.is_empty() || userinfo.contains('@') || !is_valid_url_userinfo(userinfo) {
+                ""
+            } else {
+                host_port
+            }
+        });
     if !is_valid_url_host_port(host_port) {
         return false;
     }
@@ -2627,6 +2640,53 @@ fn parse_url_port(port: Option<&str>) -> Option<u16> {
         return None;
     }
     port.parse::<u16>().ok()
+}
+
+fn is_valid_url_userinfo(value: &str) -> bool {
+    value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '-' | '.'
+                    | '_'
+                    | '~'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+                    | ':'
+                    | '%'
+            )
+    })
+}
+
+fn has_valid_percent_escapes(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let Some(first) = bytes.get(index + 1) else {
+                return false;
+            };
+            let Some(second) = bytes.get(index + 2) else {
+                return false;
+            };
+            if !first.is_ascii_hexdigit() || !second.is_ascii_hexdigit() {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn is_valid_email(value: &str) -> bool {

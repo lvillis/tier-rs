@@ -245,6 +245,13 @@ impl ConfigMetadata {
             let Some(env) = &field.env else {
                 continue;
             };
+            if env.is_empty() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "explicit environment variable names cannot be empty".to_owned(),
+                });
+            }
+            validate_metadata_path(&field.path)?;
             if field.path.is_empty() {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
@@ -283,7 +290,9 @@ impl ConfigMetadata {
             .collect::<BTreeSet<_>>();
 
         for field in &self.fields {
+            validate_metadata_path(&field.path)?;
             for alias in &field.aliases {
+                validate_metadata_path(alias)?;
                 if alias.is_empty() {
                     return Err(ConfigError::MetadataInvalid {
                         path: alias.clone(),
@@ -436,6 +445,8 @@ impl ConfigMetadata {
     }
 
     pub(crate) fn validate_paths(&self) -> Result<(), ConfigError> {
+        let _ = self.env_overrides()?;
+
         for field in &self.fields {
             validate_metadata_path(&field.path)?;
             if field.path.is_empty() && !field.aliases.is_empty() {
@@ -449,6 +460,18 @@ impl ConfigMetadata {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
                     message: "merge strategies cannot target the root path".to_owned(),
+                });
+            }
+            if field.path.is_empty() && !field.validations.is_empty() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "validation rules cannot target the root path".to_owned(),
+                });
+            }
+            if field.path.is_empty() && field.deprecated.is_some() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "deprecation metadata cannot target the root path".to_owned(),
                 });
             }
             if field.env_decode.is_some() && field.path.is_empty() {
@@ -1209,7 +1232,14 @@ impl ValidationCheck {
     }
 
     fn prefixed(self, prefix: &str) -> Option<Self> {
-        let prefix = normalize_metadata_path(prefix);
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            try_normalize_metadata_path(prefix)
+                .ok()
+                .filter(|normalized| !normalized.is_empty())
+                .unwrap_or_else(|| prefix.to_owned())
+        };
         if prefix.is_empty() {
             return self.normalize();
         }
@@ -1417,7 +1447,14 @@ pub fn prefixed_metadata(
     prefix_aliases: Vec<String>,
     metadata: ConfigMetadata,
 ) -> ConfigMetadata {
-    let prefix = normalize_metadata_path(prefix);
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        try_normalize_metadata_path(prefix)
+            .ok()
+            .filter(|normalized| !normalized.is_empty())
+            .unwrap_or_else(|| prefix.to_owned())
+    };
     if prefix.is_empty() {
         return metadata;
     }

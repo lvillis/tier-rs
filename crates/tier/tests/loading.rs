@@ -580,6 +580,46 @@ fn prefixed_metadata_does_not_silently_fix_malformed_prefixes() {
 }
 
 #[test]
+fn prefixed_metadata_does_not_treat_root_like_prefixes_as_unprefixed_metadata() {
+    let metadata = prefixed_metadata(
+        ".",
+        Vec::new(),
+        ConfigMetadata::from_fields([FieldMetadata::new("password").secret()]),
+    );
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root-like prefixes should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, "..password");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
+fn prefixed_metadata_does_not_treat_root_like_prefixes_as_unprefixed_checks() {
+    let metadata = prefixed_metadata(
+        ".",
+        Vec::new(),
+        ConfigMetadata::default().required_if("users[0].enabled", true, ["users[0].password"]),
+    );
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root-like prefixes should fail fast for cross-field checks");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, "..users.0.enabled");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
 fn prefixed_metadata_allows_empty_prefix_aliases_as_unprefixed_aliases() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
     struct PrefixedAliasConfig {
@@ -743,6 +783,64 @@ fn alias_override_helpers_reject_root_alias_paths() {
     };
     assert_eq!(path, "legacy");
     assert!(message.contains("aliases cannot rewrite the root path"));
+}
+
+#[test]
+fn alias_override_helpers_reject_malformed_metadata_paths() {
+    let malformed_canonical =
+        ConfigMetadata::from_fields([FieldMetadata::new(".users[0].password").alias("legacy")]);
+    let error = malformed_canonical
+        .alias_overrides()
+        .expect_err("malformed canonical alias paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".users[0].password");
+    assert!(message.contains("invalid metadata path"));
+
+    let malformed_alias =
+        ConfigMetadata::from_fields([FieldMetadata::new("users.0.password").alias(".legacy.")]);
+    let error = malformed_alias
+        .alias_overrides()
+        .expect_err("malformed alias paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".legacy.");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
+fn env_override_helpers_reject_malformed_metadata_paths() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new(".users[0].password").env("APP_PASSWORD")]);
+
+    let error = metadata
+        .env_overrides()
+        .expect_err("malformed metadata env paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".users[0].password");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
+fn env_override_helpers_reject_empty_env_names() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new("proxy.url").env("")]);
+
+    let error = metadata
+        .env_overrides()
+        .expect_err("empty explicit env names should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, "proxy.url");
+    assert!(message.contains("explicit environment variable names cannot be empty"));
 }
 
 #[test]
@@ -1227,6 +1325,40 @@ fn root_metadata_merge_strategies_are_rejected() {
 
     assert!(path.is_empty());
     assert!(message.contains("merge strategies cannot target the root path"));
+}
+
+#[test]
+fn root_metadata_validation_rules_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new(".").non_empty()]);
+
+    let error = ConfigLoader::new(StringValueConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root metadata validation rules should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("validation rules cannot target the root path"));
+}
+
+#[test]
+fn root_metadata_deprecations_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new(".").deprecated("legacy root")]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root metadata deprecations should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("deprecation metadata cannot target the root path"));
 }
 
 #[test]
@@ -1780,6 +1912,21 @@ fn invalid_explicit_env_binding_paths_are_rejected_even_when_unset() {
     let message = error.to_string();
     assert!(message.contains("HTTP_PROXY"));
     assert!(message.contains("environment binding path cannot be empty"));
+}
+
+#[test]
+fn empty_explicit_env_binding_names_are_rejected_even_when_unset() {
+    let error = ConfigLoader::new(ProxyCompatConfig::default())
+        .env(
+            EnvSource::from_pairs([("UNRELATED", "1")])
+                .with_alias("", "proxy.url")
+                .with_fallback("", "no_proxy"),
+        )
+        .load()
+        .expect_err("empty explicit env names should fail fast");
+
+    let message = error.to_string();
+    assert!(message.contains("environment variable names cannot be empty"));
 }
 
 #[test]
@@ -2803,6 +2950,112 @@ fn url_validation_rejects_hierarchical_urls_without_authority() {
 }
 
 #[test]
+fn url_validation_rejects_authorities_with_multiple_unescaped_at_signs() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct UrlValidationConfig {
+        malformed_database_url: String,
+    }
+
+    impl Default for UrlValidationConfig {
+        fn default() -> Self {
+            Self {
+                malformed_database_url: "postgres://user@@localhost/app".to_owned(),
+            }
+        }
+    }
+
+    let error = ConfigLoader::new(UrlValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([FieldMetadata::new(
+            "malformed_database_url",
+        )
+        .url()]))
+        .load()
+        .expect_err("multiple unescaped @ signs in authority should fail");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+    assert_eq!(errors.len(), 1);
+    let error = errors.iter().next().expect("validation error");
+    assert_eq!(error.path, "malformed_database_url");
+    assert_eq!(error.rule.as_deref(), Some("url"));
+}
+
+#[test]
+fn url_validation_rejects_invalid_userinfo_characters() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct UrlValidationConfig {
+        malformed_database_url: String,
+    }
+
+    impl Default for UrlValidationConfig {
+        fn default() -> Self {
+            Self {
+                malformed_database_url: "postgres://user|name@localhost/app".to_owned(),
+            }
+        }
+    }
+
+    let error = ConfigLoader::new(UrlValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([FieldMetadata::new(
+            "malformed_database_url",
+        )
+        .url()]))
+        .load()
+        .expect_err("invalid userinfo characters in authority should fail");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+    assert_eq!(errors.len(), 1);
+    let error = errors.iter().next().expect("validation error");
+    assert_eq!(error.path, "malformed_database_url");
+    assert_eq!(error.rule.as_deref(), Some("url"));
+}
+
+#[test]
+fn url_validation_rejects_invalid_percent_escapes() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct UrlValidationConfig {
+        path_escape: String,
+        query_escape: String,
+        mailto_escape: String,
+    }
+
+    impl Default for UrlValidationConfig {
+        fn default() -> Self {
+            Self {
+                path_escape: "https://example.com/%zz".to_owned(),
+                query_escape: "https://example.com/search?q=%4G".to_owned(),
+                mailto_escape: "mailto:ops%zz@example.com".to_owned(),
+            }
+        }
+    }
+
+    let error = ConfigLoader::new(UrlValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("path_escape").url(),
+            FieldMetadata::new("query_escape").url(),
+            FieldMetadata::new("mailto_escape").url(),
+        ]))
+        .load()
+        .expect_err("invalid percent escapes should fail URL validation");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+    assert_eq!(errors.len(), 3);
+    assert!(
+        errors
+            .iter()
+            .all(|error| error.rule.as_deref() == Some("url"))
+    );
+    assert!(errors.iter().any(|error| error.path == "path_escape"));
+    assert!(errors.iter().any(|error| error.path == "query_escape"));
+    assert!(errors.iter().any(|error| error.path == "mailto_escape"));
+}
+
+#[test]
 fn email_validation_accepts_bracketed_ip_literals_and_rejects_bare_ip_domains() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct EmailValidationConfig {
@@ -3321,6 +3574,53 @@ fn root_explicit_env_names_are_rejected() {
 
     assert!(path.is_empty());
     assert!(message.contains("explicit environment variable names cannot target the root path"));
+}
+
+#[test]
+fn root_explicit_env_names_are_rejected_even_without_env_sources() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new(".").env("APP_CONFIG")]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root explicit env names should fail even without env sources");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("explicit environment variable names cannot target the root path"));
+}
+
+#[test]
+fn duplicate_explicit_env_names_are_rejected_even_without_env_sources() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("db.url").env("DATABASE_URL"),
+        FieldMetadata::new("db.password").env("DATABASE_URL"),
+    ]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("duplicate explicit env names should fail even without env sources");
+
+    let ConfigError::MetadataConflict {
+        kind,
+        name,
+        first_path,
+        second_path,
+    } = error
+    else {
+        panic!("expected metadata conflict error");
+    };
+
+    assert_eq!(kind, "environment variable");
+    assert_eq!(name, "DATABASE_URL");
+    assert_eq!(
+        [first_path.as_str(), second_path.as_str()],
+        ["db.password", "db.url"]
+    );
 }
 
 #[test]
