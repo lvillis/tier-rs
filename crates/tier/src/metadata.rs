@@ -284,6 +284,18 @@ impl ConfigMetadata {
 
         for field in &self.fields {
             for alias in &field.aliases {
+                if alias.is_empty() {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: alias.clone(),
+                        message: "aliases cannot target the root path".to_owned(),
+                    });
+                }
+                if field.path.is_empty() {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: alias.clone(),
+                        message: "aliases cannot rewrite the root path".to_owned(),
+                    });
+                }
                 if !alias_mapping_is_lossless(alias, &field.path) {
                     return Err(ConfigError::MetadataInvalid {
                         path: alias.clone(),
@@ -426,6 +438,19 @@ impl ConfigMetadata {
     pub(crate) fn validate_paths(&self) -> Result<(), ConfigError> {
         for field in &self.fields {
             validate_metadata_path(&field.path)?;
+            if field.path.is_empty() && !field.aliases.is_empty() {
+                let alias = field.aliases.first().cloned().unwrap_or_default();
+                return Err(ConfigError::MetadataInvalid {
+                    path: alias,
+                    message: "aliases cannot rewrite the root path".to_owned(),
+                });
+            }
+            if field.path.is_empty() && field.merge != MergeStrategy::Merge {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "merge strategies cannot target the root path".to_owned(),
+                });
+            }
             if field.env_decode.is_some() && field.path.is_empty() {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
@@ -434,6 +459,12 @@ impl ConfigMetadata {
             }
             for alias in &field.aliases {
                 validate_metadata_path(alias)?;
+                if alias.is_empty() {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: alias.clone(),
+                        message: "aliases cannot target the root path".to_owned(),
+                    });
+                }
             }
         }
 
@@ -467,7 +498,7 @@ impl ConfigMetadata {
                 .aliases
                 .into_iter()
                 .map(|alias| normalize_metadata_path(&alias))
-                .filter(|alias| !alias.is_empty() && alias != &field.path)
+                .filter(|alias| alias != &field.path)
                 .collect();
             field.aliases.sort();
             field.aliases.dedup();
@@ -1392,7 +1423,16 @@ pub fn prefixed_metadata(
     }
     let prefix_aliases = prefix_aliases
         .into_iter()
-        .map(|alias| normalize_metadata_path(&alias))
+        .map(|alias| {
+            if alias.is_empty() {
+                alias
+            } else {
+                try_normalize_metadata_path(&alias)
+                    .ok()
+                    .filter(|normalized| !normalized.is_empty())
+                    .unwrap_or(alias)
+            }
+        })
         .collect::<Vec<_>>();
 
     let mut prefixed = ConfigMetadata::from_fields(metadata.fields.into_iter().map(|field| {

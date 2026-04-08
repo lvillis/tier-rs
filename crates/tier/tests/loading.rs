@@ -618,6 +618,26 @@ fn prefixed_metadata_allows_empty_prefix_aliases_as_unprefixed_aliases() {
 }
 
 #[test]
+fn prefixed_metadata_does_not_treat_root_like_prefix_aliases_as_unprefixed_aliases() {
+    let metadata = prefixed_metadata(
+        "service",
+        vec![".".to_owned()],
+        ConfigMetadata::from_fields([FieldMetadata::new("token").secret()]),
+    );
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root-like prefix aliases should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, "..token");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
 fn root_paths_in_cross_field_checks_are_rejected() {
     let metadata = ConfigMetadata::default()
         .at_least_one_of(["."])
@@ -698,6 +718,31 @@ fn metadata_lookups_accept_alias_paths_including_wildcards() {
 
     assert!(metadata.field(".users[0].legacyPassword").is_none());
     assert_eq!(metadata.merge_strategy_for("server.legacyTokens."), None);
+}
+
+#[test]
+fn alias_override_helpers_reject_root_alias_paths() {
+    let target_root = ConfigMetadata::from_fields([FieldMetadata::new("server").alias(".")]);
+    let error = target_root
+        .alias_overrides()
+        .expect_err("root aliases should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert!(path.is_empty());
+    assert!(message.contains("aliases cannot target the root path"));
+
+    let rewrite_root = ConfigMetadata::from_fields([FieldMetadata::new(".").alias("legacy")]);
+    let error = rewrite_root
+        .alias_overrides()
+        .expect_err("root canonical paths should not accept aliases");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, "legacy");
+    assert!(message.contains("aliases cannot rewrite the root path"));
 }
 
 #[test]
@@ -1156,6 +1201,49 @@ fn root_metadata_env_decoders_are_rejected() {
 
     assert!(path.is_empty());
     assert!(message.contains("environment decoder paths cannot target the root path"));
+}
+
+#[test]
+fn root_metadata_merge_strategies_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new(".").merge_strategy(MergeStrategy::Replace)
+    ]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .layer(
+            Layer::custom(
+                "overlay",
+                serde_json::json!({ "server": { "host": "0.0.0.0" } }),
+            )
+            .unwrap(),
+        )
+        .load()
+        .expect_err("root metadata merge strategies should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("merge strategies cannot target the root path"));
+}
+
+#[test]
+fn root_alias_paths_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new("server").alias(".")]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root aliases should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("aliases cannot target the root path"));
 }
 
 #[test]
