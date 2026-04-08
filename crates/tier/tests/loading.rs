@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::tempdir;
 
+use tier::metadata::prefixed_metadata;
 use tier::{
     ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, ConfigWarning, EnvDecoder, EnvSource,
     FieldMetadata, FileFormat, FileSource, Layer, MergeStrategy, REPORT_FORMAT_VERSION, SourceKind,
@@ -559,6 +560,26 @@ fn cross_field_checks_with_leading_or_trailing_dots_are_rejected() {
 }
 
 #[test]
+fn prefixed_metadata_does_not_silently_fix_malformed_prefixes() {
+    let metadata = prefixed_metadata(
+        ".users[00].",
+        vec![".legacy.".to_owned()],
+        ConfigMetadata::from_fields([FieldMetadata::new("password").secret()]),
+    );
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("malformed prefixed metadata should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+    assert_eq!(path, ".users[00]..password");
+    assert!(message.contains("invalid metadata path"));
+}
+
+#[test]
 fn root_paths_in_cross_field_checks_are_rejected() {
     let metadata = ConfigMetadata::default()
         .at_least_one_of(["."])
@@ -636,6 +657,9 @@ fn metadata_lookups_accept_alias_paths_including_wildcards() {
         .expect("wildcard alias metadata lookup");
     assert_eq!(password.path, "users.*.password");
     assert!(password.secret);
+
+    assert!(metadata.field(".users[0].legacyPassword").is_none());
+    assert_eq!(metadata.merge_strategy_for("server.legacyTokens."), None);
 }
 
 #[test]
@@ -2587,31 +2611,50 @@ fn url_validation_accepts_common_absolute_url_forms_without_external_parser() {
 fn url_validation_rejects_hierarchical_urls_without_authority() {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct UrlValidationConfig {
-        service_url: String,
+        triple_slash_url: String,
+        single_slash_url: String,
+        opaque_http_url: String,
+        hierarchical_mailto_url: String,
     }
 
     impl Default for UrlValidationConfig {
         fn default() -> Self {
             Self {
-                service_url: "http:///missing-host".to_owned(),
+                triple_slash_url: "http:///missing-host".to_owned(),
+                single_slash_url: "http:/missing-host".to_owned(),
+                opaque_http_url: "http:missing-host".to_owned(),
+                hierarchical_mailto_url: "mailto://ops@example.com".to_owned(),
             }
         }
     }
 
     let error = ConfigLoader::new(UrlValidationConfig::default())
-        .metadata(ConfigMetadata::from_fields([FieldMetadata::new(
-            "service_url",
-        )
-        .url()]))
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("triple_slash_url").url(),
+            FieldMetadata::new("single_slash_url").url(),
+            FieldMetadata::new("opaque_http_url").url(),
+            FieldMetadata::new("hierarchical_mailto_url").url(),
+        ]))
         .load()
         .expect_err("hierarchical URLs without authority should fail");
 
     let ConfigError::DeclaredValidation { errors } = error else {
         panic!("expected declared validation error");
     };
-    let error = errors.iter().next().expect("url validation error");
-    assert_eq!(error.path, "service_url");
-    assert_eq!(error.rule.as_deref(), Some("url"));
+    assert_eq!(errors.len(), 4);
+    assert!(
+        errors
+            .iter()
+            .all(|error| error.rule.as_deref() == Some("url"))
+    );
+    assert!(errors.iter().any(|error| error.path == "triple_slash_url"));
+    assert!(errors.iter().any(|error| error.path == "single_slash_url"));
+    assert!(errors.iter().any(|error| error.path == "opaque_http_url"));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.path == "hierarchical_mailto_url")
+    );
 }
 
 #[test]

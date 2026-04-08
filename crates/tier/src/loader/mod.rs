@@ -2541,18 +2541,25 @@ fn is_valid_url(value: &str) -> bool {
         return false;
     }
 
+    if scheme == "mailto" {
+        return !rest.starts_with('/')
+            && rest
+                .chars()
+                .all(|ch| !ch.is_whitespace() && !ch.is_control());
+    }
+
     if let Some(authority_and_tail) = rest.strip_prefix("//") {
         return is_valid_hierarchical_url(scheme, authority_and_tail);
     }
 
     if rest.starts_with('/') {
-        return rest
-            .chars()
-            .all(|ch| !ch.is_whitespace() && !ch.is_control());
+        return matches!(scheme, "file" | "unix")
+            && rest
+                .chars()
+                .all(|ch| !ch.is_whitespace() && !ch.is_control());
     }
 
-    rest.chars()
-        .all(|ch| !ch.is_whitespace() && !ch.is_control())
+    false
 }
 
 fn is_valid_url_scheme(scheme: &str) -> bool {

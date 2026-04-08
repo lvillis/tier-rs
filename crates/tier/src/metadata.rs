@@ -86,7 +86,7 @@ impl ConfigMetadata {
     /// Returns the metadata entry for a normalized configuration path or alias.
     #[must_use]
     pub fn field(&self, path: &str) -> Option<&FieldMetadata> {
-        let normalized = normalize_metadata_path(path);
+        let normalized = try_normalize_metadata_path(path).ok()?;
         let mut best = None::<(MetadataMatchScore, &FieldMetadata)>;
         for field in &self.fields {
             for candidate in
@@ -352,7 +352,7 @@ impl ConfigMetadata {
     /// Resolves the effective merge strategy for a concrete configuration path.
     #[must_use]
     pub fn merge_strategy_for(&self, path: &str) -> Option<MergeStrategy> {
-        let normalized = normalize_metadata_path(path);
+        let normalized = try_normalize_metadata_path(path).ok()?;
         if normalized.is_empty() {
             return None;
         }
@@ -1380,10 +1380,14 @@ pub fn prefixed_metadata(
     prefix_aliases: Vec<String>,
     metadata: ConfigMetadata,
 ) -> ConfigMetadata {
-    let prefix = normalize_path(prefix);
+    let prefix = normalize_metadata_path(prefix);
     if prefix.is_empty() {
         return metadata;
     }
+    let prefix_aliases = prefix_aliases
+        .into_iter()
+        .map(|alias| normalize_metadata_path(&alias))
+        .collect::<Vec<_>>();
 
     let mut prefixed = ConfigMetadata::from_fields(metadata.fields.into_iter().map(|field| {
         let canonical_suffix = field.path.clone();
