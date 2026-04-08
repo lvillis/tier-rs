@@ -1140,6 +1140,25 @@ fn env_decoders_reject_unrepresentable_nested_object_keys() {
 }
 
 #[test]
+fn root_metadata_env_decoders_are_rejected() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new(".").env_decoder(EnvDecoder::Csv)]);
+
+    let error = ConfigLoader::new(StructuredEnvConfig::default())
+        .metadata(metadata)
+        .env(EnvSource::from_pairs([("APP__NO_PROXY", "localhost,.internal")]).prefix("APP"))
+        .load()
+        .expect_err("root metadata env decoders should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("environment decoder paths cannot target the root path"));
+}
+
+#[test]
 fn env_decoder_paths_are_canonicalized_through_alias_metadata() {
     let metadata = ConfigMetadata::from_fields([
         FieldMetadata::new("proxy.no_proxy").alias("proxy.legacy_no_proxy")

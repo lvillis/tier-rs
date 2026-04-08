@@ -426,6 +426,12 @@ impl ConfigMetadata {
     pub(crate) fn validate_paths(&self) -> Result<(), ConfigError> {
         for field in &self.fields {
             validate_metadata_path(&field.path)?;
+            if field.env_decode.is_some() && field.path.is_empty() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "environment decoder paths cannot target the root path".to_owned(),
+                });
+            }
             for alias in &field.aliases {
                 validate_metadata_path(alias)?;
             }
