@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "toml")]
 use tier::config_example_toml;
 use tier::{
-    ConfigLoader, ConfigMetadata, EnvDocOptions, FieldMetadata, MergeStrategy, Secret,
-    TierMetadata, ValidationRule, annotated_json_schema_for, config_example_for, env_docs_for,
-    env_docs_json, env_docs_markdown, env_docs_report_json, json_schema_for,
+    ConfigLoader, ConfigMetadata, EnvDocOptions, FieldMetadata, MergeStrategy,
+    SCHEMA_EXPORT_FORMAT_VERSION, Secret, TierMetadata, ValidationRule, annotated_json_schema_for,
+    annotated_json_schema_report_json, config_example_for, config_example_report_json,
+    env_docs_for, env_docs_json, env_docs_markdown, env_docs_report_json, json_schema_for,
+    json_schema_report_json,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -20,6 +22,7 @@ struct SchemaConfig {
     secrets: SchemaSecrets,
     website: String,
     contact_email: String,
+    worker_count: u16,
     tags: Vec<String>,
 }
 
@@ -344,6 +347,7 @@ impl TierMetadata for SchemaConfig {
                 .doc("Operations contact address")
                 .example("ops@example.com")
                 .email(),
+            FieldMetadata::new("worker_count").multiple_of(4),
             FieldMetadata::new("tags").unique_items(),
         ])
         .required_if("server.port", 8080, ["server.host"])
@@ -2280,6 +2284,9 @@ fn annotated_schema_includes_tier_metadata_extensions() {
     let contact_email_rules = schema["properties"]["contact_email"]["x-tier-validate"]
         .as_array()
         .expect("contact_email validation rules");
+    let worker_count_rules = schema["properties"]["worker_count"]["x-tier-validate"]
+        .as_array()
+        .expect("worker_count validation rules");
 
     assert!(rendered.contains("\"x-tier-env\":\"APP_SERVER_HOSTNAME\""));
     assert!(rendered.contains("\"x-tier-aliases\":[\"server.hostname\"]"));
@@ -2302,6 +2309,9 @@ fn annotated_schema_includes_tier_metadata_extensions() {
             .iter()
             .any(|rule| rule.as_str() == Some("Email"))
     );
+    assert!(worker_count_rules.iter().any(|rule| {
+        rule["MultipleOf"]["Finite"].as_u64() == Some(4) || rule["MultipleOf"].as_u64() == Some(4)
+    }));
     assert!(rendered.contains("\"x-tier-checks\""));
     assert!(rendered.contains("\"x-tier-deprecated-note\":\"use server.bind_port instead\""));
 }
@@ -2685,6 +2695,30 @@ fn generates_environment_docs_from_schema() {
         docs_report["entries"].as_array().map(Vec::len),
         Some(docs.len())
     );
+}
+
+#[test]
+fn versioned_schema_and_example_exports_are_structured() {
+    let schema_report = json_schema_report_json::<SchemaConfig>();
+    assert_eq!(
+        schema_report["format_version"].as_u64(),
+        Some(SCHEMA_EXPORT_FORMAT_VERSION as u64)
+    );
+    assert_eq!(schema_report["schema"]["type"].as_str(), Some("object"));
+
+    let annotated_report = annotated_json_schema_report_json::<SchemaConfig>();
+    assert_eq!(
+        annotated_report["format_version"].as_u64(),
+        Some(SCHEMA_EXPORT_FORMAT_VERSION as u64)
+    );
+    assert!(annotated_report["schema"]["properties"]["website"]["x-tier-validate"].is_array());
+
+    let example_report = config_example_report_json::<SchemaConfig>();
+    assert_eq!(
+        example_report["format_version"].as_u64(),
+        Some(SCHEMA_EXPORT_FORMAT_VERSION as u64)
+    );
+    assert!(example_report["example"].is_object());
 }
 
 #[test]

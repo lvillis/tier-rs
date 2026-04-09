@@ -61,8 +61,12 @@ pub use crate::schema::config_example_toml;
 #[cfg(feature = "schema")]
 #[cfg_attr(docsrs, doc(cfg(feature = "schema")))]
 pub use crate::schema::{
-    JsonSchema, annotated_json_schema_for, annotated_json_schema_pretty, config_example_for,
-    config_example_pretty, json_schema_for, json_schema_pretty,
+    ConfigExampleReport, JsonSchema, JsonSchemaReport, SCHEMA_EXPORT_FORMAT_VERSION,
+    annotated_json_schema_for, annotated_json_schema_pretty, annotated_json_schema_report,
+    annotated_json_schema_report_json, annotated_json_schema_report_json_pretty,
+    config_example_for, config_example_pretty, config_example_report, config_example_report_json,
+    config_example_report_json_pretty, json_schema_for, json_schema_pretty, json_schema_report,
+    json_schema_report_json, json_schema_report_json_pretty,
 };
 pub use crate::secret::Secret;
 #[cfg(feature = "derive")]

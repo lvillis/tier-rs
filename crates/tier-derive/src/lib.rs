@@ -584,6 +584,7 @@ struct TierAttrs {
     max_items: Option<usize>,
     min_properties: Option<usize>,
     max_properties: Option<usize>,
+    multiple_of: Option<NumericLiteral>,
     pattern: Option<String>,
     unique_items: bool,
     one_of: Vec<Expr>,
@@ -614,6 +615,7 @@ impl TierAttrs {
             || self.max_items.is_some()
             || self.min_properties.is_some()
             || self.max_properties.is_some()
+            || self.multiple_of.is_some()
             || self.pattern.is_some()
             || self.unique_items
             || !self.one_of.is_empty()
@@ -906,6 +908,10 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
             }
             if meta.path.is_ident("max_properties") {
                 attrs.max_properties = Some(parse_usize_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("multiple_of") {
+                attrs.multiple_of = Some(parse_numeric_literal(meta)?);
                 return Ok(());
             }
             if meta.path.is_ident("pattern") {
@@ -1448,6 +1454,15 @@ fn validate_validation_attrs(attrs: &TierAttrs, field_ident: &syn::Ident) -> syn
         ));
     }
 
+    if let Some(multiple_of) = &attrs.multiple_of
+        && !(multiple_of.value.is_finite() && multiple_of.value > 0.0)
+    {
+        return Err(syn::Error::new_spanned(
+            field_ident,
+            "tier(multiple_of = ...) must be greater than 0",
+        ));
+    }
+
     if attrs.pattern.as_deref() == Some("") {
         return Err(syn::Error::new_spanned(
             field_ident,
@@ -1894,6 +1909,10 @@ fn direct_field_metadata_tokens(
     }
     if let Some(max_properties) = attrs.max_properties {
         builder = quote! { #builder.max_properties(#max_properties) };
+    }
+    if let Some(multiple_of) = &attrs.multiple_of {
+        let multiple_of = &multiple_of.tokens;
+        builder = quote! { #builder.multiple_of(#multiple_of) };
     }
     if let Some(pattern) = &attrs.pattern {
         let pattern = LitStr::new(pattern, field_name.span());

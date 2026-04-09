@@ -12,6 +12,27 @@ use self::toml::render_example_toml;
 /// Re-export of `schemars::JsonSchema` used by `tier` schema helpers.
 pub use schemars::JsonSchema;
 
+/// Stable version tag for machine-readable schema and example export payloads.
+pub const SCHEMA_EXPORT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Versioned machine-readable JSON Schema payload.
+pub struct JsonSchemaReport {
+    /// Stable schema version for external consumers.
+    pub format_version: u32,
+    /// Exported JSON Schema document.
+    pub schema: Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Versioned machine-readable example configuration payload.
+pub struct ConfigExampleReport {
+    /// Stable schema version for external consumers.
+    pub format_version: u32,
+    /// Generated example configuration value.
+    pub example: Value,
+}
+
 /// Exports the JSON Schema for a configuration type.
 ///
 /// # Examples
@@ -46,6 +67,38 @@ where
 {
     serde_json::to_string_pretty(&json_schema_for::<T>())
         .unwrap_or_else(|_| "{\"error\":\"failed to render schema\"}".to_owned())
+}
+
+/// Exports the JSON Schema in a versioned machine-readable wrapper.
+#[must_use]
+pub fn json_schema_report<T>() -> JsonSchemaReport
+where
+    T: JsonSchema,
+{
+    JsonSchemaReport {
+        format_version: SCHEMA_EXPORT_FORMAT_VERSION,
+        schema: json_schema_for::<T>(),
+    }
+}
+
+/// Renders the versioned JSON Schema export as JSON.
+#[must_use]
+pub fn json_schema_report_json<T>() -> Value
+where
+    T: JsonSchema,
+{
+    serde_json::to_value(json_schema_report::<T>())
+        .unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+/// Renders the versioned JSON Schema export as pretty JSON.
+#[must_use]
+pub fn json_schema_report_json_pretty<T>() -> String
+where
+    T: JsonSchema,
+{
+    serde_json::to_string_pretty(&json_schema_report_json::<T>())
+        .unwrap_or_else(|_| "{\"error\":\"failed to render schema report\"}".to_owned())
 }
 
 /// Exports the JSON Schema for a configuration type annotated with `tier` metadata.
@@ -98,6 +151,38 @@ where
         .unwrap_or_else(|_| "{\"error\":\"failed to render schema\"}".to_owned())
 }
 
+/// Exports the annotated JSON Schema in a versioned machine-readable wrapper.
+#[must_use]
+pub fn annotated_json_schema_report<T>() -> JsonSchemaReport
+where
+    T: JsonSchema + TierMetadata,
+{
+    JsonSchemaReport {
+        format_version: SCHEMA_EXPORT_FORMAT_VERSION,
+        schema: annotated_json_schema_for::<T>(),
+    }
+}
+
+/// Renders the versioned annotated JSON Schema export as JSON.
+#[must_use]
+pub fn annotated_json_schema_report_json<T>() -> Value
+where
+    T: JsonSchema + TierMetadata,
+{
+    serde_json::to_value(annotated_json_schema_report::<T>())
+        .unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+/// Renders the versioned annotated JSON Schema export as pretty JSON.
+#[must_use]
+pub fn annotated_json_schema_report_json_pretty<T>() -> String
+where
+    T: JsonSchema + TierMetadata,
+{
+    serde_json::to_string_pretty(&annotated_json_schema_report_json::<T>())
+        .unwrap_or_else(|_| "{\"error\":\"failed to render schema report\"}".to_owned())
+}
+
 /// Generates a machine-readable example configuration value from schema and metadata.
 ///
 /// # Examples
@@ -139,6 +224,38 @@ where
 {
     serde_json::to_string_pretty(&config_example_for::<T>())
         .unwrap_or_else(|_| "{\"error\":\"failed to render example config\"}".to_owned())
+}
+
+/// Exports the generated example configuration in a versioned wrapper.
+#[must_use]
+pub fn config_example_report<T>() -> ConfigExampleReport
+where
+    T: JsonSchema + TierMetadata,
+{
+    ConfigExampleReport {
+        format_version: SCHEMA_EXPORT_FORMAT_VERSION,
+        example: config_example_for::<T>(),
+    }
+}
+
+/// Renders the versioned example export as JSON.
+#[must_use]
+pub fn config_example_report_json<T>() -> Value
+where
+    T: JsonSchema + TierMetadata,
+{
+    serde_json::to_value(config_example_report::<T>())
+        .unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+/// Renders the versioned example export as pretty JSON.
+#[must_use]
+pub fn config_example_report_json_pretty<T>() -> String
+where
+    T: JsonSchema + TierMetadata,
+{
+    serde_json::to_string_pretty(&config_example_report_json::<T>())
+        .unwrap_or_else(|_| "{\"error\":\"failed to render example report\"}".to_owned())
 }
 
 #[cfg(feature = "toml")]

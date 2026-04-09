@@ -710,6 +710,12 @@ impl FieldMetadata {
         self.validate(ValidationRule::MaxProperties(max))
     }
 
+    /// Requires the field to be an exact multiple of `factor`.
+    #[must_use]
+    pub fn multiple_of(self, factor: impl Into<ValidationNumber>) -> Self {
+        self.validate(ValidationRule::MultipleOf(factor.into()))
+    }
+
     /// Requires the field to match a regular expression.
     #[must_use]
     pub fn pattern(self, pattern: impl Into<String>) -> Self {
@@ -1084,6 +1090,8 @@ pub enum ValidationRule {
     MinProperties(usize),
     /// The field must be an object with at most the given number of properties.
     MaxProperties(usize),
+    /// The field must be a numeric multiple of the given factor.
+    MultipleOf(ValidationNumber),
     /// The field must match the given regular expression.
     Pattern(String),
     /// The field must be an array whose items are unique.
@@ -1118,6 +1126,7 @@ impl ValidationRule {
             Self::MaxItems(_) => "max_items",
             Self::MinProperties(_) => "min_properties",
             Self::MaxProperties(_) => "max_properties",
+            Self::MultipleOf(_) => "multiple_of",
             Self::Pattern(_) => "pattern",
             Self::UniqueItems => "unique_items",
             Self::OneOf(_) => "one_of",
@@ -1143,6 +1152,7 @@ impl Display for ValidationRule {
             Self::MaxItems(value) => write!(f, "max_items={value}"),
             Self::MinProperties(value) => write!(f, "min_properties={value}"),
             Self::MaxProperties(value) => write!(f, "max_properties={value}"),
+            Self::MultipleOf(value) => write!(f, "multiple_of={value}"),
             Self::Pattern(value) => write!(f, "pattern={value:?}"),
             Self::UniqueItems => write!(f, "unique_items"),
             Self::OneOf(values) => write!(

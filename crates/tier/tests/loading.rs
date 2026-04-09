@@ -3136,6 +3136,7 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
         state_dir: String,
         proxies: Vec<String>,
         labels: std::collections::BTreeMap<String, String>,
+        worker_count: u16,
         tags: Vec<String>,
     }
 
@@ -3165,6 +3166,7 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
                         "region".to_owned(),
                         "cn".to_owned(),
                     )]),
+                    worker_count: 8,
                     tags: vec!["edge".to_owned()],
                 },
             }
@@ -3187,6 +3189,7 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
             .min_properties(1)
             .max_properties(2)
             .merge_strategy(MergeStrategy::Replace),
+        FieldMetadata::new("runtime.worker_count").multiple_of(4),
         FieldMetadata::new("runtime.tags").unique_items(),
     ])
     .exactly_one_of(["endpoint.port", "endpoint.unix_socket"])
@@ -3214,6 +3217,8 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
         "runtime.proxies=[]",
         "--set",
         "runtime.labels={}",
+        "--set",
+        "runtime.worker_count=10",
         "--set",
         r#"runtime.tags=["edge","edge"]"#,
         "--set",
@@ -3283,6 +3288,11 @@ fn declared_validation_supports_cross_field_checks_and_extended_rules() {
         errors
             .iter()
             .any(|error| error.rule.as_deref() == Some("min_properties"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("multiple_of"))
     );
     assert!(
         errors

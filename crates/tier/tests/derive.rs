@@ -106,6 +106,8 @@ struct DerivedValidationConfig {
     ports: Vec<u16>,
     #[tier(min_properties = 1, max_properties = 3)]
     labels: BTreeMap<String, String>,
+    #[tier(multiple_of = 4)]
+    worker_count: u16,
     #[tier(unique_items)]
     tags: Vec<String>,
     #[tier(one_of("memory", "redis"), non_empty)]
@@ -772,6 +774,14 @@ fn derive_metadata_collects_declared_validation_rules() {
             ValidationRule::MinProperties(1),
             ValidationRule::MaxProperties(3),
         ]
+    );
+
+    let worker_count = metadata
+        .field("worker_count")
+        .expect("worker_count metadata");
+    assert_eq!(
+        worker_count.validations,
+        vec![ValidationRule::MultipleOf(4u8.into())]
     );
 
     let tags = metadata.field("tags").expect("tags metadata");

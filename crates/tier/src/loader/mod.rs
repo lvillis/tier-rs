@@ -2039,6 +2039,56 @@ fn validate_declared_rule(
                 Some(Value::Number((*max as u64).into())),
             )),
         },
+        ValidationRule::MultipleOf(factor) if !factor.is_finite() => Some(validation_error(
+            path,
+            actual,
+            rule,
+            secret_paths,
+            &format!("declared multiple_of factor must be finite, got {factor}"),
+            Some(factor.as_json_value()),
+        )),
+        ValidationRule::MultipleOf(factor) => {
+            let Some(divisor) = factor.as_f64() else {
+                return Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    &format!("declared multiple_of factor must be finite, got {factor}"),
+                    Some(factor.as_json_value()),
+                ));
+            };
+            if divisor <= 0.0 {
+                return Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "declared multiple_of factor must be > 0",
+                    Some(factor.as_json_value()),
+                ));
+            }
+
+            match actual.as_f64() {
+                Some(value) if is_multiple_of(value, divisor) => None,
+                Some(_) => Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    &format!("must be a multiple of {factor}"),
+                    Some(factor.as_json_value()),
+                )),
+                None => Some(validation_error(
+                    path,
+                    actual,
+                    rule,
+                    secret_paths,
+                    "must be a numeric value",
+                    Some(factor.as_json_value()),
+                )),
+            }
+        }
         ValidationRule::Pattern(pattern) => {
             let Some(value) = actual.as_str() else {
                 return Some(validation_error(
@@ -2273,6 +2323,17 @@ fn validation_length(value: &Value) -> Option<usize> {
         Value::Object(values) => Some(values.len()),
         _ => None,
     }
+}
+
+fn is_multiple_of(value: f64, factor: f64) -> bool {
+    if !value.is_finite() || !factor.is_finite() || factor <= 0.0 {
+        return false;
+    }
+
+    let quotient = value / factor;
+    let nearest = quotient.round();
+    let tolerance = f64::EPSILON * 16.0 * quotient.abs().max(1.0);
+    (quotient - nearest).abs() <= tolerance
 }
 
 fn validation_error(
