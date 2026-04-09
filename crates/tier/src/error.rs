@@ -337,6 +337,20 @@ pub enum ConfigError {
         canonical_path: String,
     },
 
+    /// A source attempted to write to a field that restricts allowed source kinds.
+    #[error(
+        "source {trace} is not allowed to set `{path}`; allowed sources: {allowed}",
+        allowed = format_source_kind_list(allowed_sources)
+    )]
+    SourcePolicyViolation {
+        /// Concrete path rejected by the source policy.
+        path: String,
+        /// Actual source attempting to set the path.
+        trace: SourceTrace,
+        /// Allowed source kinds for the path.
+        allowed_sources: Vec<crate::loader::SourceKind>,
+    },
+
     /// A serialized object key could not be represented in tier's dot-delimited path model.
     #[error(
         "configuration object key `{key}` under {location} cannot be represented in tier paths: {message}",
@@ -472,6 +486,14 @@ fn format_path_location(path: &str) -> String {
     } else {
         format!("`{path}`")
     }
+}
+
+fn format_source_kind_list(kinds: &[crate::loader::SourceKind]) -> String {
+    kinds
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn deserialize_source_suffix(provenance: &Option<SourceTrace>) -> String {

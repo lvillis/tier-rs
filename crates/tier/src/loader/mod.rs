@@ -39,7 +39,9 @@ type Normalizer<T> = Box<dyn Fn(&mut T) -> Result<(), String> + Send + Sync>;
 type Validator<T> = Box<dyn Fn(&T) -> Result<(), ValidationErrors> + Send + Sync>;
 type CustomEnvDecoder = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 /// Kind of source that contributed configuration values.
 pub enum SourceKind {
     /// Values originating from in-code defaults.
@@ -1224,6 +1226,7 @@ where
         for layer in layers {
             string_coercion_paths.extend(layer.coercible_string_paths.iter().cloned());
             validate_indexed_array_paths(&merged, &layer)?;
+            enforce_source_policies(&layer, &metadata)?;
             report.record_source(layer.trace.clone());
             record_layer_steps(&mut report, &layer, &secret_paths);
             record_deprecation_warnings(&mut report, &layer, &metadata);
@@ -1458,6 +1461,28 @@ fn normalize_secret_registration_paths(
             Ok(normalized)
         })
         .collect()
+}
+
+fn enforce_source_policies(layer: &Layer, metadata: &ConfigMetadata) -> Result<(), ConfigError> {
+    for (path, trace) in &layer.entries {
+        let Some(field) = metadata.field(path) else {
+            continue;
+        };
+        let Some(allowed_sources) = &field.allowed_sources else {
+            continue;
+        };
+        if allowed_sources.contains(&trace.kind) {
+            continue;
+        }
+
+        return Err(ConfigError::SourcePolicyViolation {
+            path: path.clone(),
+            trace: trace.clone(),
+            allowed_sources: allowed_sources.iter().copied().collect(),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_indexed_array_paths(base: &Value, layer: &Layer) -> Result<(), ConfigError> {

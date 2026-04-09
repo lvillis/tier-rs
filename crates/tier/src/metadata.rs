@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::ConfigError;
+use crate::loader::SourceKind;
 use crate::report::{canonicalize_path_with_aliases, normalize_path, path_matches_pattern};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -462,6 +463,20 @@ impl ConfigMetadata {
                     message: "merge strategies cannot target the root path".to_owned(),
                 });
             }
+            if field.path.is_empty() && field.allowed_sources.is_some() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "source policies cannot target the root path".to_owned(),
+                });
+            }
+            if let Some(allowed_sources) = &field.allowed_sources
+                && allowed_sources.is_empty()
+            {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "source policies must allow at least one source kind".to_owned(),
+                });
+            }
             if field.path.is_empty() && !field.validations.is_empty() {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
@@ -560,6 +575,10 @@ pub struct FieldMetadata {
     pub has_default: bool,
     /// Strategy used when merging layered values into this field.
     pub merge: MergeStrategy,
+    /// Source kinds allowed to override this field.
+    ///
+    /// When unset, the field accepts values from any source kind.
+    pub allowed_sources: Option<BTreeSet<SourceKind>>,
     /// Declarative validation rules applied after normalization.
     pub validations: Vec<ValidationRule>,
 }
@@ -579,6 +598,7 @@ impl FieldMetadata {
             deprecated: None,
             has_default: false,
             merge: MergeStrategy::Merge,
+            allowed_sources: None,
             validations: Vec::new(),
         }
     }
@@ -646,6 +666,20 @@ impl FieldMetadata {
     #[must_use]
     pub fn merge_strategy(mut self, merge: MergeStrategy) -> Self {
         self.merge = merge;
+        self
+    }
+
+    /// Restricts the field to a specific set of source kinds.
+    ///
+    /// This is useful for fields that should only be loaded from selected
+    /// layers, such as requiring secrets to come from environment variables or
+    /// disallowing file-based overrides for a path.
+    #[must_use]
+    pub fn allow_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = SourceKind>,
+    {
+        self.allowed_sources = Some(sources.into_iter().collect());
         self
     }
 
@@ -800,6 +834,9 @@ impl FieldMetadata {
         if other.merge != MergeStrategy::Merge || self.merge == MergeStrategy::Merge {
             self.merge = other.merge;
         }
+        if let Some(allowed_sources) = other.allowed_sources {
+            self.allowed_sources = Some(allowed_sources);
+        }
         for rule in other.validations {
             if !self.validations.contains(&rule) {
                 self.validations.push(rule);
@@ -817,6 +854,7 @@ impl FieldMetadata {
             && self.deprecated.is_none()
             && !self.has_default
             && self.merge == MergeStrategy::Merge
+            && self.allowed_sources.is_none()
             && self.validations.is_empty()
     }
 }

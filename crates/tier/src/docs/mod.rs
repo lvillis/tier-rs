@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use crate::{
-    ConfigMetadata, FieldMetadata, JsonSchema, MergeStrategy, TierMetadata, ValidationRule,
-    json_schema_for,
+    ConfigMetadata, FieldMetadata, JsonSchema, MergeStrategy, SourceKind, TierMetadata,
+    ValidationRule, json_schema_for,
     schema::{dynamic_object_placeholder_for_schema, required_contains_additional_items_for_docs},
 };
 
@@ -13,7 +13,7 @@ mod collect;
 use self::collect::*;
 
 /// Stable version tag for machine-readable environment documentation payloads.
-pub const ENV_DOCS_FORMAT_VERSION: u32 = 1;
+pub const ENV_DOCS_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// A single schema-derived environment variable documentation row.
@@ -44,6 +44,10 @@ pub struct EnvDocEntry {
     pub has_default: bool,
     /// Merge policy applied when multiple layers target this field.
     pub merge: MergeStrategy,
+    /// Source kinds allowed to override this field.
+    ///
+    /// An empty list means the field does not restrict its allowed sources.
+    pub allowed_sources: Vec<SourceKind>,
     /// Declarative validation rules applied to this field.
     pub validations: Vec<ValidationRule>,
 }
@@ -384,6 +388,9 @@ fn apply_field_metadata(
         if field.merge != MergeStrategy::Merge {
             entry.merge = field.merge;
         }
+        if let Some(allowed_sources) = &field.allowed_sources {
+            entry.allowed_sources = allowed_sources.iter().copied().collect::<Vec<_>>();
+        }
         for rule in &field.validations {
             if !entry.validations.contains(rule) {
                 entry.validations.push(rule.clone());
@@ -441,6 +448,9 @@ fn merge_env_doc_entry(existing: &mut EnvDocEntry, incoming: EnvDocEntry) {
     }
     if existing.merge == MergeStrategy::Merge && incoming.merge != MergeStrategy::Merge {
         existing.merge = incoming.merge;
+    }
+    if !incoming.allowed_sources.is_empty() {
+        existing.allowed_sources = incoming.allowed_sources;
     }
     for rule in incoming.validations {
         if !existing.validations.contains(&rule) {

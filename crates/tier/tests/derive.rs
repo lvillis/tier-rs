@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use tier::{
-    ArgsSource, ConfigLoader, ConfigMetadata, EnvSource, FieldMetadata, MergeStrategy, Secret,
-    TierConfig, TierMetadata, ValidationCheck, ValidationRule,
+    ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, EnvSource, FieldMetadata, MergeStrategy,
+    Secret, SourceKind, TierConfig, TierMetadata, ValidationCheck, ValidationRule,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
@@ -154,6 +154,32 @@ struct DerivedTlsValidationConfig {
     enabled: bool,
     cert: Option<String>,
     key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+#[tier(at_least_one_of_expr(
+    tier::path!(DerivedExprCrossValidationConfig.port),
+    tier::path!(DerivedExprCrossValidationConfig.unix_socket)
+))]
+#[tier(required_if(
+    path_expr = tier::path!(DerivedExprCrossValidationConfig.tls.enabled),
+    equals = true,
+    requires_expr(
+        tier::path!(DerivedExprCrossValidationConfig.tls.cert),
+        tier::path!(DerivedExprCrossValidationConfig.tls.key)
+    )
+))]
+struct DerivedExprCrossValidationConfig {
+    port: Option<u16>,
+    unix_socket: Option<String>,
+    tls: DerivedTlsValidationConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq, Default)]
+struct DerivedSourcePolicyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[tier(sources("env", "cli"))]
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TierConfig, PartialEq, Eq)]
@@ -827,6 +853,72 @@ fn derive_metadata_collects_cross_field_validation_checks() {
                 requires: vec!["tls.cert".to_owned(), "tls.key".to_owned()],
             },
         ]
+    );
+}
+
+#[test]
+fn derive_metadata_supports_checked_path_container_validations() {
+    let metadata = DerivedExprCrossValidationConfig::metadata();
+
+    assert_eq!(
+        metadata.checks(),
+        &[
+            ValidationCheck::AtLeastOneOf {
+                paths: vec!["port".to_owned(), "unix_socket".to_owned()],
+            },
+            ValidationCheck::RequiredIf {
+                path: "tls.enabled".to_owned(),
+                equals: true.into(),
+                requires: vec!["tls.cert".to_owned(), "tls.key".to_owned()],
+            },
+        ]
+    );
+}
+
+#[test]
+fn checked_path_container_validations_enforce_runtime_behavior() {
+    let error = ConfigLoader::new(DerivedExprCrossValidationConfig {
+        port: None,
+        unix_socket: None,
+        tls: DerivedTlsValidationConfig {
+            enabled: true,
+            cert: None,
+            key: None,
+        },
+    })
+    .derive_metadata()
+    .load()
+    .expect_err("missing checked-path requirements should fail");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.rule.as_deref() == Some("at_least_one_of"))
+    );
+    assert!(errors.iter().any(|error| {
+        error.rule.as_deref() == Some("required_if")
+            && error.path.is_empty()
+            && error.related_paths
+                == vec![
+                    "tls.enabled".to_owned(),
+                    "tls.cert".to_owned(),
+                    "tls.key".to_owned(),
+                ]
+    }));
+}
+
+#[test]
+fn derive_metadata_supports_source_policies() {
+    let metadata = DerivedSourcePolicyConfig::metadata();
+    let token = metadata.field("token").expect("token metadata");
+
+    assert_eq!(
+        token.allowed_sources.as_ref().expect("source policy"),
+        &std::collections::BTreeSet::from([SourceKind::Environment, SourceKind::Arguments,])
     );
 }
 

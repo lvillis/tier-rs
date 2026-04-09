@@ -570,6 +570,7 @@ fn generate_leaf_patch_tokens(
 struct TierAttrs {
     secret: bool,
     leaf: bool,
+    sources: Vec<TierSourceKind>,
     env: Option<String>,
     doc: Option<String>,
     example: Option<String>,
@@ -601,6 +602,7 @@ impl TierAttrs {
     fn has_any(&self) -> bool {
         self.secret
             || self.leaf
+            || !self.sources.is_empty()
             || self.env.is_some()
             || self.doc.is_some()
             || self.example.is_some()
@@ -647,19 +649,69 @@ struct NumericLiteral {
     value: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TierSourceKind {
+    Default,
+    File,
+    Environment,
+    Arguments,
+    Normalization,
+    Custom,
+}
+
+impl TierSourceKind {
+    fn parse(value: &str, span: proc_macro2::Span) -> syn::Result<Self> {
+        match value {
+            "default" => Ok(Self::Default),
+            "file" => Ok(Self::File),
+            "env" | "environment" => Ok(Self::Environment),
+            "cli" | "arguments" => Ok(Self::Arguments),
+            "normalize" | "normalization" => Ok(Self::Normalization),
+            "custom" => Ok(Self::Custom),
+            _ => Err(syn::Error::new(
+                span,
+                "unsupported tier source kind, expected default|file|env|cli|normalize|custom",
+            )),
+        }
+    }
+
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Default => quote! { ::tier::SourceKind::Default },
+            Self::File => quote! { ::tier::SourceKind::File },
+            Self::Environment => quote! { ::tier::SourceKind::Environment },
+            Self::Arguments => quote! { ::tier::SourceKind::Arguments },
+            Self::Normalization => quote! { ::tier::SourceKind::Normalization },
+            Self::Custom => quote! { ::tier::SourceKind::Custom },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ContainerPathSpec {
+    String(String),
+    Expr(Expr),
+}
+
+#[derive(Debug, Clone)]
+enum ContainerPathListSpec {
+    Strings(Vec<String>),
+    Exprs(Vec<Expr>),
+}
+
 #[derive(Debug, Clone)]
 enum ContainerValidationCheck {
-    AtLeastOneOf(Vec<String>),
-    ExactlyOneOf(Vec<String>),
-    MutuallyExclusive(Vec<String>),
+    AtLeastOneOf(ContainerPathListSpec),
+    ExactlyOneOf(ContainerPathListSpec),
+    MutuallyExclusive(ContainerPathListSpec),
     RequiredWith {
-        path: String,
-        requires: Vec<String>,
+        path: ContainerPathSpec,
+        requires: ContainerPathListSpec,
     },
     RequiredIf {
-        path: String,
+        path: ContainerPathSpec,
         equals: Expr,
-        requires: Vec<String>,
+        requires: ContainerPathListSpec,
     },
 }
 
@@ -849,6 +901,10 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
                 consume_unused_meta(meta)?;
                 return Ok(());
             }
+            if meta.path.is_ident("sources") {
+                attrs.sources = parse_source_kind_list(meta)?;
+                return Ok(());
+            }
             if meta.path.is_ident("env") {
                 attrs.env = Some(parse_string_value(meta)?);
                 return Ok(());
@@ -1004,13 +1060,25 @@ fn parse_tier_container_attrs(attributes: &[Attribute]) -> syn::Result<TierConta
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("at_least_one_of") {
                 attrs.checks.push(ContainerValidationCheck::AtLeastOneOf(
-                    parse_string_list_call(meta)?,
+                    ContainerPathListSpec::Strings(parse_string_list_call(meta)?),
+                ));
+                return Ok(());
+            }
+            if meta.path.is_ident("at_least_one_of_expr") {
+                attrs.checks.push(ContainerValidationCheck::AtLeastOneOf(
+                    ContainerPathListSpec::Exprs(parse_expr_list_call(meta)?),
                 ));
                 return Ok(());
             }
             if meta.path.is_ident("exactly_one_of") {
                 attrs.checks.push(ContainerValidationCheck::ExactlyOneOf(
-                    parse_string_list_call(meta)?,
+                    ContainerPathListSpec::Strings(parse_string_list_call(meta)?),
+                ));
+                return Ok(());
+            }
+            if meta.path.is_ident("exactly_one_of_expr") {
+                attrs.checks.push(ContainerValidationCheck::ExactlyOneOf(
+                    ContainerPathListSpec::Exprs(parse_expr_list_call(meta)?),
                 ));
                 return Ok(());
             }
@@ -1018,7 +1086,15 @@ fn parse_tier_container_attrs(attributes: &[Attribute]) -> syn::Result<TierConta
                 attrs
                     .checks
                     .push(ContainerValidationCheck::MutuallyExclusive(
-                        parse_string_list_call(meta)?,
+                        ContainerPathListSpec::Strings(parse_string_list_call(meta)?),
+                    ));
+                return Ok(());
+            }
+            if meta.path.is_ident("mutually_exclusive_expr") {
+                attrs
+                    .checks
+                    .push(ContainerValidationCheck::MutuallyExclusive(
+                        ContainerPathListSpec::Exprs(parse_expr_list_call(meta)?),
                     ));
                 return Ok(());
             }
@@ -1497,48 +1573,36 @@ fn container_check_tokens(attrs: &TierContainerAttrs) -> Vec<proc_macro2::TokenS
         .iter()
         .map(|check| match check {
             ContainerValidationCheck::AtLeastOneOf(paths) => {
-                let path_lits = paths
-                    .iter()
-                    .map(|path| LitStr::new(path, proc_macro2::Span::call_site()))
-                    .collect::<Vec<_>>();
+                let paths = container_paths_tokens(paths);
                 quote! {
                     metadata.push_check(::tier::ValidationCheck::AtLeastOneOf {
-                        paths: ::std::vec![#(::std::string::String::from(#path_lits)),*],
+                        paths: #paths,
                     });
                 }
             }
             ContainerValidationCheck::ExactlyOneOf(paths) => {
-                let path_lits = paths
-                    .iter()
-                    .map(|path| LitStr::new(path, proc_macro2::Span::call_site()))
-                    .collect::<Vec<_>>();
+                let paths = container_paths_tokens(paths);
                 quote! {
                     metadata.push_check(::tier::ValidationCheck::ExactlyOneOf {
-                        paths: ::std::vec![#(::std::string::String::from(#path_lits)),*],
+                        paths: #paths,
                     });
                 }
             }
             ContainerValidationCheck::MutuallyExclusive(paths) => {
-                let path_lits = paths
-                    .iter()
-                    .map(|path| LitStr::new(path, proc_macro2::Span::call_site()))
-                    .collect::<Vec<_>>();
+                let paths = container_paths_tokens(paths);
                 quote! {
                     metadata.push_check(::tier::ValidationCheck::MutuallyExclusive {
-                        paths: ::std::vec![#(::std::string::String::from(#path_lits)),*],
+                        paths: #paths,
                     });
                 }
             }
             ContainerValidationCheck::RequiredWith { path, requires } => {
-                let path = LitStr::new(path, proc_macro2::Span::call_site());
-                let requires = requires
-                    .iter()
-                    .map(|item| LitStr::new(item, proc_macro2::Span::call_site()))
-                    .collect::<Vec<_>>();
+                let path = container_path_tokens(path);
+                let requires = container_paths_tokens(requires);
                 quote! {
                     metadata.push_check(::tier::ValidationCheck::RequiredWith {
-                        path: ::std::string::String::from(#path),
-                        requires: ::std::vec![#(::std::string::String::from(#requires)),*],
+                        path: #path,
+                        requires: #requires,
                     });
                 }
             }
@@ -1547,21 +1611,43 @@ fn container_check_tokens(attrs: &TierContainerAttrs) -> Vec<proc_macro2::TokenS
                 equals,
                 requires,
             } => {
-                let path = LitStr::new(path, proc_macro2::Span::call_site());
-                let requires = requires
-                    .iter()
-                    .map(|item| LitStr::new(item, proc_macro2::Span::call_site()))
-                    .collect::<Vec<_>>();
+                let path = container_path_tokens(path);
+                let requires = container_paths_tokens(requires);
                 quote! {
                     metadata.push_check(::tier::ValidationCheck::RequiredIf {
-                        path: ::std::string::String::from(#path),
+                        path: #path,
                         equals: ::tier::ValidationValue::from(#equals),
-                        requires: ::std::vec![#(::std::string::String::from(#requires)),*],
+                        requires: #requires,
                     });
                 }
             }
         })
         .collect()
+}
+
+fn container_path_tokens(path: &ContainerPathSpec) -> proc_macro2::TokenStream {
+    match path {
+        ContainerPathSpec::String(path) => {
+            let path = LitStr::new(path, proc_macro2::Span::call_site());
+            quote! { ::std::string::String::from(#path) }
+        }
+        ContainerPathSpec::Expr(path) => quote! { ::std::string::String::from(#path) },
+    }
+}
+
+fn container_paths_tokens(paths: &ContainerPathListSpec) -> proc_macro2::TokenStream {
+    match paths {
+        ContainerPathListSpec::Strings(paths) => {
+            let paths = paths
+                .iter()
+                .map(|path| LitStr::new(path, proc_macro2::Span::call_site()))
+                .collect::<Vec<_>>();
+            quote! { ::std::vec![#(::std::string::String::from(#paths)),*] }
+        }
+        ContainerPathListSpec::Exprs(paths) => {
+            quote! { ::std::vec![#(::std::string::String::from(#paths)),*] }
+        }
+    }
 }
 
 fn supports_append_strategy(ty: &Type) -> bool {
@@ -1643,6 +1729,26 @@ fn parse_string_list_call(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<V
         return Err(meta.error("expected at least one string literal"));
     }
     Ok(values.into_iter().map(|value| value.value()).collect())
+}
+
+fn parse_expr_list_call(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<Vec<Expr>> {
+    let content;
+    syn::parenthesized!(content in meta.input);
+    let values = Punctuated::<Expr, syn::Token![,]>::parse_terminated(&content)?;
+    if values.is_empty() {
+        return Err(meta.error("expected at least one expression"));
+    }
+    Ok(values.into_iter().collect())
+}
+
+fn parse_source_kind_list(
+    meta: syn::meta::ParseNestedMeta<'_>,
+) -> syn::Result<Vec<TierSourceKind>> {
+    let span = meta.path.span();
+    parse_string_list_call(meta)?
+        .into_iter()
+        .map(|value| TierSourceKind::parse(&value, span))
+        .collect()
 }
 
 fn parse_literal_expr_list(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<Vec<Expr>> {
@@ -1743,26 +1849,56 @@ fn validate_value_expr(expr: &Expr, span: proc_macro2::Span) -> syn::Result<()> 
 fn parse_required_with_container_check(
     meta: syn::meta::ParseNestedMeta<'_>,
 ) -> syn::Result<ContainerValidationCheck> {
-    let mut path = None;
-    let mut requires = Vec::new();
+    let mut path = None::<ContainerPathSpec>;
+    let mut requires = None::<ContainerPathListSpec>;
     meta.parse_nested_meta(|nested| {
         if nested.path.is_ident("path") {
-            path = Some(parse_string_value(nested)?);
+            if path.is_some() {
+                return Err(nested.error(
+                    "required_with supports either `path = ...` or `path_expr = ...`, not both",
+                ));
+            }
+            path = Some(ContainerPathSpec::String(parse_string_value(nested)?));
+            return Ok(());
+        }
+        if nested.path.is_ident("path_expr") {
+            if path.is_some() {
+                return Err(nested.error(
+                    "required_with supports either `path = ...` or `path_expr = ...`, not both",
+                ));
+            }
+            path = Some(ContainerPathSpec::Expr(parse_expr_value(nested)?));
             return Ok(());
         }
         if nested.path.is_ident("requires") {
-            requires = parse_string_list_call(nested)?;
+            if requires.is_some() {
+                return Err(nested.error(
+                    "required_with supports either `requires(...)` or `requires_expr(...)`, not both",
+                ));
+            }
+            requires = Some(ContainerPathListSpec::Strings(parse_string_list_call(nested)?));
+            return Ok(());
+        }
+        if nested.path.is_ident("requires_expr") {
+            if requires.is_some() {
+                return Err(nested.error(
+                    "required_with supports either `requires(...)` or `requires_expr(...)`, not both",
+                ));
+            }
+            requires = Some(ContainerPathListSpec::Exprs(parse_expr_list_call(nested)?));
             return Ok(());
         }
         Err(nested.error("unsupported required_with option"))
     })?;
 
     let Some(path) = path else {
-        return Err(meta.error("required_with requires `path = \"...\"`"));
+        return Err(meta.error("required_with requires `path = \"...\"` or `path_expr = ...`"));
     };
-    if requires.is_empty() {
-        return Err(meta.error("required_with requires `requires(\"...\")`"));
-    }
+    let Some(requires) = requires else {
+        return Err(
+            meta.error("required_with requires `requires(\"...\")` or `requires_expr(...)`")
+        );
+    };
 
     Ok(ContainerValidationCheck::RequiredWith { path, requires })
 }
@@ -1770,12 +1906,26 @@ fn parse_required_with_container_check(
 fn parse_required_if_container_check(
     meta: syn::meta::ParseNestedMeta<'_>,
 ) -> syn::Result<ContainerValidationCheck> {
-    let mut path = None;
+    let mut path = None::<ContainerPathSpec>;
     let mut equals = None;
-    let mut requires = Vec::new();
+    let mut requires = None::<ContainerPathListSpec>;
     meta.parse_nested_meta(|nested| {
         if nested.path.is_ident("path") {
-            path = Some(parse_string_value(nested)?);
+            if path.is_some() {
+                return Err(nested.error(
+                    "required_if supports either `path = ...` or `path_expr = ...`, not both",
+                ));
+            }
+            path = Some(ContainerPathSpec::String(parse_string_value(nested)?));
+            return Ok(());
+        }
+        if nested.path.is_ident("path_expr") {
+            if path.is_some() {
+                return Err(nested.error(
+                    "required_if supports either `path = ...` or `path_expr = ...`, not both",
+                ));
+            }
+            path = Some(ContainerPathSpec::Expr(parse_expr_value(nested)?));
             return Ok(());
         }
         if nested.path.is_ident("equals") {
@@ -1783,21 +1933,37 @@ fn parse_required_if_container_check(
             return Ok(());
         }
         if nested.path.is_ident("requires") {
-            requires = parse_string_list_call(nested)?;
+            if requires.is_some() {
+                return Err(nested.error(
+                    "required_if supports either `requires(...)` or `requires_expr(...)`, not both",
+                ));
+            }
+            requires = Some(ContainerPathListSpec::Strings(parse_string_list_call(
+                nested,
+            )?));
+            return Ok(());
+        }
+        if nested.path.is_ident("requires_expr") {
+            if requires.is_some() {
+                return Err(nested.error(
+                    "required_if supports either `requires(...)` or `requires_expr(...)`, not both",
+                ));
+            }
+            requires = Some(ContainerPathListSpec::Exprs(parse_expr_list_call(nested)?));
             return Ok(());
         }
         Err(nested.error("unsupported required_if option"))
     })?;
 
     let Some(path) = path else {
-        return Err(meta.error("required_if requires `path = \"...\"`"));
+        return Err(meta.error("required_if requires `path = \"...\"` or `path_expr = ...`"));
     };
     let Some(equals) = equals else {
         return Err(meta.error("required_if requires `equals = ...`"));
     };
-    if requires.is_empty() {
-        return Err(meta.error("required_if requires `requires(\"...\")`"));
-    }
+    let Some(requires) = requires else {
+        return Err(meta.error("required_if requires `requires(\"...\")` or `requires_expr(...)`"));
+    };
 
     Ok(ContainerValidationCheck::RequiredIf {
         path,
@@ -1880,6 +2046,14 @@ fn direct_field_metadata_tokens(
             }
         };
         builder = quote! { #builder.merge_strategy(#merge_strategy) };
+    }
+    if !attrs.sources.is_empty() {
+        let sources = attrs
+            .sources
+            .iter()
+            .map(|source| source.tokens())
+            .collect::<Vec<_>>();
+        builder = quote! { #builder.allow_sources([#(#sources),*]) };
     }
     if attrs.non_empty {
         builder = quote! { #builder.non_empty() };

@@ -13,7 +13,7 @@ use self::toml::render_example_toml;
 pub use schemars::JsonSchema;
 
 /// Stable version tag for machine-readable schema and example export payloads.
-pub const SCHEMA_EXPORT_FORMAT_VERSION: u32 = 1;
+pub const SCHEMA_EXPORT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 /// Versioned machine-readable JSON Schema payload.
@@ -374,6 +374,13 @@ fn annotate_schema_node(node: &mut Value, field: &FieldMetadata) {
         "x-tier-merge".to_owned(),
         Value::String(field.merge.to_string()),
     );
+    if let Some(allowed_sources) = &field.allowed_sources {
+        let sources = allowed_sources
+            .iter()
+            .map(|source| Value::String(source.to_string()))
+            .collect::<Vec<_>>();
+        object.insert("x-tier-sources".to_owned(), Value::Array(sources));
+    }
     if !field.validations.is_empty() {
         object.insert(
             "x-tier-validate".to_owned(),

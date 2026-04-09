@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "toml")]
 use tier::config_example_toml;
 use tier::{
-    ConfigLoader, ConfigMetadata, EnvDocOptions, FieldMetadata, MergeStrategy,
-    SCHEMA_EXPORT_FORMAT_VERSION, Secret, TierMetadata, ValidationRule, annotated_json_schema_for,
-    annotated_json_schema_report_json, config_example_for, config_example_report_json,
-    env_docs_for, env_docs_json, env_docs_markdown, env_docs_report_json, json_schema_for,
-    json_schema_report_json,
+    ConfigLoader, ConfigMetadata, ENV_DOCS_FORMAT_VERSION, EnvDocOptions, FieldMetadata,
+    MergeStrategy, SCHEMA_EXPORT_FORMAT_VERSION, Secret, SourceKind, TierMetadata, ValidationRule,
+    annotated_json_schema_for, annotated_json_schema_report_json, config_example_for,
+    config_example_report_json, env_docs_for, env_docs_json, env_docs_markdown,
+    env_docs_report_json, json_schema_for, json_schema_report_json,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -342,6 +342,7 @@ impl TierMetadata for SchemaConfig {
             FieldMetadata::new("website")
                 .doc("Public service URL")
                 .example("https://api.example.com")
+                .allow_sources([SourceKind::Environment, SourceKind::Arguments])
                 .url(),
             FieldMetadata::new("contact_email")
                 .doc("Operations contact address")
@@ -2304,6 +2305,10 @@ fn annotated_schema_includes_tier_metadata_extensions() {
             .iter()
             .any(|rule| rule.as_str() == Some("Url"))
     );
+    assert_eq!(
+        schema["properties"]["website"]["x-tier-sources"],
+        serde_json::json!(["env", "cli"])
+    );
     assert!(
         contact_email_rules
             .iter()
@@ -2589,6 +2594,7 @@ fn generates_environment_docs_from_schema() {
             && entry.env == "APP__WEBSITE"
             && entry.description.as_deref() == Some("Public service URL")
             && entry.example.as_deref() == Some("https://api.example.com")
+            && entry.allowed_sources == vec![SourceKind::Environment, SourceKind::Arguments]
             && entry.validations == vec![ValidationRule::Url]
     }));
     assert!(docs.iter().any(|entry| {
@@ -2690,7 +2696,10 @@ fn generates_environment_docs_from_schema() {
     }));
 
     let docs_report = env_docs_report_json::<SchemaConfig>(&EnvDocOptions::prefixed("APP"));
-    assert_eq!(docs_report["format_version"].as_u64(), Some(1));
+    assert_eq!(
+        docs_report["format_version"].as_u64(),
+        Some(ENV_DOCS_FORMAT_VERSION as u64)
+    );
     assert_eq!(
         docs_report["entries"].as_array().map(Vec::len),
         Some(docs.len())

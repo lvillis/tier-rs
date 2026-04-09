@@ -42,6 +42,7 @@ pub(super) fn collect_env_docs(
                     aliases: Vec::new(),
                     has_default: false,
                     merge: MergeStrategy::Merge,
+                    allowed_sources: Vec::new(),
                     validations: Vec::new(),
                 });
             }
@@ -59,6 +60,7 @@ pub(super) fn collect_env_docs(
                     aliases: Vec::new(),
                     has_default: false,
                     merge: MergeStrategy::Merge,
+                    allowed_sources: Vec::new(),
                     validations: Vec::new(),
                 });
             }
@@ -401,6 +403,7 @@ pub(super) fn collect_env_docs(
             aliases: Vec::new(),
             has_default: false,
             merge: MergeStrategy::Merge,
+            allowed_sources: Vec::new(),
             validations: Vec::new(),
         });
     }

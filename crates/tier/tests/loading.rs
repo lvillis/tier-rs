@@ -4133,3 +4133,43 @@ fn doctor_json_is_machine_readable() {
     assert_eq!(doctor["validations"].as_array().map(Vec::len), Some(1));
     assert!(doctor["redacted_final"].is_object());
 }
+
+#[test]
+fn field_source_policies_reject_disallowed_layers() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new("token")
+            .allow_sources([SourceKind::Environment, SourceKind::Arguments])]);
+
+    let error = ConfigLoader::new(OptionalTokenConfig::default())
+        .metadata(metadata)
+        .layer(Layer::custom("manual", serde_json::json!({ "token": "shadow" })).expect("layer"))
+        .load()
+        .expect_err("custom layer should be rejected");
+
+    assert!(matches!(
+        error,
+        ConfigError::SourcePolicyViolation {
+            path,
+            trace,
+            allowed_sources,
+        } if path == "token"
+            && trace.kind == SourceKind::Custom
+            && trace.name == "manual"
+            && allowed_sources == vec![SourceKind::Environment, SourceKind::Arguments]
+    ));
+}
+
+#[test]
+fn field_source_policies_allow_configured_sources() {
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new("token")
+            .allow_sources([SourceKind::Environment, SourceKind::Arguments])]);
+
+    let loaded = ConfigLoader::new(OptionalTokenConfig::default())
+        .metadata(metadata)
+        .env(EnvSource::from_pairs([("APP__TOKEN", "env-secret")]).prefix("APP"))
+        .load()
+        .expect("environment source should be allowed");
+
+    assert_eq!(loaded.token.as_deref(), Some("env-secret"));
+}
