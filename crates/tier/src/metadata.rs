@@ -469,6 +469,12 @@ impl ConfigMetadata {
                     message: "source policies cannot target the root path".to_owned(),
                 });
             }
+            if field.path.is_empty() && field.denied_sources.is_some() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "source policies cannot target the root path".to_owned(),
+                });
+            }
             if let Some(allowed_sources) = &field.allowed_sources
                 && allowed_sources.is_empty()
             {
@@ -477,11 +483,53 @@ impl ConfigMetadata {
                     message: "source policies must allow at least one source kind".to_owned(),
                 });
             }
+            if let Some(denied_sources) = &field.denied_sources
+                && let Some(allowed_sources) = &field.allowed_sources
+            {
+                let overlap = allowed_sources
+                    .intersection(denied_sources)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !overlap.is_empty() {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: field.path.clone(),
+                        message: format!(
+                            "source policies cannot both allow and deny the same source kinds: {}",
+                            overlap
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
+            }
             if field.path.is_empty() && !field.validations.is_empty() {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
                     message: "validation rules cannot target the root path".to_owned(),
                 });
+            }
+            if field.path.is_empty() && !field.validation_configs.is_empty() {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "validation rules cannot target the root path".to_owned(),
+                });
+            }
+            let declared_rule_codes = field
+                .validations
+                .iter()
+                .map(ValidationRule::code)
+                .collect::<BTreeSet<_>>();
+            for rule_code in field.validation_configs.keys() {
+                if !declared_rule_codes.contains(rule_code.as_str()) {
+                    return Err(ConfigError::MetadataInvalid {
+                        path: field.path.clone(),
+                        message: format!(
+                            "validation config references unknown rule `{rule_code}` for this field"
+                        ),
+                    });
+                }
             }
             if field.path.is_empty() && field.deprecated.is_some() {
                 return Err(ConfigError::MetadataInvalid {
@@ -579,8 +627,14 @@ pub struct FieldMetadata {
     ///
     /// When unset, the field accepts values from any source kind.
     pub allowed_sources: Option<BTreeSet<SourceKind>>,
+    /// Source kinds explicitly denied from overriding this field.
+    ///
+    /// When unset, the field does not deny any source kinds.
+    pub denied_sources: Option<BTreeSet<SourceKind>>,
     /// Declarative validation rules applied after normalization.
     pub validations: Vec<ValidationRule>,
+    /// Per-rule configuration such as custom messages, warning levels, and tags.
+    pub validation_configs: BTreeMap<String, ValidationRuleConfig>,
 }
 
 impl FieldMetadata {
@@ -599,7 +653,9 @@ impl FieldMetadata {
             has_default: false,
             merge: MergeStrategy::Merge,
             allowed_sources: None,
+            denied_sources: None,
             validations: Vec::new(),
+            validation_configs: BTreeMap::new(),
         }
     }
 
@@ -683,10 +739,62 @@ impl FieldMetadata {
         self
     }
 
+    /// Explicitly denies a set of source kinds from overriding this field.
+    #[must_use]
+    pub fn deny_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = SourceKind>,
+    {
+        self.denied_sources = Some(sources.into_iter().collect());
+        self
+    }
+
     /// Appends a declarative validation rule.
     #[must_use]
     pub fn validate(mut self, rule: ValidationRule) -> Self {
         self.validations.push(rule);
+        self
+    }
+
+    /// Overrides the human-readable message for a validation rule.
+    #[must_use]
+    pub fn validation_message(
+        mut self,
+        rule_code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        self.validation_configs
+            .entry(rule_code.into())
+            .or_default()
+            .message = Some(message.into());
+        self
+    }
+
+    /// Sets the runtime level for a validation rule.
+    #[must_use]
+    pub fn validation_level(
+        mut self,
+        rule_code: impl Into<String>,
+        level: ValidationLevel,
+    ) -> Self {
+        self.validation_configs
+            .entry(rule_code.into())
+            .or_default()
+            .level = level;
+        self
+    }
+
+    /// Attaches machine-readable tags to a validation rule.
+    #[must_use]
+    pub fn validation_tags<I, S>(mut self, rule_code: impl Into<String>, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.validation_configs
+            .entry(rule_code.into())
+            .or_default()
+            .tags = tags.into_iter().map(Into::into).collect();
         self
     }
 
@@ -837,10 +945,16 @@ impl FieldMetadata {
         if let Some(allowed_sources) = other.allowed_sources {
             self.allowed_sources = Some(allowed_sources);
         }
+        if let Some(denied_sources) = other.denied_sources {
+            self.denied_sources = Some(denied_sources);
+        }
         for rule in other.validations {
             if !self.validations.contains(&rule) {
                 self.validations.push(rule);
             }
+        }
+        for (rule_code, config) in other.validation_configs {
+            self.validation_configs.insert(rule_code, config);
         }
     }
 
@@ -855,7 +969,9 @@ impl FieldMetadata {
             && !self.has_default
             && self.merge == MergeStrategy::Merge
             && self.allowed_sources.is_none()
+            && self.denied_sources.is_none()
             && self.validations.is_empty()
+            && self.validation_configs.is_empty()
     }
 }
 
@@ -908,6 +1024,48 @@ pub enum MergeStrategy {
     Replace,
     /// Append array overlays while still recursively merging nested objects.
     Append,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+/// Runtime severity applied to a declarative validation rule.
+pub enum ValidationLevel {
+    /// Reject the configuration when the rule fails.
+    #[default]
+    Error,
+    /// Record a warning and continue loading when the rule fails.
+    Warning,
+}
+
+impl Display for ValidationLevel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Error => write!(f, "error"),
+            Self::Warning => write!(f, "warning"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Additional configuration attached to a declarative validation rule.
+pub struct ValidationRuleConfig {
+    /// Runtime severity for the rule.
+    pub level: ValidationLevel,
+    /// Optional custom message shown when the rule fails.
+    pub message: Option<String>,
+    /// Optional machine-readable tags for downstream consumers.
+    pub tags: Vec<String>,
 }
 
 impl Display for MergeStrategy {

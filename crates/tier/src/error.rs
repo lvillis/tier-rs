@@ -21,6 +21,8 @@ pub struct ValidationError {
     pub expected: Option<Value>,
     /// Optional actual value observed during validation.
     pub actual: Option<Value>,
+    /// Optional machine-readable tags for downstream consumers.
+    pub tags: Vec<String>,
 }
 
 impl ValidationError {
@@ -34,6 +36,7 @@ impl ValidationError {
             rule: None,
             expected: None,
             actual: None,
+            tags: Vec::new(),
         }
     }
 
@@ -66,6 +69,17 @@ impl ValidationError {
     #[must_use]
     pub fn with_actual(mut self, actual: Value) -> Self {
         self.actual = Some(actual);
+        self
+    }
+
+    /// Attaches machine-readable tags for downstream consumers.
+    #[must_use]
+    pub fn with_tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -339,8 +353,8 @@ pub enum ConfigError {
 
     /// A source attempted to write to a field that restricts allowed source kinds.
     #[error(
-        "source {trace} is not allowed to set `{path}`; allowed sources: {allowed}",
-        allowed = format_source_kind_list(allowed_sources)
+        "source {trace} is not allowed to set `{path}`; {policy}",
+        policy = format_source_policy(allowed_sources, denied_sources)
     )]
     SourcePolicyViolation {
         /// Concrete path rejected by the source policy.
@@ -348,7 +362,31 @@ pub enum ConfigError {
         /// Actual source attempting to set the path.
         trace: SourceTrace,
         /// Allowed source kinds for the path.
-        allowed_sources: Vec<crate::loader::SourceKind>,
+        allowed_sources: Box<[crate::loader::SourceKind]>,
+        /// Explicitly denied source kinds for the path.
+        denied_sources: Box<[crate::loader::SourceKind]>,
+    },
+
+    /// The loaded configuration declares a version newer than this binary supports.
+    #[error(
+        "configuration version at `{path}` is {found}, but this binary only supports up to {supported}"
+    )]
+    UnsupportedConfigVersion {
+        /// Path that stores the configuration version.
+        path: String,
+        /// Version found in the loaded configuration.
+        found: u32,
+        /// Highest version understood by this binary.
+        supported: u32,
+    },
+
+    /// The loaded configuration version field could not be parsed as an unsigned integer.
+    #[error("configuration version at `{path}` must be an unsigned integer: {message}")]
+    InvalidConfigVersion {
+        /// Path that stores the configuration version.
+        path: String,
+        /// Human-readable validation failure.
+        message: String,
     },
 
     /// A serialized object key could not be represented in tier's dot-delimited path model.
@@ -494,6 +532,22 @@ fn format_source_kind_list(kinds: &[crate::loader::SourceKind]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_source_policy(
+    allowed: &[crate::loader::SourceKind],
+    denied: &[crate::loader::SourceKind],
+) -> String {
+    match (allowed.is_empty(), denied.is_empty()) {
+        (false, true) => format!("allowed sources: {}", format_source_kind_list(allowed)),
+        (true, false) => format!("denied sources: {}", format_source_kind_list(denied)),
+        (false, false) => format!(
+            "allowed sources: {}; denied sources: {}",
+            format_source_kind_list(allowed),
+            format_source_kind_list(denied)
+        ),
+        (true, true) => "no source policy matched".to_owned(),
+    }
 }
 
 fn deserialize_source_suffix(provenance: &Option<SourceTrace>) -> String {

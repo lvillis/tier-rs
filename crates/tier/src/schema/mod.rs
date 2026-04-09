@@ -13,7 +13,7 @@ use self::toml::render_example_toml;
 pub use schemars::JsonSchema;
 
 /// Stable version tag for machine-readable schema and example export payloads.
-pub const SCHEMA_EXPORT_FORMAT_VERSION: u32 = 2;
+pub const SCHEMA_EXPORT_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 /// Versioned machine-readable JSON Schema payload.
@@ -381,10 +381,24 @@ fn annotate_schema_node(node: &mut Value, field: &FieldMetadata) {
             .collect::<Vec<_>>();
         object.insert("x-tier-sources".to_owned(), Value::Array(sources));
     }
+    if let Some(denied_sources) = &field.denied_sources {
+        let sources = denied_sources
+            .iter()
+            .map(|source| Value::String(source.to_string()))
+            .collect::<Vec<_>>();
+        object.insert("x-tier-denied-sources".to_owned(), Value::Array(sources));
+    }
     if !field.validations.is_empty() {
         object.insert(
             "x-tier-validate".to_owned(),
             serde_json::to_value(&field.validations).unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+    }
+    if !field.validation_configs.is_empty() {
+        object.insert(
+            "x-tier-validation-config".to_owned(),
+            serde_json::to_value(&field.validation_configs)
+                .unwrap_or_else(|_| Value::Object(Default::default())),
         );
     }
 }

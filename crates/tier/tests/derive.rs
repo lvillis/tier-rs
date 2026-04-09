@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use tier::{
     ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, EnvSource, FieldMetadata, MergeStrategy,
-    Secret, SourceKind, TierConfig, TierMetadata, ValidationCheck, ValidationRule,
+    Secret, SourceKind, TierConfig, TierMetadata, ValidationCheck, ValidationLevel, ValidationRule,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
@@ -1108,4 +1108,62 @@ fn loader_canonicalizes_external_enum_variant_aliases() {
     assert!(rendered.contains("endpointUrl"));
     assert!(!rendered.contains("legacy-redis"));
     assert!(!rendered.contains("redis-secret"));
+}
+
+#[test]
+fn tier_config_derives_direct_field_path_constants() {
+    #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+    struct PathConstantConfig {
+        server_port: u16,
+        #[serde(rename = "db-token")]
+        db_token: String,
+    }
+
+    assert_eq!(PathConstantConfig::PATH_SERVER_PORT, "server_port");
+    assert_eq!(PathConstantConfig::PATH_DB_TOKEN, "db-token");
+}
+
+#[test]
+fn derive_metadata_supports_denied_source_policies() {
+    #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+    struct DenySourceConfig {
+        #[tier(deny_sources("file", "custom"))]
+        token: String,
+    }
+
+    let metadata = DenySourceConfig::metadata();
+    let token = metadata.field("token").expect("token metadata");
+    assert_eq!(
+        token.denied_sources.as_ref().expect("denied sources"),
+        &std::collections::BTreeSet::from([SourceKind::File, SourceKind::Custom])
+    );
+}
+
+#[test]
+fn derive_metadata_supports_validation_configuration() {
+    #[derive(Debug, Clone, Serialize, Deserialize, TierConfig)]
+    struct ValidationConfig {
+        #[tier(
+            url,
+            validation_level(rule = "url", value = "warning"),
+            validation_message(rule = "url", value = "service url must be valid"),
+            validation_tags(rule = "url", values("network", "external"))
+        )]
+        service_url: String,
+    }
+
+    let metadata = ValidationConfig::metadata();
+    let field = metadata.field("service_url").expect("service_url metadata");
+    assert_eq!(field.validations, vec![ValidationRule::Url]);
+
+    let config = field
+        .validation_configs
+        .get("url")
+        .expect("url validation config");
+    assert_eq!(config.level, ValidationLevel::Warning);
+    assert_eq!(config.message.as_deref(), Some("service url must be valid"));
+    assert_eq!(
+        config.tags,
+        vec!["network".to_owned(), "external".to_owned()]
+    );
 }

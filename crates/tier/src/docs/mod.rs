@@ -13,7 +13,7 @@ mod collect;
 use self::collect::*;
 
 /// Stable version tag for machine-readable environment documentation payloads.
-pub const ENV_DOCS_FORMAT_VERSION: u32 = 2;
+pub const ENV_DOCS_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// A single schema-derived environment variable documentation row.
@@ -48,8 +48,16 @@ pub struct EnvDocEntry {
     ///
     /// An empty list means the field does not restrict its allowed sources.
     pub allowed_sources: Vec<SourceKind>,
+    /// Source kinds explicitly denied from overriding this field.
+    pub denied_sources: Vec<SourceKind>,
     /// Declarative validation rules applied to this field.
     pub validations: Vec<ValidationRule>,
+    /// Per-rule validation levels keyed by rule code.
+    pub validation_levels: std::collections::BTreeMap<String, crate::ValidationLevel>,
+    /// Per-rule custom messages keyed by rule code.
+    pub validation_messages: std::collections::BTreeMap<String, String>,
+    /// Per-rule machine-readable tags keyed by rule code.
+    pub validation_tags: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -391,9 +399,27 @@ fn apply_field_metadata(
         if let Some(allowed_sources) = &field.allowed_sources {
             entry.allowed_sources = allowed_sources.iter().copied().collect::<Vec<_>>();
         }
+        if let Some(denied_sources) = &field.denied_sources {
+            entry.denied_sources = denied_sources.iter().copied().collect::<Vec<_>>();
+        }
         for rule in &field.validations {
             if !entry.validations.contains(rule) {
                 entry.validations.push(rule.clone());
+            }
+        }
+        for (rule_code, config) in &field.validation_configs {
+            entry
+                .validation_levels
+                .insert(rule_code.clone(), config.level);
+            if let Some(message) = &config.message {
+                entry
+                    .validation_messages
+                    .insert(rule_code.clone(), message.clone());
+            }
+            if !config.tags.is_empty() {
+                entry
+                    .validation_tags
+                    .insert(rule_code.clone(), config.tags.clone());
             }
         }
         if field.has_default {
@@ -452,11 +478,21 @@ fn merge_env_doc_entry(existing: &mut EnvDocEntry, incoming: EnvDocEntry) {
     if !incoming.allowed_sources.is_empty() {
         existing.allowed_sources = incoming.allowed_sources;
     }
+    if !incoming.denied_sources.is_empty() {
+        existing.denied_sources = incoming.denied_sources;
+    }
     for rule in incoming.validations {
         if !existing.validations.contains(&rule) {
             existing.validations.push(rule);
         }
     }
+    existing
+        .validation_levels
+        .extend(incoming.validation_levels);
+    existing
+        .validation_messages
+        .extend(incoming.validation_messages);
+    existing.validation_tags.extend(incoming.validation_tags);
 }
 
 fn merge_env_doc_types(existing: &str, incoming: &str) -> String {

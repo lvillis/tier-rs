@@ -43,7 +43,11 @@ pub(super) fn collect_env_docs(
                     has_default: false,
                     merge: MergeStrategy::Merge,
                     allowed_sources: Vec::new(),
+                    denied_sources: Vec::new(),
                     validations: Vec::new(),
+                    validation_levels: std::collections::BTreeMap::new(),
+                    validation_messages: std::collections::BTreeMap::new(),
+                    validation_tags: std::collections::BTreeMap::new(),
                 });
             }
             Value::Bool(false) => {}
@@ -61,7 +65,11 @@ pub(super) fn collect_env_docs(
                     has_default: false,
                     merge: MergeStrategy::Merge,
                     allowed_sources: Vec::new(),
+                    denied_sources: Vec::new(),
                     validations: Vec::new(),
+                    validation_levels: std::collections::BTreeMap::new(),
+                    validation_messages: std::collections::BTreeMap::new(),
+                    validation_tags: std::collections::BTreeMap::new(),
                 });
             }
             _ => {}
@@ -404,7 +412,11 @@ pub(super) fn collect_env_docs(
             has_default: false,
             merge: MergeStrategy::Merge,
             allowed_sources: Vec::new(),
+            denied_sources: Vec::new(),
             validations: Vec::new(),
+            validation_levels: std::collections::BTreeMap::new(),
+            validation_messages: std::collections::BTreeMap::new(),
+            validation_tags: std::collections::BTreeMap::new(),
         });
     }
 }

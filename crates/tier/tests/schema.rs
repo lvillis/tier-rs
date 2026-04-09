@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use tier::config_example_toml;
 use tier::{
     ConfigLoader, ConfigMetadata, ENV_DOCS_FORMAT_VERSION, EnvDocOptions, FieldMetadata,
-    MergeStrategy, SCHEMA_EXPORT_FORMAT_VERSION, Secret, SourceKind, TierMetadata, ValidationRule,
-    annotated_json_schema_for, annotated_json_schema_report_json, config_example_for,
-    config_example_report_json, env_docs_for, env_docs_json, env_docs_markdown,
+    MergeStrategy, SCHEMA_EXPORT_FORMAT_VERSION, Secret, SourceKind, TierMetadata, ValidationLevel,
+    ValidationRule, annotated_json_schema_for, annotated_json_schema_report_json,
+    config_example_for, config_example_report_json, env_docs_for, env_docs_json, env_docs_markdown,
     env_docs_report_json, json_schema_for, json_schema_report_json,
 };
 
@@ -343,6 +343,10 @@ impl TierMetadata for SchemaConfig {
                 .doc("Public service URL")
                 .example("https://api.example.com")
                 .allow_sources([SourceKind::Environment, SourceKind::Arguments])
+                .deny_sources([SourceKind::File])
+                .validation_level("url", ValidationLevel::Warning)
+                .validation_message("url", "website should be a valid public URL")
+                .validation_tags("url", ["network", "public"])
                 .url(),
             FieldMetadata::new("contact_email")
                 .doc("Operations contact address")
@@ -2309,6 +2313,18 @@ fn annotated_schema_includes_tier_metadata_extensions() {
         schema["properties"]["website"]["x-tier-sources"],
         serde_json::json!(["env", "cli"])
     );
+    assert_eq!(
+        schema["properties"]["website"]["x-tier-denied-sources"],
+        serde_json::json!(["file"])
+    );
+    assert_eq!(
+        schema["properties"]["website"]["x-tier-validation-config"]["url"],
+        serde_json::json!({
+            "level": "warning",
+            "message": "website should be a valid public URL",
+            "tags": ["network", "public"]
+        })
+    );
     assert!(
         contact_email_rules
             .iter()
@@ -2595,7 +2611,13 @@ fn generates_environment_docs_from_schema() {
             && entry.description.as_deref() == Some("Public service URL")
             && entry.example.as_deref() == Some("https://api.example.com")
             && entry.allowed_sources == vec![SourceKind::Environment, SourceKind::Arguments]
+            && entry.denied_sources == vec![SourceKind::File]
             && entry.validations == vec![ValidationRule::Url]
+            && entry.validation_levels.get("url") == Some(&ValidationLevel::Warning)
+            && entry.validation_messages.get("url").map(String::as_str)
+                == Some("website should be a valid public URL")
+            && entry.validation_tags.get("url")
+                == Some(&vec!["network".to_owned(), "public".to_owned()])
     }));
     assert!(docs.iter().any(|entry| {
         entry.path == "contact_email"
@@ -2683,6 +2705,14 @@ fn generates_environment_docs_from_schema() {
             && entry["env"].as_str() == Some("APP_SERVER_HOSTNAME")
             && entry["has_default"].as_bool() == Some(true)
             && entry["validations"].as_array().map(Vec::len) == Some(3)
+    }));
+    assert!(docs_array.iter().any(|entry| {
+        entry["path"].as_str() == Some("website")
+            && entry["denied_sources"] == serde_json::json!(["file"])
+            && entry["validation_levels"]["url"] == serde_json::json!("warning")
+            && entry["validation_messages"]["url"]
+                == serde_json::json!("website should be a valid public URL")
+            && entry["validation_tags"]["url"] == serde_json::json!(["network", "public"])
     }));
 
     let array_docs_json = env_docs_json::<ArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));

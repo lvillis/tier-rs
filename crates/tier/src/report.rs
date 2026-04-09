@@ -4,11 +4,15 @@ use std::fmt::{self, Display, Formatter};
 
 use serde_json::Value;
 
-use crate::error::UnknownField;
+use crate::error::{UnknownField, ValidationError};
 use crate::loader::SourceTrace;
 
 /// Stable version tag for machine-readable doctor and audit reports.
-pub const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 2;
+
+#[cfg(feature = "schema")]
+/// Stable version tag for machine-readable export bundles.
+pub const EXPORT_BUNDLE_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// Aggregate counts for a machine-readable configuration report.
@@ -23,6 +27,8 @@ pub struct ReportSummary {
     pub trace_count: usize,
     /// Number of configured secret paths.
     pub secret_path_count: usize,
+    /// Number of applied configuration migrations.
+    pub migration_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -38,6 +44,8 @@ pub struct DoctorReport {
     pub validations: Vec<String>,
     /// Structured warnings recorded during loading.
     pub warnings: Vec<ConfigWarning>,
+    /// Applied migration steps recorded during loading.
+    pub migrations: Vec<AppliedMigration>,
     /// Final configuration value with redaction applied.
     pub redacted_final: Value,
 }
@@ -64,6 +72,26 @@ pub struct AuditReport {
     pub doctor: DoctorReport,
     /// Structured path explanations keyed by normalized path.
     pub traces: BTreeMap<String, TraceAudit>,
+}
+
+#[cfg(feature = "schema")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Versioned machine-readable export bundle for downstream integrations.
+pub struct ExportBundleReport {
+    /// Stable bundle version for external consumers.
+    pub format_version: u32,
+    /// Operational doctor summary for the loaded configuration.
+    pub doctor: DoctorReport,
+    /// Full audit payload for the loaded configuration.
+    pub audit: AuditReport,
+    /// Versioned env docs export.
+    pub env_docs: crate::EnvDocsReport,
+    /// Versioned plain JSON Schema export.
+    pub json_schema: crate::JsonSchemaReport,
+    /// Versioned annotated JSON Schema export.
+    pub annotated_json_schema: crate::JsonSchemaReport,
+    /// Versioned example export.
+    pub example: crate::ConfigExampleReport,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -123,6 +151,48 @@ pub struct DeprecatedField {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// A migration step applied while upgrading configuration input.
+pub struct AppliedMigration {
+    /// Stable migration kind.
+    pub kind: String,
+    /// Source version that triggered the migration.
+    pub from_version: u32,
+    /// Target version this migration belongs to.
+    pub to_version: u32,
+    /// Original path affected by the migration.
+    pub from_path: String,
+    /// Replacement path when the migration renames a field.
+    pub to_path: Option<String>,
+    /// Optional operator-facing note.
+    pub note: Option<String>,
+}
+
+impl Display for AppliedMigration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.to_path {
+            Some(to_path) => {
+                write!(
+                    f,
+                    "{} {} -> {} (v{} -> v{})",
+                    self.kind, self.from_path, to_path, self.from_version, self.to_version
+                )?;
+            }
+            None => {
+                write!(
+                    f,
+                    "{} {} (v{} -> v{})",
+                    self.kind, self.from_path, self.from_version, self.to_version
+                )?;
+            }
+        }
+        if let Some(note) = &self.note {
+            write!(f, "; {note}")?;
+        }
+        Ok(())
+    }
+}
+
 impl DeprecatedField {
     /// Creates a deprecated field diagnostic for a path.
     #[must_use]
@@ -169,6 +239,8 @@ pub enum ConfigWarning {
     UnknownField(UnknownField),
     /// A deprecated path was used by one of the configured sources.
     DeprecatedField(DeprecatedField),
+    /// A declarative validation was configured as warning-level.
+    Validation(ValidationError),
 }
 
 impl Display for ConfigWarning {
@@ -176,6 +248,7 @@ impl Display for ConfigWarning {
         match self {
             Self::UnknownField(field) => Display::fmt(field, f),
             Self::DeprecatedField(field) => Display::fmt(field, f),
+            Self::Validation(error) => Display::fmt(error, f),
         }
     }
 }
@@ -224,6 +297,7 @@ pub struct ConfigReport {
     applied_sources: Vec<SourceTrace>,
     validations: Vec<String>,
     warnings: Vec<ConfigWarning>,
+    migrations: Vec<AppliedMigration>,
 }
 
 impl ConfigReport {
@@ -240,6 +314,7 @@ impl ConfigReport {
             applied_sources: Vec::new(),
             validations: Vec::new(),
             warnings: Vec::new(),
+            migrations: Vec::new(),
         }
     }
 
@@ -272,6 +347,10 @@ impl ConfigReport {
         self.warnings.push(warning);
     }
 
+    pub(crate) fn record_migration(&mut self, migration: AppliedMigration) {
+        self.migrations.push(migration);
+    }
+
     /// Returns aggregate counts for machine-readable report consumers.
     #[must_use]
     pub fn summary(&self) -> ReportSummary {
@@ -281,6 +360,7 @@ impl ConfigReport {
             warning_count: self.warnings.len(),
             trace_count: self.traces.len(),
             secret_path_count: self.secret_paths.len(),
+            migration_count: self.migrations.len(),
         }
     }
 
@@ -306,6 +386,12 @@ impl ConfigReport {
     #[must_use]
     pub fn warnings(&self) -> &[ConfigWarning] {
         &self.warnings
+    }
+
+    /// Returns applied migration steps recorded during loading.
+    #[must_use]
+    pub fn migrations(&self) -> &[AppliedMigration] {
+        &self.migrations
     }
 
     /// Returns `true` when the report contains warnings.
@@ -372,6 +458,7 @@ impl ConfigReport {
             sources: self.applied_sources.clone(),
             validations: self.validations.clone(),
             warnings: self.warnings.clone(),
+            migrations: self.migrations.clone(),
             redacted_final: self.redacted_value(),
         }
     }
@@ -427,6 +514,14 @@ impl ConfigReport {
 
         let _ = writeln!(&mut output, "Traces: {}", doctor.summary.trace_count);
         let _ = writeln!(&mut output, "Secrets: {}", doctor.summary.secret_path_count);
+        let _ = writeln!(
+            &mut output,
+            "Migrations: {}",
+            doctor.summary.migration_count
+        );
+        for migration in &doctor.migrations {
+            let _ = writeln!(&mut output, "- {migration}");
+        }
 
         if doctor.warnings.is_empty() {
             let _ = writeln!(&mut output, "Warnings: 0");

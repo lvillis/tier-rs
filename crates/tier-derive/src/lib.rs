@@ -36,6 +36,7 @@ fn expand_tier_config(input: DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let generics = input.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let container_attrs = parse_serde_container_attrs(&input.attrs)?;
+    let path_constant_tokens = expand_path_constants(&input.data, &container_attrs)?;
     let field_tokens = match input.data {
         Data::Struct(data_struct) => expand_struct_metadata(data_struct, &container_attrs)?,
         Data::Enum(data_enum) => expand_enum_metadata(data_enum, &container_attrs)?,
@@ -56,6 +57,10 @@ fn expand_tier_config(input: DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 #(#check_tokens)*
                 metadata
             }
+        }
+
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #(#path_constant_tokens)*
         }
     })
 }
@@ -127,6 +132,49 @@ fn expand_struct_metadata(
         }
         Fields::Unit => Ok(Vec::new()),
     }
+}
+
+fn expand_path_constants(
+    data: &Data,
+    container_attrs: &SerdeContainerAttrs,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let Data::Struct(data_struct) = data else {
+        return Ok(Vec::new());
+    };
+    let Fields::Named(fields) = &data_struct.fields else {
+        return Ok(Vec::new());
+    };
+
+    let mut constants = Vec::new();
+    let context = SerdeFieldContext::for_struct(container_attrs);
+    for field in &fields.named {
+        let Some(field_ident) = &field.ident else {
+            continue;
+        };
+        let serde_attrs = parse_serde_field_attrs(&field.attrs, field_ident, context)?;
+        if serde_attrs.flatten || serde_attrs.skip_metadata {
+            continue;
+        }
+        let const_ident = format_ident!("PATH_{}", screaming_snake_ident(&field_ident.to_string()));
+        let path = LitStr::new(&serde_attrs.canonical_name, field_ident.span());
+        constants.push(quote! {
+            /// Dot-delimited path constant for this direct config field.
+            pub const #const_ident: &'static str = #path;
+        });
+    }
+
+    Ok(constants)
+}
+
+fn screaming_snake_ident(value: &str) -> String {
+    let mut rendered = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if ch.is_ascii_uppercase() && index > 0 {
+            rendered.push('_');
+        }
+        rendered.push(ch.to_ascii_uppercase());
+    }
+    rendered
 }
 
 fn expand_enum_metadata(
@@ -571,6 +619,7 @@ struct TierAttrs {
     secret: bool,
     leaf: bool,
     sources: Vec<TierSourceKind>,
+    deny_sources: Vec<TierSourceKind>,
     env: Option<String>,
     doc: Option<String>,
     example: Option<String>,
@@ -596,6 +645,9 @@ struct TierAttrs {
     socket_addr: bool,
     absolute_path: bool,
     env_decode: Option<String>,
+    validation_messages: Vec<(String, String)>,
+    validation_levels: Vec<(String, String)>,
+    validation_tags: Vec<(String, Vec<String>)>,
 }
 
 impl TierAttrs {
@@ -603,6 +655,7 @@ impl TierAttrs {
         self.secret
             || self.leaf
             || !self.sources.is_empty()
+            || !self.deny_sources.is_empty()
             || self.env.is_some()
             || self.doc.is_some()
             || self.example.is_some()
@@ -628,6 +681,9 @@ impl TierAttrs {
             || self.socket_addr
             || self.absolute_path
             || self.env_decode.is_some()
+            || !self.validation_messages.is_empty()
+            || !self.validation_levels.is_empty()
+            || !self.validation_tags.is_empty()
     }
 }
 
@@ -905,6 +961,10 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
                 attrs.sources = parse_source_kind_list(meta)?;
                 return Ok(());
             }
+            if meta.path.is_ident("deny_sources") {
+                attrs.deny_sources = parse_source_kind_list(meta)?;
+                return Ok(());
+            }
             if meta.path.is_ident("env") {
                 attrs.env = Some(parse_string_value(meta)?);
                 return Ok(());
@@ -1015,6 +1075,21 @@ fn parse_tier_attrs(attributes: &[Attribute]) -> syn::Result<TierAttrs> {
             }
             if meta.path.is_ident("env_decode") {
                 attrs.env_decode = Some(parse_string_value(meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("validation_message") {
+                let (rule, value) = parse_rule_key_string_value(meta)?;
+                attrs.validation_messages.push((rule, value));
+                return Ok(());
+            }
+            if meta.path.is_ident("validation_level") {
+                let (rule, value) = parse_rule_key_string_value(meta)?;
+                attrs.validation_levels.push((rule, value));
+                return Ok(());
+            }
+            if meta.path.is_ident("validation_tags") {
+                let (rule, values) = parse_rule_key_string_list(meta)?;
+                attrs.validation_tags.push((rule, values));
                 return Ok(());
             }
             Err(meta.error("unsupported tier attribute"))
@@ -1765,6 +1840,58 @@ fn parse_literal_expr_list(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<
     Ok(values)
 }
 
+fn parse_rule_key_string_value(
+    meta: syn::meta::ParseNestedMeta<'_>,
+) -> syn::Result<(String, String)> {
+    let mut rule = None::<String>;
+    let mut value = None::<String>;
+    meta.parse_nested_meta(|nested| {
+        if nested.path.is_ident("rule") {
+            rule = Some(parse_string_value(nested)?);
+            return Ok(());
+        }
+        if nested.path.is_ident("value") {
+            value = Some(parse_string_value(nested)?);
+            return Ok(());
+        }
+        Err(nested.error("unsupported validation rule config option"))
+    })?;
+
+    let Some(rule) = rule else {
+        return Err(meta.error("validation rule config requires `rule = \"...\"`"));
+    };
+    let Some(value) = value else {
+        return Err(meta.error("validation rule config requires `value = \"...\"`"));
+    };
+    Ok((rule, value))
+}
+
+fn parse_rule_key_string_list(
+    meta: syn::meta::ParseNestedMeta<'_>,
+) -> syn::Result<(String, Vec<String>)> {
+    let mut rule = None::<String>;
+    let mut values = None::<Vec<String>>;
+    meta.parse_nested_meta(|nested| {
+        if nested.path.is_ident("rule") {
+            rule = Some(parse_string_value(nested)?);
+            return Ok(());
+        }
+        if nested.path.is_ident("values") {
+            values = Some(parse_string_list_call(nested)?);
+            return Ok(());
+        }
+        Err(nested.error("unsupported validation tag config option"))
+    })?;
+
+    let Some(rule) = rule else {
+        return Err(meta.error("validation tag config requires `rule = \"...\"`"));
+    };
+    let Some(values) = values else {
+        return Err(meta.error("validation tag config requires `values(\"...\")`"));
+    };
+    Ok((rule, values))
+}
+
 fn parse_numeric_literal(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<NumericLiteral> {
     let expr: Expr = meta.value()?.parse()?;
     parse_numeric_expr(expr, meta.path.span())
@@ -2055,6 +2182,14 @@ fn direct_field_metadata_tokens(
             .collect::<Vec<_>>();
         builder = quote! { #builder.allow_sources([#(#sources),*]) };
     }
+    if !attrs.deny_sources.is_empty() {
+        let sources = attrs
+            .deny_sources
+            .iter()
+            .map(|source| source.tokens())
+            .collect::<Vec<_>>();
+        builder = quote! { #builder.deny_sources([#(#sources),*]) };
+    }
     if attrs.non_empty {
         builder = quote! { #builder.non_empty() };
     }
@@ -2131,6 +2266,33 @@ fn direct_field_metadata_tokens(
             }
         };
         builder = quote! { #builder.env_decoder(#env_decode) };
+    }
+    for (rule, message) in &attrs.validation_messages {
+        let rule = LitStr::new(rule, field_name.span());
+        let message = LitStr::new(message, field_name.span());
+        builder = quote! { #builder.validation_message(#rule, #message) };
+    }
+    for (rule, level) in &attrs.validation_levels {
+        let rule = LitStr::new(rule, field_name.span());
+        let level = match level.as_str() {
+            "error" => quote! { ::tier::ValidationLevel::Error },
+            "warn" | "warning" => quote! { ::tier::ValidationLevel::Warning },
+            _ => {
+                return Err(syn::Error::new(
+                    field_name.span(),
+                    "unsupported validation level, expected error|warning",
+                ));
+            }
+        };
+        builder = quote! { #builder.validation_level(#rule, #level) };
+    }
+    for (rule, tags) in &attrs.validation_tags {
+        let rule = LitStr::new(rule, field_name.span());
+        let tags = tags
+            .iter()
+            .map(|tag| LitStr::new(tag, field_name.span()))
+            .collect::<Vec<_>>();
+        builder = quote! { #builder.validation_tags(#rule, [#(#tags),*]) };
     }
 
     Ok(quote! {

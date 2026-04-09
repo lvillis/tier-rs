@@ -36,12 +36,12 @@ pub use crate::docs::{
 };
 pub use crate::error::{ConfigError, UnknownField, ValidationError, ValidationErrors};
 pub use crate::loader::{
-    ArgsSource, ConfigLoader, EnvSource, FileFormat, FileSource, Layer, LoadedConfig, SourceKind,
-    SourceTrace, UnknownFieldPolicy,
+    ArgsSource, ConfigLoader, ConfigMigration, ConfigMigrationKind, EnvSource, FileFormat,
+    FileSource, Layer, LoadedConfig, SourceKind, SourceTrace, UnknownFieldPolicy,
 };
 pub use crate::metadata::{
     ConfigMetadata, EnvDecoder, FieldMetadata, MergeStrategy, TierMetadata, ValidationCheck,
-    ValidationNumber, ValidationRule, ValidationValue,
+    ValidationLevel, ValidationNumber, ValidationRule, ValidationRuleConfig, ValidationValue,
 };
 pub use crate::patch::{Patch, TierPatch};
 #[cfg(feature = "watch")]
@@ -52,9 +52,12 @@ pub use crate::reload::{
     ReloadOptions, ReloadSummary,
 };
 pub use crate::report::{
-    AuditReport, ConfigReport, ConfigWarning, DeprecatedField, DoctorReport, Explanation,
-    REPORT_FORMAT_VERSION, ReportSummary, ResolutionStep, TraceAudit,
+    AppliedMigration, AuditReport, ConfigReport, ConfigWarning, DeprecatedField, DoctorReport,
+    Explanation, REPORT_FORMAT_VERSION, ReportSummary, ResolutionStep, TraceAudit,
 };
+#[cfg(feature = "schema")]
+#[cfg_attr(docsrs, doc(cfg(feature = "schema")))]
+pub use crate::report::{EXPORT_BUNDLE_FORMAT_VERSION, ExportBundleReport};
 #[cfg(all(feature = "schema", feature = "toml"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "schema", feature = "toml"))))]
 pub use crate::schema::config_example_toml;

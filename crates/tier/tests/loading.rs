@@ -9,10 +9,12 @@ use tempfile::tempdir;
 
 use tier::metadata::prefixed_metadata;
 use tier::{
-    ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, ConfigWarning, EnvDecoder, EnvSource,
-    FieldMetadata, FileFormat, FileSource, Layer, MergeStrategy, REPORT_FORMAT_VERSION, SourceKind,
-    ValidationErrors,
+    ArgsSource, ConfigError, ConfigLoader, ConfigMetadata, ConfigMigration, ConfigWarning,
+    EnvDecoder, EnvSource, FieldMetadata, FileFormat, FileSource, Layer, MergeStrategy,
+    REPORT_FORMAT_VERSION, SourceKind, ValidationErrors, ValidationLevel,
 };
+#[cfg(feature = "schema")]
+use tier::{EXPORT_BUNDLE_FORMAT_VERSION, EnvDocOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct AppConfig {
@@ -4152,10 +4154,11 @@ fn field_source_policies_reject_disallowed_layers() {
             path,
             trace,
             allowed_sources,
+            ..
         } if path == "token"
             && trace.kind == SourceKind::Custom
             && trace.name == "manual"
-            && allowed_sources == vec![SourceKind::Environment, SourceKind::Arguments]
+            && allowed_sources.as_ref() == [SourceKind::Environment, SourceKind::Arguments]
     ));
 }
 
@@ -4172,4 +4175,194 @@ fn field_source_policies_allow_configured_sources() {
         .expect("environment source should be allowed");
 
     assert_eq!(loaded.token.as_deref(), Some("env-secret"));
+}
+
+#[test]
+fn config_migrations_upgrade_legacy_payloads_and_record_report_entries() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct MigrationServer {
+        port: u16,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct MigrationConfig {
+        version: u32,
+        server: MigrationServer,
+    }
+
+    impl Default for MigrationConfig {
+        fn default() -> Self {
+            Self {
+                version: 3,
+                server: MigrationServer { port: 3000 },
+            }
+        }
+    }
+
+    let loaded = ConfigLoader::new(MigrationConfig::default())
+        .config_version("version", 3)
+        .migration(
+            ConfigMigration::rename("legacy_port", "server.port", 2).with_note("use server.port"),
+        )
+        .migration(ConfigMigration::remove("obsolete", 3).with_note("field removed"))
+        .layer(
+            Layer::custom(
+                "legacy",
+                serde_json::json!({
+                    "version": 1,
+                    "legacy_port": 7000,
+                    "obsolete": true,
+                }),
+            )
+            .expect("legacy layer"),
+        )
+        .load()
+        .expect("legacy config should migrate");
+
+    assert_eq!(loaded.version, 3);
+    assert_eq!(loaded.server.port, 7000);
+    assert_eq!(loaded.report().migrations().len(), 2);
+    assert_eq!(loaded.report().doctor_report().summary.migration_count, 2);
+    assert_eq!(loaded.report().doctor_report().migrations.len(), 2);
+}
+
+#[test]
+fn newer_config_versions_are_rejected() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct MigrationConfig {
+        version: u32,
+    }
+
+    impl Default for MigrationConfig {
+        fn default() -> Self {
+            Self { version: 3 }
+        }
+    }
+
+    let error = ConfigLoader::new(MigrationConfig::default())
+        .config_version("version", 3)
+        .layer(Layer::custom("future", serde_json::json!({ "version": 4 })).expect("future layer"))
+        .load()
+        .expect_err("future version should fail");
+
+    assert!(matches!(
+        error,
+        ConfigError::UnsupportedConfigVersion {
+            path,
+            found,
+            supported
+        } if path == "version" && found == 4 && supported == 3
+    ));
+}
+
+#[test]
+fn warning_level_validations_record_warnings_with_custom_messages_and_tags() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct WarningConfig {
+        service_url: String,
+    }
+
+    impl Default for WarningConfig {
+        fn default() -> Self {
+            Self {
+                service_url: "https://example.com".to_owned(),
+            }
+        }
+    }
+
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new("service_url")
+        .url()
+        .validation_level("url", ValidationLevel::Warning)
+        .validation_message("url", "service_url should be a valid URL")
+        .validation_tags("url", ["network", "endpoint"])]);
+
+    let loaded = ConfigLoader::new(WarningConfig::default())
+        .metadata(metadata)
+        .layer(
+            Layer::custom(
+                "manual",
+                serde_json::json!({ "service_url": "http:missing-host" }),
+            )
+            .expect("layer"),
+        )
+        .load()
+        .expect("warning-level validation should not fail load");
+
+    assert!(matches!(
+        loaded.report().warnings(),
+        [ConfigWarning::Validation(error)]
+            if error.path == "service_url"
+                && error.rule.as_deref() == Some("url")
+                && error.message == "service_url should be a valid URL"
+                && error.tags == vec!["network".to_owned(), "endpoint".to_owned()]
+    ));
+}
+
+#[test]
+fn field_source_policies_can_deny_specific_sources() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "token = \"from-file\"\n").expect("config file");
+
+    let metadata =
+        ConfigMetadata::from_fields([FieldMetadata::new("token").deny_sources([SourceKind::File])]);
+
+    let error = ConfigLoader::new(OptionalTokenConfig::default())
+        .metadata(metadata)
+        .with_file(FileSource::new(&path).format(FileFormat::Toml))
+        .load()
+        .expect_err("file layer should be denied");
+
+    assert!(matches!(
+        error,
+        ConfigError::SourcePolicyViolation {
+            path,
+            trace,
+            denied_sources,
+            ..
+        } if path == "token"
+            && trace.kind == SourceKind::File
+            && denied_sources.as_ref() == [SourceKind::File]
+    ));
+}
+
+#[cfg(feature = "schema")]
+#[test]
+fn export_bundle_is_machine_readable_and_versioned() {
+    #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, tier::TierConfig)]
+    struct BundleConfig {
+        port: u16,
+    }
+
+    impl Default for BundleConfig {
+        fn default() -> Self {
+            Self { port: 3000 }
+        }
+    }
+
+    let loaded = ConfigLoader::new(BundleConfig::default())
+        .derive_metadata()
+        .load()
+        .expect("config loads");
+
+    let bundle = loaded.export_bundle(&EnvDocOptions::prefixed("APP"));
+    assert_eq!(bundle.format_version, EXPORT_BUNDLE_FORMAT_VERSION);
+    assert_eq!(bundle.doctor.format_version, REPORT_FORMAT_VERSION);
+    assert_eq!(bundle.audit.format_version, REPORT_FORMAT_VERSION);
+    assert_eq!(
+        bundle.env_docs.format_version,
+        tier::ENV_DOCS_FORMAT_VERSION
+    );
+    assert_eq!(
+        bundle.json_schema.format_version,
+        tier::SCHEMA_EXPORT_FORMAT_VERSION
+    );
+    assert_eq!(
+        bundle.annotated_json_schema.format_version,
+        tier::SCHEMA_EXPORT_FORMAT_VERSION
+    );
+    assert_eq!(
+        bundle.example.format_version,
+        tier::SCHEMA_EXPORT_FORMAT_VERSION
+    );
 }

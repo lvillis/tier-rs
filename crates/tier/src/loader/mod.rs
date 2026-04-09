@@ -19,13 +19,14 @@ use crate::error::LineColumn;
 use crate::error::{ConfigError, UnknownField, ValidationError, ValidationErrors};
 use crate::patch::DeferredPatchLayer;
 use crate::report::{
-    ConfigReport, ConfigWarning, DeprecatedField, ResolutionStep, canonicalize_path_with_aliases,
-    collect_diff_paths, collect_paths, get_value_at_path, join_path, normalize_path,
-    path_matches_pattern, path_overlaps_pattern, path_starts_with_pattern, redact_value,
+    AppliedMigration, ConfigReport, ConfigWarning, DeprecatedField, ResolutionStep,
+    canonicalize_path_with_aliases, collect_diff_paths, collect_paths, get_value_at_path,
+    join_path, normalize_path, path_matches_pattern, path_overlaps_pattern,
+    path_starts_with_pattern, redact_value,
 };
 use crate::{
     ConfigMetadata, EnvDecoder, MergeStrategy, TierMetadata, TierPatch, ValidationCheck,
-    ValidationRule,
+    ValidationLevel, ValidationRule,
 };
 
 mod canonical;
@@ -42,6 +43,7 @@ type CustomEnvDecoder = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 /// Kind of source that contributed configuration values.
 pub enum SourceKind {
     /// Values originating from in-code defaults.
@@ -81,6 +83,66 @@ pub enum UnknownFieldPolicy {
     #[default]
     /// Reject unknown fields with an error.
     Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Migration action applied when upgrading older configuration payloads.
+pub enum ConfigMigrationKind {
+    /// Renames one configuration path to another.
+    Rename {
+        /// Original path used by older configs.
+        from: String,
+        /// Replacement path used by newer configs.
+        to: String,
+    },
+    /// Removes a configuration path that is no longer supported.
+    Remove {
+        /// Path removed from newer configs.
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Declarative migration rule applied to loaded configuration values.
+pub struct ConfigMigration {
+    /// Version introduced by this migration rule.
+    pub since_version: u32,
+    /// Concrete migration action.
+    pub kind: ConfigMigrationKind,
+    /// Optional operator-facing migration note.
+    pub note: Option<String>,
+}
+
+impl ConfigMigration {
+    /// Creates a rename migration from `from` to `to`.
+    #[must_use]
+    pub fn rename(from: impl Into<String>, to: impl Into<String>, since_version: u32) -> Self {
+        Self {
+            since_version,
+            kind: ConfigMigrationKind::Rename {
+                from: from.into(),
+                to: to.into(),
+            },
+            note: None,
+        }
+    }
+
+    /// Creates a removal migration for `path`.
+    #[must_use]
+    pub fn remove(path: impl Into<String>, since_version: u32) -> Self {
+        Self {
+            since_version,
+            kind: ConfigMigrationKind::Remove { path: path.into() },
+            note: None,
+        }
+    }
+
+    /// Attaches an operator-facing migration note.
+    #[must_use]
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
 }
 
 impl Display for UnknownFieldPolicy {
@@ -704,6 +766,40 @@ impl<T> std::ops::Deref for LoadedConfig<T> {
     }
 }
 
+#[cfg(feature = "schema")]
+impl<T> LoadedConfig<T>
+where
+    T: Serialize + DeserializeOwned + crate::JsonSchema + crate::TierMetadata,
+{
+    /// Builds a versioned machine-readable export bundle for downstream tools.
+    #[must_use]
+    pub fn export_bundle(&self, options: &crate::EnvDocOptions) -> crate::ExportBundleReport {
+        crate::ExportBundleReport {
+            format_version: crate::EXPORT_BUNDLE_FORMAT_VERSION,
+            doctor: self.report.doctor_report(),
+            audit: self.report.audit_report(),
+            env_docs: crate::env_docs_report::<T>(options),
+            json_schema: crate::json_schema_report::<T>(),
+            annotated_json_schema: crate::annotated_json_schema_report::<T>(),
+            example: crate::config_example_report::<T>(),
+        }
+    }
+
+    /// Renders the versioned export bundle as JSON.
+    #[must_use]
+    pub fn export_bundle_json(&self, options: &crate::EnvDocOptions) -> Value {
+        serde_json::to_value(self.export_bundle(options))
+            .unwrap_or_else(|_| Value::Object(Default::default()))
+    }
+
+    /// Renders the versioned export bundle as pretty JSON.
+    #[must_use]
+    pub fn export_bundle_json_pretty(&self, options: &crate::EnvDocOptions) -> String {
+        serde_json::to_string_pretty(&self.export_bundle_json(options))
+            .unwrap_or_else(|_| "{\"error\":\"failed to render export bundle\"}".to_owned())
+    }
+}
+
 /// Builder for layered configuration loading.
 ///
 /// `ConfigLoader<T>` is the main entry point for `tier`. It starts from
@@ -755,6 +851,8 @@ pub struct ConfigLoader<T> {
     unknown_field_policy: UnknownFieldPolicy,
     env_decoders: BTreeMap<String, EnvDecoder>,
     custom_env_decoders: BTreeMap<String, CustomEnvDecoder>,
+    config_version: Option<(String, u32)>,
+    migrations: Vec<ConfigMigration>,
 }
 
 impl<T> ConfigLoader<T>
@@ -779,6 +877,8 @@ where
             unknown_field_policy: UnknownFieldPolicy::Deny,
             env_decoders: BTreeMap::new(),
             custom_env_decoders: BTreeMap::new(),
+            config_version: None,
+            migrations: Vec::new(),
         }
     }
 
@@ -896,6 +996,21 @@ where
     {
         let path = path.into();
         self.custom_env_decoders.insert(path, Arc::new(decoder));
+        self
+    }
+
+    /// Declares the configuration version path and the newest version this
+    /// loader understands.
+    #[must_use]
+    pub fn config_version(mut self, path: impl Into<String>, current_version: u32) -> Self {
+        self.config_version = Some((path.into(), current_version));
+        self
+    }
+
+    /// Registers a migration rule applied before deserialization.
+    #[must_use]
+    pub fn migration(mut self, migration: ConfigMigration) -> Self {
+        self.migrations.push(migration);
         self
     }
 
@@ -1124,6 +1239,10 @@ where
         let mut metadata = self.metadata.clone();
         metadata.canonicalize_env_decoder_paths()?;
         metadata.validate_paths()?;
+        if let Some((path, _)) = &self.config_version {
+            let _ = normalize_version_registration_path(path)?;
+        }
+        validate_config_migrations(&self.migrations)?;
         let parsed_args = match self.args_source {
             Some(source) => Some(parse_args(source)?),
             None => None,
@@ -1135,6 +1254,14 @@ where
             .or(self.profile);
         let defaults_shape = serde_json::to_value(&self.defaults)?;
         ensure_root_object(&defaults_shape)?;
+        if !self.migrations.is_empty() && self.config_version.is_none() {
+            return Err(ConfigError::MetadataInvalid {
+                path: String::new(),
+                message:
+                    "configuration migrations require ConfigLoader::config_version(...) to be set"
+                        .to_owned(),
+            });
+        }
 
         let mut layers = Vec::new();
         layers.push(canonicalize_layer_paths(
@@ -1242,6 +1369,17 @@ where
             }
         }
 
+        if let Some((version_path, current_version)) = &self.config_version {
+            let version_path = normalize_version_registration_path(version_path)?;
+            apply_config_migrations(
+                &mut merged,
+                &version_path,
+                *current_version,
+                &self.migrations,
+                &mut report,
+            )?;
+        }
+
         let mut config = match deserialize_with_path(&merged, &report, &string_coercion_paths) {
             Ok(config) => config,
             Err(error) => {
@@ -1321,7 +1459,7 @@ where
         let normalized_value =
             canonicalize_value_paths(&serde_json::to_value(&config)?, &metadata)?;
         let mut declared_errors =
-            validate_declared_rules(&normalized_value, &metadata, &secret_paths);
+            validate_declared_rules(&normalized_value, &metadata, &secret_paths, &mut report);
         declared_errors.extend(validate_declared_checks(
             &normalized_value,
             &metadata,
@@ -1463,23 +1601,245 @@ fn normalize_secret_registration_paths(
         .collect()
 }
 
+fn normalize_version_registration_path(path: &str) -> Result<String, ConfigError> {
+    let normalized =
+        try_normalize_external_path(path).map_err(|message| ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: format!("invalid configuration version path: {message}"),
+        })?;
+    if normalized.is_empty() {
+        return Err(ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: "configuration version path cannot be empty".to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_migration_registration_path(path: &str) -> Result<String, ConfigError> {
+    let normalized =
+        try_normalize_external_path(path).map_err(|message| ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: format!("invalid migration path: {message}"),
+        })?;
+    if normalized.is_empty() {
+        return Err(ConfigError::MetadataInvalid {
+            path: path.to_owned(),
+            message: "migration paths cannot target the configuration root".to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn validate_config_migrations(migrations: &[ConfigMigration]) -> Result<(), ConfigError> {
+    for migration in migrations {
+        match &migration.kind {
+            ConfigMigrationKind::Rename { from, to } => {
+                let _ = normalize_migration_registration_path(from)?;
+                let _ = normalize_migration_registration_path(to)?;
+            }
+            ConfigMigrationKind::Remove { path } => {
+                let _ = normalize_migration_registration_path(path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_config_migrations(
+    merged: &mut Value,
+    version_path: &str,
+    current_version: u32,
+    migrations: &[ConfigMigration],
+    report: &mut ConfigReport,
+) -> Result<(), ConfigError> {
+    let version_path = canonicalize_runtime_path(merged, version_path);
+    let mut working_version = read_config_version(merged, &version_path)?;
+    if working_version > current_version {
+        return Err(ConfigError::UnsupportedConfigVersion {
+            path: version_path,
+            found: working_version,
+            supported: current_version,
+        });
+    }
+
+    let mut sorted = migrations.to_vec();
+    sorted.sort_by_key(|migration| migration.since_version);
+
+    for migration in sorted {
+        if migration.since_version <= working_version || migration.since_version > current_version {
+            continue;
+        }
+
+        match &migration.kind {
+            ConfigMigrationKind::Rename { from, to } => {
+                let from = canonicalize_runtime_path(
+                    merged,
+                    &normalize_migration_registration_path(from)?,
+                );
+                let to =
+                    canonicalize_runtime_path(merged, &normalize_migration_registration_path(to)?);
+                if let Some(value) = take_value_at_path(merged, &from) {
+                    insert_normalized_path(merged, &to, value).map_err(|message| {
+                        ConfigError::MetadataInvalid {
+                            path: to.clone(),
+                            message: format!("failed to apply migration: {message}"),
+                        }
+                    })?;
+                    report.record_migration(AppliedMigration {
+                        kind: "rename".to_owned(),
+                        from_version: working_version,
+                        to_version: migration.since_version,
+                        from_path: from,
+                        to_path: Some(to),
+                        note: migration.note.clone(),
+                    });
+                }
+            }
+            ConfigMigrationKind::Remove { path } => {
+                let path = canonicalize_runtime_path(
+                    merged,
+                    &normalize_migration_registration_path(path)?,
+                );
+                if take_value_at_path(merged, &path).is_some() {
+                    report.record_migration(AppliedMigration {
+                        kind: "remove".to_owned(),
+                        from_version: working_version,
+                        to_version: migration.since_version,
+                        from_path: path,
+                        to_path: None,
+                        note: migration.note.clone(),
+                    });
+                }
+            }
+        }
+
+        working_version = migration.since_version;
+    }
+
+    insert_normalized_path(
+        merged,
+        &version_path,
+        Value::Number(serde_json::Number::from(current_version)),
+    )
+    .map_err(|message| ConfigError::InvalidConfigVersion {
+        path: version_path,
+        message,
+    })?;
+
+    Ok(())
+}
+
+fn read_config_version(value: &Value, path: &str) -> Result<u32, ConfigError> {
+    let Some(found) = get_value_at_path(value, path) else {
+        return Ok(0);
+    };
+
+    let Some(version) = found.as_u64() else {
+        return Err(ConfigError::InvalidConfigVersion {
+            path: path.to_owned(),
+            message: "expected an unsigned integer".to_owned(),
+        });
+    };
+
+    u32::try_from(version).map_err(|_| ConfigError::InvalidConfigVersion {
+        path: path.to_owned(),
+        message: "version must fit in u32".to_owned(),
+    })
+}
+
+fn insert_normalized_path(root: &mut Value, path: &str, value: Value) -> Result<(), String> {
+    let segments = path.split('.').collect::<Vec<_>>();
+    insert_path(root, &segments, value)
+}
+
+fn take_value_at_path(root: &mut Value, path: &str) -> Option<Value> {
+    let segments = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    take_value_at_segments(root, &segments)
+}
+
+fn take_value_at_segments(current: &mut Value, segments: &[&str]) -> Option<Value> {
+    let segment = segments.first()?;
+    if segments.len() == 1 {
+        return match current {
+            Value::Object(map) => map.remove(*segment),
+            Value::Array(values) => {
+                let index = segment.parse::<usize>().ok()?;
+                (index < values.len()).then(|| values.remove(index))
+            }
+            _ => None,
+        };
+    }
+
+    match current {
+        Value::Object(map) => {
+            let child = map.get_mut(*segment)?;
+            take_value_at_segments(child, &segments[1..])
+        }
+        Value::Array(values) => {
+            let index = segment.parse::<usize>().ok()?;
+            let child = values.get_mut(index)?;
+            take_value_at_segments(child, &segments[1..])
+        }
+        _ => None,
+    }
+}
+
 fn enforce_source_policies(layer: &Layer, metadata: &ConfigMetadata) -> Result<(), ConfigError> {
     for (path, trace) in &layer.entries {
         let Some(field) = metadata.field(path) else {
             continue;
         };
-        let Some(allowed_sources) = &field.allowed_sources else {
-            continue;
-        };
-        if allowed_sources.contains(&trace.kind) {
-            continue;
+        if let Some(allowed_sources) = &field.allowed_sources
+            && !allowed_sources.contains(&trace.kind)
+        {
+            return Err(ConfigError::SourcePolicyViolation {
+                path: path.clone(),
+                trace: trace.clone(),
+                allowed_sources: allowed_sources
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                denied_sources: Vec::new().into_boxed_slice(),
+            });
         }
-
-        return Err(ConfigError::SourcePolicyViolation {
-            path: path.clone(),
-            trace: trace.clone(),
-            allowed_sources: allowed_sources.iter().copied().collect(),
-        });
+        if field
+            .denied_sources
+            .as_ref()
+            .is_some_and(|denied_sources| denied_sources.contains(&trace.kind))
+        {
+            return Err(ConfigError::SourcePolicyViolation {
+                path: path.clone(),
+                trace: trace.clone(),
+                allowed_sources: field
+                    .allowed_sources
+                    .as_ref()
+                    .map(|sources| {
+                        sources
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice()
+                    })
+                    .unwrap_or_else(|| Vec::new().into_boxed_slice()),
+                denied_sources: field
+                    .denied_sources
+                    .as_ref()
+                    .map(|sources| {
+                        sources
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice()
+                    })
+                    .unwrap_or_else(|| Vec::new().into_boxed_slice()),
+            });
+        }
     }
 
     Ok(())
@@ -1734,6 +2094,7 @@ fn validate_declared_rules(
     value: &Value,
     metadata: &ConfigMetadata,
     secret_paths: &BTreeSet<String>,
+    report: &mut ConfigReport,
 ) -> ValidationErrors {
     let mut errors = ValidationErrors::new();
 
@@ -1750,7 +2111,18 @@ fn validate_declared_rules(
                 if let Some(error) =
                     validate_declared_rule(matched_path, actual, rule, secret_paths)
                 {
-                    errors.push(error);
+                    let error = decorate_validation_error(error, field, rule);
+                    match field
+                        .validation_configs
+                        .get(rule.code())
+                        .map(|config| config.level)
+                        .unwrap_or(ValidationLevel::Error)
+                    {
+                        ValidationLevel::Error => errors.push(error),
+                        ValidationLevel::Warning => {
+                            report.record_warning(ConfigWarning::Validation(error))
+                        }
+                    }
                 }
             }
         }
@@ -2380,6 +2752,22 @@ fn validation_error(
         error = error.with_expected(expected);
     }
     error.with_actual(actual)
+}
+
+fn decorate_validation_error(
+    mut error: ValidationError,
+    field: &crate::metadata::FieldMetadata,
+    rule: &ValidationRule,
+) -> ValidationError {
+    if let Some(config) = field.validation_configs.get(rule.code()) {
+        if let Some(message) = &config.message {
+            error.message = message.clone();
+        }
+        if !config.tags.is_empty() {
+            error = error.with_tags(config.tags.clone());
+        }
+    }
+    error
 }
 
 fn group_validation_error<I, S>(
