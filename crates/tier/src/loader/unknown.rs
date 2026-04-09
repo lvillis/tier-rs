@@ -178,7 +178,7 @@ where
 {
     let ignored = RefCell::new(Vec::new());
     let known_paths = RefCell::new(BTreeSet::new());
-    let deserializer = CoercingDeserializer::new(
+    let deserializer = super::de::CoercingDeserializer::new(
         value,
         "",
         string_coercion_paths,

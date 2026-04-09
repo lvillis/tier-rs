@@ -115,6 +115,66 @@ last layer through `ConfigLoader::clap_overrides(&parsed_cli)`, and
 `path_expr = tier::path!(...)` keeps CLI-to-config mappings checked during
 refactors.
 
+## CLI-first Applications
+
+`tier` supports CLI-first applications, but it does not try to replace `clap`.
+The intended split is:
+
+- `clap` owns CLI grammar, subcommands, positional arguments, trailing args, and parse-time validation
+- `tier` owns post-parse config layering, typed validation, and diagnostics
+
+For full CLI models, keep the whole `clap` parser and project only the
+config-bearing portion into `tier`:
+
+```rust,no_run
+# #[cfg(all(feature = "derive", feature = "clap"))] {
+# fn main() -> Result<(), tier::ConfigError> {
+use clap::{Args, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use tier::{ConfigLoader, TierPatch};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    port: u16,
+}
+
+#[derive(Debug, Clone, Args, TierPatch, Default)]
+struct ConfigArgs {
+    #[arg(long)]
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum Command {
+    Serve {
+        #[arg(last = true)]
+        trailing: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Parser)]
+struct AppCli {
+    #[command(flatten)]
+    config: ConfigArgs,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+let cli = AppCli::parse_from(["app", "--port", "8080", "serve", "--", "extra"]);
+let loaded = ConfigLoader::new(AppConfig { port: 3000 })
+    .clap_overrides_from(&cli, |cli| &cli.config)?
+    .load()?;
+
+assert_eq!(loaded.port, 8080);
+assert!(matches!(
+    cli.command,
+    Some(Command::Serve { ref trailing }) if trailing == &["extra"]
+));
+# Ok(())
+# }
+# }
+```
+
 ## Structured Env Values
 
 `tier` can decode common operational env formats without forcing applications

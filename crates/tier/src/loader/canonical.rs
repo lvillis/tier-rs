@@ -1,4 +1,5 @@
 use super::*;
+use crate::ValidationCheck;
 
 pub(super) fn canonicalize_layer_paths(
     layer: Layer,

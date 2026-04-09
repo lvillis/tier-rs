@@ -52,7 +52,10 @@ impl TierCliCommand {
 ///
 /// Embed `TierCli` into an existing application CLI with `#[command(flatten)]`
 /// to reuse `tier`'s config-related flags without rebuilding that surface
-/// yourself.
+/// yourself. In CLI-first applications, `clap` should continue to own the CLI
+/// grammar, subcommands, positional arguments, trailing args, and parse-time
+/// validation. `tier` starts after parse and handles layered config loading,
+/// typed validation, and diagnostics.
 ///
 /// # Examples
 ///
@@ -175,6 +178,12 @@ impl TierCli {
         T: Serialize + DeserializeOwned,
     {
         loader.args(self.to_args_source())
+    }
+
+    /// Renders a [`ConfigError`] in a CLI-friendly form.
+    #[must_use]
+    pub fn render_error(error: &ConfigError) -> String {
+        error.cli_message()
     }
 
     /// Renders output for runtime, validation, print, and explain commands.

@@ -8,6 +8,7 @@ mod cli;
 #[cfg(feature = "schema")]
 mod docs;
 mod error;
+mod export;
 mod loader;
 /// Internal metadata helpers used by the derive macro.
 #[doc(hidden)]

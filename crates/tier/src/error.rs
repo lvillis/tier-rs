@@ -495,6 +495,28 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// Renders the error in a CLI-friendly form for terminal output.
+    #[must_use]
+    pub fn cli_message(&self) -> String {
+        match self {
+            Self::UnknownFields { fields } => {
+                format!(
+                    "Unknown configuration fields:\n{}",
+                    format_unknown_fields(fields)
+                )
+            }
+            Self::Validation { errors, .. } | Self::DeclaredValidation { errors } => {
+                format!("Configuration validation failed:\n{errors}")
+            }
+            Self::ExplainPathNotFound { path } => {
+                format!("Configuration path `{path}` was not found in the final report")
+            }
+            _ => format!("Configuration error: {self}"),
+        }
+    }
+}
+
 fn format_location(location: Option<LineColumn>) -> String {
     match location {
         Some(location) => format!(" ({location})"),

@@ -614,7 +614,7 @@ fn canonical_overlapping_array_patch_paths_are_rejected() {
 
 #[cfg(feature = "clap")]
 mod clap_bridge {
-    use clap::{Args, Parser};
+    use clap::{Args, Parser, Subcommand};
 
     use super::*;
 
@@ -632,6 +632,62 @@ mod clap_bridge {
         #[arg(long = "db-token")]
         #[tier(path_expr = tier::path!(PatchConfig.db.token))]
         token: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Args, TierPatch, Default)]
+    struct ConfigArgs {
+        #[arg(long)]
+        #[tier(path = "server.port")]
+        port: Option<u16>,
+        #[arg(long = "db-token")]
+        #[tier(path_expr = tier::path!(PatchConfig.db.token))]
+        token: Option<String>,
+    }
+
+    #[derive(Debug, Clone, TierPatch)]
+    enum CommandPatch {
+        #[tier(path = "server")]
+        Serve(ServerCli),
+        RotateCredentials {
+            #[tier(path_expr = tier::path!(PatchConfig.db.token))]
+            token: Option<String>,
+        },
+        Inspect,
+    }
+
+    #[derive(Debug, Clone, Subcommand)]
+    enum Command {
+        Serve {
+            #[arg(last = true)]
+            trailing: Vec<String>,
+        },
+        Inspect,
+    }
+
+    #[derive(Debug, Clone, Parser)]
+    struct FullCli {
+        #[command(flatten)]
+        config: ConfigArgs,
+        #[command(subcommand)]
+        command: Option<Command>,
+        #[arg(long)]
+        verbose: bool,
+    }
+
+    #[derive(Debug, Clone, Parser, TierPatch)]
+    struct DirectCli {
+        #[arg(long)]
+        #[tier(path = "server.port")]
+        port: Option<u16>,
+        #[arg(long = "db-token")]
+        #[tier(path_expr = tier::path!(PatchConfig.db.token))]
+        token: Option<String>,
+        #[arg(long)]
+        #[tier(skip)]
+        verbose: bool,
+        #[arg(last = true)]
+        #[tier(skip)]
+        trailing: Vec<String>,
     }
 
     #[test]
@@ -712,5 +768,104 @@ mod clap_bridge {
             .expect("server.port explanation");
         let port_step = explanation.steps.last().expect("latest step");
         assert!(port_step.source.to_string().contains("typed-clap"));
+    }
+
+    #[test]
+    fn typed_patch_enums_support_tuple_and_named_variants() {
+        let serve_loaded = ConfigLoader::new(PatchConfig::default())
+            .clap_overrides(&CommandPatch::Serve(ServerCli { port: Some(8124) }))
+            .expect("tuple variant patch is valid")
+            .load()
+            .expect("config loads");
+
+        assert_eq!(serve_loaded.server.port, 8124);
+
+        let rotated_loaded = ConfigLoader::new(PatchConfig::default())
+            .clap_overrides(&CommandPatch::RotateCredentials {
+                token: Some("rotated".to_owned()),
+            })
+            .expect("named variant patch is valid")
+            .load()
+            .expect("config loads");
+
+        assert_eq!(rotated_loaded.db.token.as_deref(), Some("rotated"));
+
+        let inspect_loaded = ConfigLoader::new(PatchConfig::default())
+            .clap_overrides(&CommandPatch::Inspect)
+            .expect("unit variant patch is valid")
+            .load()
+            .expect("config loads");
+
+        assert_eq!(
+            inspect_loaded.server.port,
+            PatchConfig::default().server.port
+        );
+        assert_eq!(inspect_loaded.db.token, PatchConfig::default().db.token);
+    }
+
+    #[test]
+    fn direct_typed_clap_structs_can_skip_cli_only_fields() {
+        let cli = DirectCli::try_parse_from([
+            "app",
+            "--port",
+            "8125",
+            "--db-token",
+            "from-direct",
+            "--verbose",
+            "--",
+            "serve",
+            "--color=always",
+        ])
+        .expect("CLI parses");
+
+        let loaded = ConfigLoader::new(PatchConfig::default())
+            .clap_overrides(&cli)
+            .expect("typed clap overrides are valid")
+            .load()
+            .expect("config loads");
+
+        assert_eq!(loaded.server.port, 8125);
+        assert_eq!(loaded.db.token.as_deref(), Some("from-direct"));
+        assert!(loaded.report().explain("verbose").is_none());
+        assert!(loaded.report().explain("trailing").is_none());
+    }
+
+    #[test]
+    fn typed_clap_projection_helper_supports_cli_first_models() {
+        let cli = FullCli::try_parse_from([
+            "app",
+            "--port",
+            "8126",
+            "--db-token",
+            "from-projected-cli",
+            "serve",
+            "--",
+            "deploy",
+            "--force",
+        ])
+        .expect("CLI parses");
+
+        let loaded = ConfigLoader::new(PatchConfig::default())
+            .clap_overrides_from(&cli, |cli| &cli.config)
+            .expect("projected typed clap overrides are valid")
+            .load()
+            .expect("config loads");
+
+        assert_eq!(loaded.server.port, 8126);
+        assert_eq!(loaded.db.token.as_deref(), Some("from-projected-cli"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { ref trailing }) if trailing == &["deploy", "--force"]
+        ));
+    }
+
+    #[test]
+    fn tier_cli_renders_config_errors_for_terminal_output() {
+        let rendered = tier::TierCli::render_error(&tier::ConfigError::DeclaredValidation {
+            errors: tier::ValidationErrors::from_message("db.token", "must not be empty"),
+        });
+
+        assert!(rendered.contains("Configuration validation failed:"));
+        assert!(rendered.contains("- db.token: must not be empty"));
     }
 }

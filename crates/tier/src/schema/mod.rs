@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::{ConfigMetadata, FieldMetadata, TierMetadata};
+use crate::{
+    ConfigMetadata, FieldMetadata, TierMetadata,
+    export::{json_pretty, json_value},
+};
 use regex::Regex;
 use serde_json::Value;
 #[cfg(feature = "toml")]
@@ -55,8 +58,7 @@ pub fn json_schema_for<T>() -> Value
 where
     T: JsonSchema,
 {
-    serde_json::to_value(schemars::schema_for!(T))
-        .unwrap_or_else(|_| Value::Object(Default::default()))
+    json_value(&schemars::schema_for!(T), Value::Object(Default::default()))
 }
 
 /// Exports the JSON Schema for a configuration type as pretty JSON.
@@ -65,8 +67,10 @@ pub fn json_schema_pretty<T>() -> String
 where
     T: JsonSchema,
 {
-    serde_json::to_string_pretty(&json_schema_for::<T>())
-        .unwrap_or_else(|_| "{\"error\":\"failed to render schema\"}".to_owned())
+    json_pretty(
+        &json_schema_for::<T>(),
+        "{\"error\":\"failed to render schema\"}",
+    )
 }
 
 /// Exports the JSON Schema in a versioned machine-readable wrapper.
@@ -87,8 +91,10 @@ pub fn json_schema_report_json<T>() -> Value
 where
     T: JsonSchema,
 {
-    serde_json::to_value(json_schema_report::<T>())
-        .unwrap_or_else(|_| Value::Object(Default::default()))
+    json_value(
+        &json_schema_report::<T>(),
+        Value::Object(Default::default()),
+    )
 }
 
 /// Renders the versioned JSON Schema export as pretty JSON.
@@ -97,8 +103,10 @@ pub fn json_schema_report_json_pretty<T>() -> String
 where
     T: JsonSchema,
 {
-    serde_json::to_string_pretty(&json_schema_report_json::<T>())
-        .unwrap_or_else(|_| "{\"error\":\"failed to render schema report\"}".to_owned())
+    json_pretty(
+        &json_schema_report_json::<T>(),
+        "{\"error\":\"failed to render schema report\"}",
+    )
 }
 
 /// Exports the JSON Schema for a configuration type annotated with `tier` metadata.
@@ -147,8 +155,10 @@ pub fn annotated_json_schema_pretty<T>() -> String
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_string_pretty(&annotated_json_schema_for::<T>())
-        .unwrap_or_else(|_| "{\"error\":\"failed to render schema\"}".to_owned())
+    json_pretty(
+        &annotated_json_schema_for::<T>(),
+        "{\"error\":\"failed to render schema\"}",
+    )
 }
 
 /// Exports the annotated JSON Schema in a versioned machine-readable wrapper.
@@ -169,8 +179,10 @@ pub fn annotated_json_schema_report_json<T>() -> Value
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_value(annotated_json_schema_report::<T>())
-        .unwrap_or_else(|_| Value::Object(Default::default()))
+    json_value(
+        &annotated_json_schema_report::<T>(),
+        Value::Object(Default::default()),
+    )
 }
 
 /// Renders the versioned annotated JSON Schema export as pretty JSON.
@@ -179,8 +191,10 @@ pub fn annotated_json_schema_report_json_pretty<T>() -> String
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_string_pretty(&annotated_json_schema_report_json::<T>())
-        .unwrap_or_else(|_| "{\"error\":\"failed to render schema report\"}".to_owned())
+    json_pretty(
+        &annotated_json_schema_report_json::<T>(),
+        "{\"error\":\"failed to render schema report\"}",
+    )
 }
 
 /// Generates a machine-readable example configuration value from schema and metadata.
@@ -222,8 +236,10 @@ pub fn config_example_pretty<T>() -> String
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_string_pretty(&config_example_for::<T>())
-        .unwrap_or_else(|_| "{\"error\":\"failed to render example config\"}".to_owned())
+    json_pretty(
+        &config_example_for::<T>(),
+        "{\"error\":\"failed to render example config\"}",
+    )
 }
 
 /// Exports the generated example configuration in a versioned wrapper.
@@ -244,8 +260,10 @@ pub fn config_example_report_json<T>() -> Value
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_value(config_example_report::<T>())
-        .unwrap_or_else(|_| Value::Object(Default::default()))
+    json_value(
+        &config_example_report::<T>(),
+        Value::Object(Default::default()),
+    )
 }
 
 /// Renders the versioned example export as pretty JSON.
@@ -254,8 +272,10 @@ pub fn config_example_report_json_pretty<T>() -> String
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_string_pretty(&config_example_report_json::<T>())
-        .unwrap_or_else(|_| "{\"error\":\"failed to render example report\"}".to_owned())
+    json_pretty(
+        &config_example_report_json::<T>(),
+        "{\"error\":\"failed to render example report\"}",
+    )
 }
 
 #[cfg(feature = "toml")]
@@ -374,17 +394,19 @@ fn annotate_schema_node(node: &mut Value, field: &FieldMetadata) {
         "x-tier-merge".to_owned(),
         Value::String(field.merge.to_string()),
     );
-    if let Some(allowed_sources) = &field.allowed_sources {
+    let allowed_sources = field.allowed_source_names();
+    if !allowed_sources.is_empty() {
         let sources = allowed_sources
-            .iter()
-            .map(|source| Value::String(source.to_string()))
+            .into_iter()
+            .map(Value::String)
             .collect::<Vec<_>>();
         object.insert("x-tier-sources".to_owned(), Value::Array(sources));
     }
-    if let Some(denied_sources) = &field.denied_sources {
+    let denied_sources = field.denied_source_names();
+    if !denied_sources.is_empty() {
         let sources = denied_sources
-            .iter()
-            .map(|source| Value::String(source.to_string()))
+            .into_iter()
+            .map(Value::String)
             .collect::<Vec<_>>();
         object.insert("x-tier-denied-sources".to_owned(), Value::Array(sources));
     }
@@ -394,12 +416,8 @@ fn annotate_schema_node(node: &mut Value, field: &FieldMetadata) {
             serde_json::to_value(&field.validations).unwrap_or_else(|_| Value::Array(Vec::new())),
         );
     }
-    if !field.validation_configs.is_empty() {
-        object.insert(
-            "x-tier-validation-config".to_owned(),
-            serde_json::to_value(&field.validation_configs)
-                .unwrap_or_else(|_| Value::Object(Default::default())),
-        );
+    if let Some(validation_config) = field.validation_config_json() {
+        object.insert("x-tier-validation-config".to_owned(), validation_config);
     }
 }
 

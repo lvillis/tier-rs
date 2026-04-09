@@ -70,28 +70,28 @@ fn expand_tier_patch(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
     let generics = input.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let container_attrs = parse_serde_container_attrs(&input.attrs)?;
-    ensure_struct_patch_container_attrs(&container_attrs)?;
 
-    let field_tokens = match input.data {
-        Data::Struct(data_struct) => match data_struct.fields {
-            Fields::Named(fields) => expand_patch_fields_metadata(
-                fields,
-                SerdeFieldContext::for_struct(&container_attrs),
-            )?,
-            Fields::Unnamed(fields) => {
-                return Err(syn::Error::new_spanned(
+    let write_tokens = match input.data {
+        Data::Struct(data_struct) => {
+            ensure_struct_patch_container_attrs(&container_attrs)?;
+            let field_tokens = match data_struct.fields {
+                Fields::Named(fields) => expand_patch_fields_metadata(
                     fields,
-                    "TierPatch only supports structs with named fields",
-                ));
+                    SerdeFieldContext::for_struct(&container_attrs),
+                )?,
+                Fields::Unnamed(fields) => {
+                    return Err(syn::Error::new_spanned(
+                        fields,
+                        "TierPatch only supports structs with named fields",
+                    ));
+                }
+                Fields::Unit => Vec::new(),
+            };
+            quote! {
+                #(#field_tokens)*
             }
-            Fields::Unit => Vec::new(),
-        },
-        Data::Enum(data_enum) => {
-            return Err(syn::Error::new_spanned(
-                data_enum.enum_token,
-                "TierPatch cannot be derived for enums",
-            ));
         }
+        Data::Enum(data_enum) => expand_patch_enum_metadata(data_enum, &container_attrs)?,
         Data::Union(union) => {
             return Err(syn::Error::new_spanned(
                 union.union_token,
@@ -107,7 +107,7 @@ fn expand_tier_patch(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 __tier_builder: &mut ::tier::patch::PatchLayerBuilder,
                 __tier_prefix: &str,
             ) -> ::std::result::Result<(), ::tier::ConfigError> {
-                #(#field_tokens)*
+                #write_tokens
                 Ok(())
             }
         }
@@ -499,15 +499,35 @@ fn expand_patch_field_metadata(
     field: Field,
     context: SerdeFieldContext,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let field_ident = field.ident.expect("named field");
+    let field_ident = field.ident.clone().expect("named field");
+    let field_access = quote! { &self.#field_ident };
+    expand_patch_bound_field(field, context, field_access)
+}
+
+fn expand_patch_bound_field(
+    field: Field,
+    context: SerdeFieldContext,
+    field_access: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let field_ident = field.ident.clone().expect("named field");
     let serde_attrs = parse_serde_field_attrs(&field.attrs, &field_ident, context)?;
     let attrs = parse_patch_attrs(&field.attrs)?;
 
     if serde_attrs.skip_metadata {
-        if attrs.path.is_some() || attrs.path_expr.is_some() || attrs.nested {
+        if attrs.has_non_skip() {
             return Err(syn::Error::new_spanned(
                 field_ident,
                 "skipped fields cannot use tier patch attributes",
+            ));
+        }
+        return Ok(quote! {});
+    }
+
+    if attrs.skip {
+        if attrs.has_non_skip() {
+            return Err(syn::Error::new_spanned(
+                field_ident,
+                "skipped patch fields cannot use other tier patch attributes",
             ));
         }
         return Ok(quote! {});
@@ -530,16 +550,15 @@ fn expand_patch_field_metadata(
     let path_expr = if serde_attrs.flatten {
         quote! { ::std::string::String::from(__tier_prefix) }
     } else if let Some(path_expr) = attrs.path_expr {
-        quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_expr) }
+        quote! { ::tier::patch::join_patch_prefix(&__tier_prefix, #path_expr) }
     } else {
         let default_path = attrs
             .path
             .clone()
             .unwrap_or_else(|| serde_attrs.canonical_name.clone());
         let path_lit = LitStr::new(&default_path, field_ident.span());
-        quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_lit) }
+        quote! { ::tier::patch::join_patch_prefix(&__tier_prefix, #path_lit) }
     };
-    let field_access = quote! { &self.#field_ident };
 
     if serde_attrs.flatten || attrs.nested {
         return Ok(generate_nested_patch_tokens(
@@ -554,6 +573,140 @@ fn expand_patch_field_metadata(
         field_access,
         path_expr,
     ))
+}
+
+fn expand_patch_enum_metadata(
+    data_enum: DataEnum,
+    container_attrs: &SerdeContainerAttrs,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut variant_arms = Vec::new();
+    let context = SerdeFieldContext::for_enum_variant_fields(container_attrs);
+
+    for variant in data_enum.variants {
+        let variant_ident = variant.ident.clone();
+        let serde_attrs =
+            parse_serde_variant_attrs(&variant.attrs, &variant_ident, container_attrs)?;
+        let attrs = parse_patch_attrs(&variant.attrs)?;
+
+        if serde_attrs.skip_metadata {
+            if attrs.has_non_skip() {
+                return Err(syn::Error::new_spanned(
+                    variant_ident,
+                    "skipped variants cannot use tier patch attributes",
+                ));
+            }
+            variant_arms.push(expand_noop_patch_variant_arm(
+                &variant_ident,
+                &variant.fields,
+            ));
+            continue;
+        }
+
+        if attrs.skip {
+            if attrs.has_non_skip() {
+                return Err(syn::Error::new_spanned(
+                    variant_ident,
+                    "skipped patch variants cannot use other tier patch attributes",
+                ));
+            }
+            variant_arms.push(expand_noop_patch_variant_arm(
+                &variant_ident,
+                &variant.fields,
+            ));
+            continue;
+        }
+
+        if attrs.path.is_some() && attrs.path_expr.is_some() {
+            return Err(syn::Error::new_spanned(
+                variant_ident,
+                "patch variants must use either tier(path = ...) or tier(path_expr = ...), not both",
+            ));
+        }
+
+        let variant_prefix = if let Some(path_expr) = attrs.path_expr {
+            quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_expr) }
+        } else if let Some(path) = attrs.path {
+            let path_lit = LitStr::new(&path, variant_ident.span());
+            quote! { ::tier::patch::join_patch_prefix(__tier_prefix, #path_lit) }
+        } else {
+            quote! { ::std::string::String::from(__tier_prefix) }
+        };
+
+        match variant.fields {
+            Fields::Named(fields) => {
+                let mut bindings = Vec::new();
+                let mut body_tokens = Vec::new();
+                for field in fields.named {
+                    let binding_ident = field.ident.clone().expect("named field");
+                    body_tokens.push(expand_patch_bound_field(
+                        field,
+                        context,
+                        quote! { #binding_ident },
+                    )?);
+                    bindings.push(quote! { #binding_ident });
+                }
+
+                variant_arms.push(quote! {
+                    Self::#variant_ident { #(#bindings),* } => {
+                        let __tier_prefix = #variant_prefix;
+                        #(#body_tokens)*
+                    }
+                });
+            }
+            Fields::Unnamed(fields) => {
+                if fields.unnamed.len() != 1 {
+                    return Err(syn::Error::new_spanned(
+                        fields,
+                        "TierPatch only supports tuple variants with exactly one field",
+                    ));
+                }
+                let field = fields.unnamed.into_iter().next().expect("single field");
+                if parse_patch_attrs(&field.attrs)?.has_any()
+                    || has_field_naming_attrs(&field.attrs)?
+                {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "tuple patch variants cannot use field-level tier or serde naming attributes",
+                    ));
+                }
+                let binding_ident = format_ident!("__tier_variant_value");
+                let body_token = generate_nested_patch_tokens(
+                    &field.ty,
+                    quote! { #binding_ident },
+                    quote! { __tier_prefix.clone() },
+                );
+
+                variant_arms.push(quote! {
+                    Self::#variant_ident(#binding_ident) => {
+                        let __tier_prefix = #variant_prefix;
+                        #body_token
+                    }
+                });
+            }
+            Fields::Unit => {
+                variant_arms.push(quote! {
+                    Self::#variant_ident => {}
+                });
+            }
+        }
+    }
+
+    Ok(quote! {
+        match self {
+            #(#variant_arms),*
+        }
+    })
+}
+
+fn expand_noop_patch_variant_arm(
+    variant_ident: &syn::Ident,
+    fields: &Fields,
+) -> proc_macro2::TokenStream {
+    match fields {
+        Fields::Named(_) => quote! { Self::#variant_ident { .. } => {} },
+        Fields::Unnamed(_) => quote! { Self::#variant_ident(..) => {} },
+        Fields::Unit => quote! { Self::#variant_ident => {} },
+    }
 }
 
 fn generate_nested_patch_tokens(
@@ -692,6 +845,17 @@ struct PatchAttrs {
     path: Option<String>,
     path_expr: Option<Expr>,
     nested: bool,
+    skip: bool,
+}
+
+impl PatchAttrs {
+    fn has_any(&self) -> bool {
+        self.path.is_some() || self.path_expr.is_some() || self.nested || self.skip
+    }
+
+    fn has_non_skip(&self) -> bool {
+        self.path.is_some() || self.path_expr.is_some() || self.nested
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1115,6 +1279,11 @@ fn parse_patch_attrs(attributes: &[Attribute]) -> syn::Result<PatchAttrs> {
             }
             if meta.path.is_ident("nested") {
                 attrs.nested = true;
+                consume_unused_meta(meta)?;
+                return Ok(());
+            }
+            if meta.path.is_ident("skip") {
+                attrs.skip = true;
                 consume_unused_meta(meta)?;
                 return Ok(());
             }

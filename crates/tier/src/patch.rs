@@ -85,6 +85,8 @@ impl<T> From<T> for Patch<T> {
 ///
 /// - `Option<T>` fields only write when they are `Some(...)`
 /// - nested patch structs can be connected with `#[tier(nested)]`
+/// - CLI-only fields can be ignored with `#[tier(skip)]`
+/// - enums can be used for subcommand-like patch models
 /// - use [`Patch<Option<T>>`] when the patch must distinguish "unset" from
 ///   "explicitly clear this optional config field"
 ///

@@ -5,6 +5,7 @@ use std::fmt::{self, Display, Formatter};
 use serde_json::Value;
 
 use crate::error::{UnknownField, ValidationError};
+use crate::export::{json_pretty, json_value};
 use crate::loader::SourceTrace;
 
 /// Stable version tag for machine-readable doctor and audit reports.
@@ -409,8 +410,10 @@ impl ConfigReport {
     /// Returns the final redacted configuration rendered as pretty JSON.
     #[must_use]
     pub fn redacted_pretty_json(&self) -> String {
-        serde_json::to_string_pretty(&self.redacted_value())
-            .unwrap_or_else(|_| "{\"error\":\"failed to render report\"}".to_owned())
+        json_pretty(
+            &self.redacted_value(),
+            "{\"error\":\"failed to render report\"}",
+        )
     }
 
     /// Explains how a configuration path was resolved.
@@ -538,29 +541,31 @@ impl ConfigReport {
     /// Renders a machine-readable operational summary of the loaded configuration.
     #[must_use]
     pub fn doctor_json(&self) -> Value {
-        serde_json::to_value(self.doctor_report())
-            .unwrap_or_else(|_| Value::Object(Default::default()))
+        json_value(&self.doctor_report(), Value::Object(Default::default()))
     }
 
     /// Renders the machine-readable doctor output as pretty JSON.
     #[must_use]
     pub fn doctor_json_pretty(&self) -> String {
-        serde_json::to_string_pretty(&self.doctor_json())
-            .unwrap_or_else(|_| "{\"error\":\"failed to render doctor report\"}".to_owned())
+        json_pretty(
+            &self.doctor_json(),
+            "{\"error\":\"failed to render doctor report\"}",
+        )
     }
 
     /// Renders a machine-readable audit payload including path traces.
     #[must_use]
     pub fn audit_json(&self) -> Value {
-        serde_json::to_value(self.audit_report())
-            .unwrap_or_else(|_| Value::Object(Default::default()))
+        json_value(&self.audit_report(), Value::Object(Default::default()))
     }
 
     /// Renders the machine-readable audit output as pretty JSON.
     #[must_use]
     pub fn audit_json_pretty(&self) -> String {
-        serde_json::to_string_pretty(&self.audit_json())
-            .unwrap_or_else(|_| "{\"error\":\"failed to render audit report\"}".to_owned())
+        json_pretty(
+            &self.audit_json(),
+            "{\"error\":\"failed to render audit report\"}",
+        )
     }
 
     pub(crate) fn latest_source_for(&self, path: &str) -> Option<SourceTrace> {

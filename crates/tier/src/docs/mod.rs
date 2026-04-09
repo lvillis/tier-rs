@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use crate::{
     ConfigMetadata, FieldMetadata, JsonSchema, MergeStrategy, SourceKind, TierMetadata,
-    ValidationRule, json_schema_for,
+    ValidationRule,
+    export::{json_pretty, json_value},
+    json_schema_for,
     schema::{dynamic_object_placeholder_for_schema, required_contains_additional_items_for_docs},
 };
 
@@ -316,7 +318,7 @@ pub fn env_docs_json<T>(options: &EnvDocOptions) -> Value
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_value(env_docs_for::<T>(options)).unwrap_or_else(|_| Value::Array(Vec::new()))
+    json_value(&env_docs_for::<T>(options), Value::Array(Vec::new()))
 }
 
 /// Renders machine-readable environment variable documentation as pretty JSON.
@@ -325,7 +327,7 @@ pub fn env_docs_json_pretty<T>(options: &EnvDocOptions) -> String
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_string_pretty(&env_docs_json::<T>(options)).unwrap_or_else(|_| "[]".to_owned())
+    json_pretty(&env_docs_json::<T>(options), "[]")
 }
 
 /// Renders versioned machine-readable environment variable documentation.
@@ -346,8 +348,10 @@ pub fn env_docs_report_json<T>(options: &EnvDocOptions) -> Value
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_value(env_docs_report::<T>(options))
-        .unwrap_or_else(|_| Value::Object(Default::default()))
+    json_value(
+        &env_docs_report::<T>(options),
+        Value::Object(Default::default()),
+    )
 }
 
 /// Renders versioned environment variable documentation as pretty JSON.
@@ -356,8 +360,10 @@ pub fn env_docs_report_json_pretty<T>(options: &EnvDocOptions) -> String
 where
     T: JsonSchema + TierMetadata,
 {
-    serde_json::to_string_pretty(&env_docs_report_json::<T>(options))
-        .unwrap_or_else(|_| "{\"error\":\"failed to render env docs report\"}".to_owned())
+    json_pretty(
+        &env_docs_report_json::<T>(options),
+        "{\"error\":\"failed to render env docs report\"}",
+    )
 }
 
 fn apply_field_metadata(
@@ -396,32 +402,17 @@ fn apply_field_metadata(
         if field.merge != MergeStrategy::Merge {
             entry.merge = field.merge;
         }
-        if let Some(allowed_sources) = &field.allowed_sources {
-            entry.allowed_sources = allowed_sources.iter().copied().collect::<Vec<_>>();
-        }
-        if let Some(denied_sources) = &field.denied_sources {
-            entry.denied_sources = denied_sources.iter().copied().collect::<Vec<_>>();
-        }
+        entry.allowed_sources = field.allowed_sources_vec();
+        entry.denied_sources = field.denied_sources_vec();
         for rule in &field.validations {
             if !entry.validations.contains(rule) {
                 entry.validations.push(rule.clone());
             }
         }
-        for (rule_code, config) in &field.validation_configs {
-            entry
-                .validation_levels
-                .insert(rule_code.clone(), config.level);
-            if let Some(message) = &config.message {
-                entry
-                    .validation_messages
-                    .insert(rule_code.clone(), message.clone());
-            }
-            if !config.tags.is_empty() {
-                entry
-                    .validation_tags
-                    .insert(rule_code.clone(), config.tags.clone());
-            }
-        }
+        let validation_export = field.validation_export();
+        entry.validation_levels.extend(validation_export.levels);
+        entry.validation_messages.extend(validation_export.messages);
+        entry.validation_tags.extend(validation_export.tags);
         if field.has_default {
             entry.required = false;
         }
