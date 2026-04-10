@@ -273,11 +273,14 @@ fn insert_env_value(
     let custom_decoder = if decoder.is_some() {
         None
     } else {
-        custom_env_decoder_for_path(path.as_str(), metadata, custom_env_decoders)
+        custom_env_decoder_for_path(path.as_str(), custom_env_decoders)
     };
+    let metadata_env_decoder = metadata
+        .effective_field_for(&path)
+        .and_then(|field| field.env_decode);
     let decoder = decoder
-        .or_else(|| env_decoder_for_path(path.as_str(), metadata, env_decoders))
-        .or_else(|| metadata.field(&path).and_then(|field| field.env_decode));
+        .or_else(|| env_decoder_for_path(path.as_str(), env_decoders))
+        .or(metadata_env_decoder);
     let parsed =
         parse_env_override_value(raw_value, decoder, custom_decoder).map_err(|message| {
             ConfigError::InvalidEnv {
@@ -431,16 +434,12 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 
 fn custom_env_decoder_for_path<'a>(
     path: &str,
-    metadata: &ConfigMetadata,
     custom_env_decoders: &'a BTreeMap<String, CustomEnvDecoder>,
 ) -> Option<&'a CustomEnvDecoder> {
-    let canonical = metadata
-        .field(path)
-        .map_or(path, |field| field.path.as_str());
     let mut best = None::<((usize, usize, Vec<bool>), &CustomEnvDecoder)>;
 
     for (pattern, decoder) in custom_env_decoders {
-        if !path_matches_pattern(canonical, pattern) {
+        if !path_matches_pattern(path, pattern) {
             continue;
         }
 
@@ -469,16 +468,12 @@ fn custom_env_decoder_for_path<'a>(
 
 fn env_decoder_for_path(
     path: &str,
-    metadata: &ConfigMetadata,
     env_decoders: &BTreeMap<String, EnvDecoder>,
 ) -> Option<EnvDecoder> {
-    let canonical = metadata
-        .field(path)
-        .map_or(path, |field| field.path.as_str());
     let mut best = None::<((usize, usize, Vec<bool>), EnvDecoder)>;
 
     for (pattern, decoder) in env_decoders {
-        if !path_matches_pattern(canonical, pattern) {
+        if !path_matches_pattern(path, pattern) {
             continue;
         }
 

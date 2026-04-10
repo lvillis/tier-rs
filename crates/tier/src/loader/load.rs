@@ -65,6 +65,9 @@ where
             layers.push(canonicalize_layer_paths(layer, &metadata)?);
         }
 
+        metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
+        let _ = metadata.env_overrides()?;
+
         for env_source in self.env_sources {
             metadata = canonicalize_metadata_against_layers(&metadata, &layers)?;
             let env_decoders = canonicalize_env_decoders(&self.env_decoders, &metadata, &layers)?;
@@ -740,30 +743,24 @@ fn record_deprecation_warnings(
         return;
     }
 
-    let deprecated = metadata
-        .fields()
-        .iter()
-        .filter(|field| field.deprecated.is_some())
-        .collect::<Vec<_>>();
-    if deprecated.is_empty() {
-        return;
-    }
-
     let mut used_paths = Vec::new();
     collect_paths(&layer.value, "", &mut used_paths);
     used_paths.sort();
     used_paths.dedup();
 
     let mut warned = BTreeSet::new();
-    for field in deprecated {
-        let used = used_paths
-            .iter()
-            .any(|path| path_starts_with_pattern(path, &field.path));
-        if used && warned.insert(field.path.clone()) {
+    for path in used_paths {
+        let Some(field) = metadata.effective_field_for(&path) else {
+            continue;
+        };
+        let Some(note) = field.deprecated.clone() else {
+            continue;
+        };
+        if warned.insert(path.clone()) {
             report.record_warning(ConfigWarning::DeprecatedField(
-                DeprecatedField::new(field.path.clone())
+                DeprecatedField::new(path)
                     .with_source(Some(layer.trace.clone()))
-                    .with_note(field.deprecated.clone()),
+                    .with_note(Some(note)),
             ));
         }
     }

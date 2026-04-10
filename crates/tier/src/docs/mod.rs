@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use crate::{
-    ConfigMetadata, FieldMetadata, JsonSchema, MergeStrategy, SourceKind, TierMetadata,
-    ValidationRule,
+    ConfigMetadata, JsonSchema, MergeStrategy, SourceKind, TierMetadata, ValidationRule,
     export::{json_pretty, json_value},
     json_schema_for,
     schema::{dynamic_object_placeholder_for_schema, required_contains_additional_items_for_docs},
@@ -371,7 +370,7 @@ fn apply_field_metadata(
     metadata: &ConfigMetadata,
     options: &EnvDocOptions,
 ) {
-    let fields = matching_field_metadata_for_path(metadata, &entry.path);
+    let fields = metadata.matching_fields_for_path(&entry.path);
     if fields.is_empty() {
         entry.env = options.env_name(&entry.path);
         return;
@@ -399,23 +398,23 @@ fn apply_field_metadata(
             }
         }
         entry.has_default |= field.has_default;
-        if field.merge != MergeStrategy::Merge {
-            entry.merge = field.merge;
-        }
-        entry.allowed_sources = field.allowed_sources_vec();
-        entry.denied_sources = field.denied_sources_vec();
-        for rule in &field.validations {
-            if !entry.validations.contains(rule) {
-                entry.validations.push(rule.clone());
-            }
-        }
-        let validation_export = field.validation_export();
-        entry.validation_levels.extend(validation_export.levels);
-        entry.validation_messages.extend(validation_export.messages);
-        entry.validation_tags.extend(validation_export.tags);
         if field.has_default {
             entry.required = false;
         }
+    }
+
+    if let Some(effective) = metadata.effective_field_for(&entry.path) {
+        entry.merge = effective.merge;
+        entry.validations = effective.validations.clone();
+        let validation_export = effective.validation_export();
+        entry.validation_levels = validation_export.levels;
+        entry.validation_messages = validation_export.messages;
+        entry.validation_tags = validation_export.tags;
+    }
+
+    if let Some(policy) = metadata.effective_source_policy_for(&entry.path) {
+        entry.allowed_sources = policy.allowed_sources_vec();
+        entry.denied_sources = policy.denied_sources_vec();
     }
 
     if entry.secret && entry.example.is_some() {
@@ -508,32 +507,6 @@ fn merge_env_doc_types(existing: &str, incoming: &str) -> String {
     } else {
         merged.join(" | ")
     }
-}
-
-fn metadata_sort_key(path: &str) -> (usize, usize) {
-    let segments = path.split('.').filter(|segment| !segment.is_empty());
-    let total = segments.clone().count();
-    let specificity = segments.filter(|segment| *segment != "*").count();
-    (specificity, total)
-}
-
-fn matching_field_metadata_for_path<'a>(
-    metadata: &'a ConfigMetadata,
-    path: &str,
-) -> Vec<&'a FieldMetadata> {
-    let mut fields = metadata
-        .fields()
-        .iter()
-        .filter(|field| {
-            field.path == path || crate::report::path_matches_pattern(path, &field.path)
-        })
-        .collect::<Vec<_>>();
-    fields.sort_by(|left, right| {
-        metadata_sort_key(&left.path)
-            .cmp(&metadata_sort_key(&right.path))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    fields
 }
 
 fn apply_local_schema_entry_overrides(

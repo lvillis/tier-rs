@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::error::{ValidationError, ValidationErrors};
 use crate::metadata::{ConfigMetadata, ValidationCheck, ValidationRule};
-use crate::report::{ConfigReport, ConfigWarning, join_path, normalize_path};
+use crate::report::{ConfigReport, ConfigWarning, get_value_at_path, join_path, normalize_path};
 
 use super::{is_secret_path, is_valid_email, is_valid_hostname, is_valid_url};
 
@@ -18,26 +18,32 @@ pub(super) fn validate_declared_rules(
     report: &mut ConfigReport,
 ) -> ValidationErrors {
     let mut errors = ValidationErrors::new();
+    let mut matched_paths = BTreeSet::<String>::new();
 
     for field in metadata.fields() {
         if field.validations.is_empty() || field.path.is_empty() {
             continue;
         }
-        let matches = collect_matching_values(value, &field.path);
-        if matches.is_empty() {
+        matched_paths.extend(
+            collect_matching_values(value, &field.path)
+                .into_iter()
+                .map(|(matched_path, _)| matched_path),
+        );
+    }
+
+    for matched_path in matched_paths {
+        let Some(actual) = get_value_at_path(value, &matched_path) else {
             continue;
-        }
-        for rule in &field.validations {
-            for (matched_path, actual) in &matches {
-                if let Some(error) =
-                    validate_declared_rule(matched_path, actual, rule, secret_paths)
-                {
-                    let error = field.decorate_validation_error(rule, error);
-                    match field.validation_level_for(rule) {
-                        crate::ValidationLevel::Error => errors.push(error),
-                        crate::ValidationLevel::Warning => {
-                            report.record_warning(ConfigWarning::Validation(error))
-                        }
+        };
+        for effective in metadata.effective_validations_for(&matched_path) {
+            let rule = &effective.rule;
+            let field = effective.field;
+            if let Some(error) = validate_declared_rule(&matched_path, actual, rule, secret_paths) {
+                let error = field.decorate_validation_error(rule, error);
+                match field.validation_level_for(rule) {
+                    crate::ValidationLevel::Error => errors.push(error),
+                    crate::ValidationLevel::Warning => {
+                        report.record_warning(ConfigWarning::Validation(error))
                     }
                 }
             }

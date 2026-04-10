@@ -1,4 +1,5 @@
 use super::*;
+use crate::FieldMetadata;
 use crate::ValidationCheck;
 
 pub(super) fn canonicalize_layer_paths(
@@ -158,11 +159,17 @@ pub(super) fn canonicalize_metadata_against_layers(
     metadata: &ConfigMetadata,
     layers: &[Layer],
 ) -> Result<ConfigMetadata, ConfigError> {
-    let fields = metadata.fields().iter().cloned().map(|mut field| {
-        field.path = canonicalize_runtime_path_across_layers(&field.path, layers);
-        field.aliases = canonicalize_runtime_paths_across_layers(field.aliases, layers);
-        field
-    });
+    let fields = metadata
+        .fields()
+        .iter()
+        .cloned()
+        .map(|mut field| {
+            field.path = canonicalize_runtime_path_across_layers(&field.path, layers);
+            field.aliases = canonicalize_runtime_paths_across_layers(field.aliases, layers);
+            field
+        })
+        .collect::<Vec<_>>();
+    validate_canonical_explicit_env_targets(&fields)?;
 
     let mut resolved = ConfigMetadata::new();
     resolved.extend_fields(fields);
@@ -193,11 +200,17 @@ pub(super) fn canonicalize_metadata_against_value(
     metadata: &ConfigMetadata,
     value: &Value,
 ) -> Result<ConfigMetadata, ConfigError> {
-    let fields = metadata.fields().iter().cloned().map(|mut field| {
-        field.path = canonicalize_runtime_path(value, &field.path);
-        field.aliases = canonicalize_runtime_paths_against_value(field.aliases, value);
-        field
-    });
+    let fields = metadata
+        .fields()
+        .iter()
+        .cloned()
+        .map(|mut field| {
+            field.path = canonicalize_runtime_path(value, &field.path);
+            field.aliases = canonicalize_runtime_paths_against_value(field.aliases, value);
+            field
+        })
+        .collect::<Vec<_>>();
+    validate_canonical_explicit_env_targets(&fields)?;
 
     let mut resolved = ConfigMetadata::new();
     resolved.extend_fields(fields);
@@ -207,6 +220,26 @@ pub(super) fn canonicalize_metadata_against_value(
     });
     resolved.extend_checks(checks);
     Ok(resolved)
+}
+
+fn validate_canonical_explicit_env_targets(fields: &[FieldMetadata]) -> Result<(), ConfigError> {
+    let mut targets = BTreeMap::<String, String>::new();
+    for field in fields {
+        let Some(env) = &field.env else {
+            continue;
+        };
+        if let Some(first_env) = targets.insert(field.path.clone(), env.clone())
+            && first_env != *env
+        {
+            return Err(ConfigError::MetadataConflict {
+                kind: "environment override target",
+                name: field.path.clone(),
+                first_path: first_env,
+                second_path: env.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn canonicalize_secret_paths_against_value(

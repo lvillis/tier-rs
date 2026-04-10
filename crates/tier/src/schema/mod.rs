@@ -329,7 +329,10 @@ fn apply_metadata_annotations(schema: &mut Value, metadata: &ConfigMetadata) {
     }
 
     for field in metadata.fields() {
-        annotate_schema_path(schema, &snapshot, &field.path, field);
+        let effective = metadata
+            .effective_field_for(&field.path)
+            .unwrap_or_else(|| field.clone());
+        annotate_schema_path(schema, &snapshot, &field.path, &effective);
     }
 }
 

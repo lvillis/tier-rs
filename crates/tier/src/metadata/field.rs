@@ -25,6 +25,7 @@ impl FieldMetadata {
             deprecated: None,
             has_default: false,
             merge: MergeStrategy::Merge,
+            merge_explicit: false,
             allowed_sources: None,
             denied_sources: None,
             validations: Vec::new(),
@@ -95,6 +96,7 @@ impl FieldMetadata {
     #[must_use]
     pub fn merge_strategy(mut self, merge: MergeStrategy) -> Self {
         self.merge = merge;
+        self.merge_explicit = true;
         self
     }
 
@@ -125,7 +127,7 @@ impl FieldMetadata {
     /// Appends a declarative validation rule.
     #[must_use]
     pub fn validate(mut self, rule: ValidationRule) -> Self {
-        self.validations.push(rule);
+        self.upsert_validation(rule);
         self
     }
 
@@ -291,35 +293,12 @@ impl FieldMetadata {
         self.validate(ValidationRule::AbsolutePath)
     }
 
-    pub(crate) fn source_kind_allowed(&self, kind: SourceKind) -> bool {
-        self.allowed_sources
-            .as_ref()
-            .is_none_or(|allowed_sources| allowed_sources.contains(&kind))
-    }
-
-    pub(crate) fn source_kind_denied(&self, kind: SourceKind) -> bool {
-        self.denied_sources
-            .as_ref()
-            .is_some_and(|denied_sources| denied_sources.contains(&kind))
-    }
-
-    pub(crate) fn allowed_sources_vec(&self) -> Vec<SourceKind> {
-        self.allowed_sources
-            .as_ref()
-            .map(|allowed_sources| allowed_sources.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn denied_sources_vec(&self) -> Vec<SourceKind> {
-        self.denied_sources
-            .as_ref()
-            .map(|denied_sources| denied_sources.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
     #[cfg(feature = "schema")]
     pub(crate) fn allowed_source_names(&self) -> Vec<String> {
-        self.allowed_sources_vec()
+        self.allowed_sources
+            .as_ref()
+            .map(|allowed_sources| allowed_sources.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
             .into_iter()
             .map(|source| source.to_string())
             .collect()
@@ -327,7 +306,10 @@ impl FieldMetadata {
 
     #[cfg(feature = "schema")]
     pub(crate) fn denied_source_names(&self) -> Vec<String> {
-        self.denied_sources_vec()
+        self.denied_sources
+            .as_ref()
+            .map(|denied_sources| denied_sources.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
             .into_iter()
             .map(|source| source.to_string())
             .collect()
@@ -410,8 +392,9 @@ impl FieldMetadata {
             self.deprecated = Some(deprecated);
         }
         self.has_default |= other.has_default;
-        if other.merge != MergeStrategy::Merge || self.merge == MergeStrategy::Merge {
+        if other.merge_explicit {
             self.merge = other.merge;
+            self.merge_explicit = true;
         }
         if let Some(allowed_sources) = other.allowed_sources {
             self.allowed_sources = Some(allowed_sources);
@@ -420,12 +403,22 @@ impl FieldMetadata {
             self.denied_sources = Some(denied_sources);
         }
         for rule in other.validations {
-            if !self.validations.contains(&rule) {
-                self.validations.push(rule);
-            }
+            self.upsert_validation(rule);
         }
         for (rule_code, config) in other.validation_configs {
             self.validation_configs.insert(rule_code, config);
+        }
+    }
+
+    fn upsert_validation(&mut self, rule: ValidationRule) {
+        if let Some(existing) = self
+            .validations
+            .iter_mut()
+            .find(|existing| existing.code() == rule.code())
+        {
+            *existing = rule;
+        } else {
+            self.validations.push(rule);
         }
     }
 
@@ -438,10 +431,47 @@ impl FieldMetadata {
             && self.example.is_none()
             && self.deprecated.is_none()
             && !self.has_default
-            && self.merge == MergeStrategy::Merge
+            && !self.merge_explicit
             && self.allowed_sources.is_none()
             && self.denied_sources.is_none()
             && self.validations.is_empty()
             && self.validation_configs.is_empty()
+    }
+}
+
+impl EffectiveSourcePolicy {
+    pub(crate) fn apply_field(&mut self, field: &FieldMetadata) {
+        if let Some(allowed_sources) = &field.allowed_sources {
+            self.allowed_sources = Some(allowed_sources.clone());
+        }
+        if let Some(denied_sources) = &field.denied_sources {
+            self.denied_sources = Some(denied_sources.clone());
+        }
+    }
+
+    pub(crate) fn source_kind_allowed(&self, kind: SourceKind) -> bool {
+        self.allowed_sources
+            .as_ref()
+            .is_none_or(|allowed_sources| allowed_sources.contains(&kind))
+    }
+
+    pub(crate) fn source_kind_denied(&self, kind: SourceKind) -> bool {
+        self.denied_sources
+            .as_ref()
+            .is_some_and(|denied_sources| denied_sources.contains(&kind))
+    }
+
+    pub(crate) fn allowed_sources_vec(&self) -> Vec<SourceKind> {
+        self.allowed_sources
+            .as_ref()
+            .map(|allowed_sources| allowed_sources.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn denied_sources_vec(&self) -> Vec<SourceKind> {
+        self.denied_sources
+            .as_ref()
+            .map(|denied_sources| denied_sources.iter().copied().collect())
+            .unwrap_or_default()
     }
 }

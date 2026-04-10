@@ -743,6 +743,11 @@ fn derive_metadata_tracks_serde_defaults_and_merge_strategies() {
 
     let region = metadata.field("regionName").expect("regionName metadata");
     assert!(region.has_default);
+
+    let merges = metadata.merge_strategies();
+    assert_eq!(merges.get("peers"), Some(&MergeStrategy::Append));
+    assert_eq!(merges.get("tls"), Some(&MergeStrategy::Replace));
+    assert!(!merges.contains_key("regionName"));
 }
 
 #[test]

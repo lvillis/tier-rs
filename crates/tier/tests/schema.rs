@@ -2476,6 +2476,55 @@ fn annotated_schema_prefers_exact_metadata_over_later_wildcard_matches() {
 }
 
 #[test]
+fn exact_validation_rules_override_generic_rule_kinds_in_exports() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct ValidationOverrideTupleSchemaConfig {
+        pair: (u16, u16),
+    }
+
+    impl TierMetadata for ValidationOverrideTupleSchemaConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*")
+                    .min(10)
+                    .validation_message("min", "generic minimum rule"),
+                FieldMetadata::new("pair.1").min(1),
+            ])
+        }
+    }
+
+    let schema = annotated_json_schema_for::<ValidationOverrideTupleSchemaConfig>();
+    let item = &schema["properties"]["pair"]["prefixItems"][1];
+    let rendered = serde_json::to_string(item).expect("annotated tuple item schema");
+    let docs = env_docs_for::<ValidationOverrideTupleSchemaConfig>(&EnvDocOptions::prefixed("APP"));
+    let entry = docs
+        .iter()
+        .find(|entry| entry.path == "pair.1")
+        .expect("pair.1 env doc entry");
+
+    assert_eq!(item["x-tier-validate"].as_array().map(Vec::len), Some(1));
+    assert!(rendered.contains("\"Min\":1"));
+    assert!(!rendered.contains("\"Min\":10"));
+    assert_eq!(
+        item["x-tier-validation-config"]["min"]["message"].as_str(),
+        Some("generic minimum rule")
+    );
+
+    assert_eq!(
+        entry
+            .validations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["min=1".to_owned()]
+    );
+    assert_eq!(
+        entry.validation_messages.get("min").map(String::as_str),
+        Some("generic minimum rule")
+    );
+}
+
+#[test]
 fn annotated_schema_does_not_project_exact_indices_onto_homogeneous_array_items() {
     let schema = annotated_json_schema_for::<IndexedPrimitiveArraySchemaConfig>();
     let item_schema = &schema["properties"]["ports"]["items"];
@@ -3361,6 +3410,35 @@ fn env_docs_merge_generic_wildcard_metadata_for_template_paths() {
 }
 
 #[test]
+fn env_docs_preserve_generic_source_policies_when_exact_metadata_only_adds_docs() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct SourcePolicyDocsConfig {
+        pair: (String, String),
+    }
+
+    impl TierMetadata for SourcePolicyDocsConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*")
+                    .allow_sources([SourceKind::Environment])
+                    .deny_sources([SourceKind::File]),
+                FieldMetadata::new("pair.1").doc("Secondary value"),
+            ])
+        }
+    }
+
+    let docs = env_docs_for::<SourcePolicyDocsConfig>(&EnvDocOptions::prefixed("APP"));
+    let pair = docs
+        .iter()
+        .find(|entry| entry.path == "pair.1")
+        .expect("pair.1 env doc entry");
+
+    assert_eq!(pair.allowed_sources, vec![SourceKind::Environment]);
+    assert_eq!(pair.denied_sources, vec![SourceKind::File]);
+    assert_eq!(pair.description.as_deref(), Some("Secondary value"));
+}
+
+#[test]
 fn annotated_schema_merges_generic_wildcard_metadata_for_template_paths() {
     let schema = annotated_json_schema_for::<WildcardTemplateMetadataSchemaConfig>();
     let token = &schema["properties"]["services"]["additionalProperties"]["properties"]["token"];
@@ -3372,6 +3450,57 @@ fn annotated_schema_merges_generic_wildcard_metadata_for_template_paths() {
     );
     assert_eq!(token["x-tier-secret"].as_bool(), Some(true));
     assert_eq!(token["example"].as_str(), Some("<secret>"));
+}
+
+#[test]
+fn annotated_schema_preserves_generic_merge_strategies_when_exact_metadata_only_adds_docs() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct SchemaMergeConfig {
+        pair: (String, String),
+    }
+
+    impl TierMetadata for SchemaMergeConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*").merge_strategy(MergeStrategy::Replace),
+                FieldMetadata::new("pair.1").doc("Secondary value"),
+            ])
+        }
+    }
+
+    let schema = annotated_json_schema_for::<SchemaMergeConfig>();
+    let pair = &schema["properties"]["pair"]["prefixItems"][1];
+
+    assert_eq!(pair["description"].as_str(), Some("Secondary value"));
+    assert_eq!(pair["x-tier-merge"].as_str(), Some("replace"));
+}
+
+#[test]
+fn exact_explicit_default_merge_strategies_override_generic_merge_exports() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct SchemaMergeOverrideConfig {
+        pair: (String, String),
+    }
+
+    impl TierMetadata for SchemaMergeOverrideConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*").merge_strategy(MergeStrategy::Replace),
+                FieldMetadata::new("pair.1").merge_strategy(MergeStrategy::Merge),
+            ])
+        }
+    }
+
+    let schema = annotated_json_schema_for::<SchemaMergeOverrideConfig>();
+    let pair = &schema["properties"]["pair"]["prefixItems"][1];
+    let docs = env_docs_for::<SchemaMergeOverrideConfig>(&EnvDocOptions::prefixed("APP"));
+    let entry = docs
+        .iter()
+        .find(|entry| entry.path == "pair.1")
+        .expect("pair.1 env doc entry");
+
+    assert_eq!(pair["x-tier-merge"].as_str(), Some("merge"));
+    assert_eq!(entry.merge, MergeStrategy::Merge);
 }
 
 #[test]
@@ -3740,6 +3869,86 @@ fn commented_toml_examples_include_wildcard_and_exact_array_table_field_comments
     assert!(example.contains("[[users]]"));
     assert!(example.contains("# Any user name"));
     assert!(example.contains("# Primary user name"));
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn commented_toml_examples_use_effective_validation_rules_for_concrete_field_comments() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct ValidationCommentOverrideSchemaConfig {
+        users: Vec<SpecificArrayTableFieldCommentUser>,
+    }
+
+    impl TierMetadata for ValidationCommentOverrideSchemaConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("users.*.name")
+                    .doc("Any user name")
+                    .min_length(3),
+                FieldMetadata::new("users.0.name")
+                    .doc("Primary user name")
+                    .min_length(1),
+            ])
+        }
+    }
+
+    let example = config_example_toml::<ValidationCommentOverrideSchemaConfig>();
+
+    assert!(example.contains("[[users]]"));
+    assert!(example.contains("# Any user name"));
+    assert!(example.contains("# Primary user name"));
+    assert!(example.contains("# validate: min_length=1"));
+    assert!(!example.contains("# validate: min_length=3"));
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn commented_toml_examples_use_effective_validation_rules_for_inline_array_item_comments() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct InlineValidationCommentOverrideSchemaConfig {
+        pair: (String, String),
+    }
+
+    impl TierMetadata for InlineValidationCommentOverrideSchemaConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*")
+                    .doc("Any pair item")
+                    .min_length(3),
+                FieldMetadata::new("pair.1").doc("Secondary value"),
+            ])
+        }
+    }
+
+    let example = config_example_toml::<InlineValidationCommentOverrideSchemaConfig>();
+
+    assert!(example.contains("# [*] Any pair item"));
+    assert!(example.contains("# [*] validate: min_length=3"));
+    assert!(example.contains("# [1] Secondary value"));
+    assert!(example.contains("# [1] validate: min_length=3"));
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn commented_toml_examples_include_explicit_default_merge_overrides() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct InlineMergeCommentOverrideSchemaConfig {
+        pair: (String, String),
+    }
+
+    impl TierMetadata for InlineMergeCommentOverrideSchemaConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*").merge_strategy(MergeStrategy::Replace),
+                FieldMetadata::new("pair.1").merge_strategy(MergeStrategy::Merge),
+            ])
+        }
+    }
+
+    let example = config_example_toml::<InlineMergeCommentOverrideSchemaConfig>();
+
+    assert!(example.contains("# [*] merge: replace"));
+    assert!(example.contains("# [1] merge: merge"));
 }
 
 #[cfg(feature = "toml")]

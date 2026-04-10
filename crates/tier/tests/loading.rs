@@ -1347,6 +1347,23 @@ fn root_metadata_validation_rules_are_rejected() {
 }
 
 #[test]
+fn root_metadata_secret_paths_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([FieldMetadata::new(".").secret()]);
+
+    let error = ConfigLoader::new(AppConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err("root metadata secret paths should fail fast");
+
+    let ConfigError::MetadataInvalid { path, message } = error else {
+        panic!("expected metadata invalid error");
+    };
+
+    assert!(path.is_empty());
+    assert!(message.contains("secret metadata cannot target the root path"));
+}
+
+#[test]
 fn root_metadata_deprecations_are_rejected() {
     let metadata = ConfigMetadata::from_fields([FieldMetadata::new(".").deprecated("legacy root")]);
 
@@ -1397,6 +1414,27 @@ fn env_decoder_paths_are_canonicalized_through_alias_metadata() {
         loaded.proxy.no_proxy,
         vec!["localhost".to_owned(), ".internal".to_owned()]
     );
+}
+
+#[test]
+fn exact_metadata_without_env_decoder_does_not_clear_generic_wildcard_env_decoders() {
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    struct TupleDecoderConfig {
+        pair: (String, Vec<String>),
+    }
+
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("pair.*").env_decoder(EnvDecoder::Csv),
+        FieldMetadata::new("pair.1").doc("Secondary values"),
+    ]);
+
+    let loaded = ConfigLoader::new(TupleDecoderConfig::default())
+        .metadata(metadata)
+        .env(EnvSource::from_pairs([("APP__PAIR__1", "alpha,beta")]).prefix("APP"))
+        .load()
+        .expect("generic wildcard metadata env decoders should still apply");
+
+    assert_eq!(loaded.pair.1, vec!["alpha".to_owned(), "beta".to_owned()]);
 }
 
 #[test]
@@ -1979,6 +2017,78 @@ fn custom_env_decoders_support_wildcard_paths_for_dynamic_entries() {
         )
         .load()
         .expect("wildcard custom env decoders should apply to dynamic entries");
+
+    assert_eq!(
+        loaded.services["api"].no_proxy,
+        vec!["localhost".to_owned(), ".svc.internal".to_owned()]
+    );
+}
+
+#[test]
+fn exact_env_decoders_are_not_collapsed_to_wildcard_metadata_paths() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct DynamicProxyConfig {
+        services: BTreeMap<String, DynamicProxyEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct DynamicProxyEntry {
+        no_proxy: Vec<String>,
+    }
+
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("services.*.no_proxy").doc("Wildcard service no-proxy")
+    ]);
+
+    let loaded = ConfigLoader::new(DynamicProxyConfig::default())
+        .metadata(metadata)
+        .env_decoder("services.api.no_proxy", EnvDecoder::Csv)
+        .env(
+            EnvSource::from_pairs([("APP__SERVICES__api__NO_PROXY", "localhost,.svc.internal")])
+                .prefix("APP"),
+        )
+        .load()
+        .expect("exact env decoders should still match concrete dynamic paths");
+
+    assert_eq!(
+        loaded.services["api"].no_proxy,
+        vec!["localhost".to_owned(), ".svc.internal".to_owned()]
+    );
+}
+
+#[test]
+fn exact_custom_env_decoders_are_not_collapsed_to_wildcard_metadata_paths() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct DynamicProxyConfig {
+        services: BTreeMap<String, DynamicProxyEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct DynamicProxyEntry {
+        no_proxy: Vec<String>,
+    }
+
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("services.*.no_proxy").doc("Wildcard service no-proxy")
+    ]);
+
+    let loaded = ConfigLoader::new(DynamicProxyConfig::default())
+        .metadata(metadata)
+        .env_decoder_with("services.api.no_proxy", |raw| {
+            Ok(Value::Array(
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| Value::String(segment.to_owned()))
+                    .collect(),
+            ))
+        })
+        .env(
+            EnvSource::from_pairs([("APP__SERVICES__api__NO_PROXY", "localhost;.svc.internal")])
+                .prefix("APP"),
+        )
+        .load()
+        .expect("exact custom env decoders should still match concrete dynamic paths");
 
     assert_eq!(
         loaded.services["api"].no_proxy,
@@ -2576,6 +2686,40 @@ fn concrete_deprecated_metadata_paths_match_canonical_array_indices() {
 }
 
 #[test]
+fn exact_deprecations_override_generic_wildcard_deprecations_without_double_warnings() {
+    let loaded = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("users.*.password").deprecated("use users.*.credential instead"),
+            FieldMetadata::new("users.0.password").deprecated("use users.0.credential instead"),
+        ]))
+        .args(ArgsSource::from_args([
+            "tier",
+            "--set",
+            r#"users[0].password="rotated-secret""#,
+        ]))
+        .load()
+        .expect("config loads");
+
+    let deprecations = loaded
+        .report()
+        .warnings()
+        .iter()
+        .filter_map(|warning| match warning {
+            ConfigWarning::DeprecatedField(field) if field.path == "users.0.password" => {
+                Some(field)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(deprecations.len(), 1);
+    assert_eq!(
+        deprecations[0].note.as_deref(),
+        Some("use users.0.credential instead")
+    );
+}
+
+#[test]
 fn args_can_still_replace_whole_arrays() {
     let loaded = ConfigLoader::new(UserArrayConfig::default())
         .args(ArgsSource::from_args([
@@ -2746,6 +2890,57 @@ fn wildcard_declared_validation_runs_for_array_items() {
         error.path == "users.0.password"
             && error.actual.as_ref().and_then(|value| value.as_str()) == Some("***redacted***")
     }));
+}
+
+#[test]
+fn exact_declared_validations_override_duplicate_wildcard_rules_without_double_reporting() {
+    let error = ConfigLoader::new(UserArrayConfig {
+        users: vec![UserRecord {
+            name: String::new(),
+            password: "present".to_owned(),
+        }],
+    })
+    .metadata(ConfigMetadata::from_fields([
+        FieldMetadata::new("users.*.name")
+            .non_empty()
+            .validation_message("non_empty", "generic name rule"),
+        FieldMetadata::new("users.0.name")
+            .non_empty()
+            .validation_message("non_empty", "exact name rule"),
+    ]))
+    .load()
+    .expect_err("duplicate wildcard and exact validations should still report once");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    let name_errors = errors
+        .iter()
+        .filter(|error| error.path == "users.0.name")
+        .collect::<Vec<_>>();
+    assert_eq!(name_errors.len(), 1);
+    assert_eq!(name_errors[0].message, "exact name rule");
+}
+
+#[test]
+fn exact_declared_validations_override_generic_rule_kinds() {
+    let loaded = ConfigLoader::new(UserArrayConfig {
+        users: vec![UserRecord {
+            name: "ok".to_owned(),
+            password: "present".to_owned(),
+        }],
+    })
+    .metadata(ConfigMetadata::from_fields([
+        FieldMetadata::new("users.*.name")
+            .min_length(3)
+            .validation_message("min_length", "generic minimum length"),
+        FieldMetadata::new("users.0.name").min_length(1),
+    ]))
+    .load()
+    .expect("exact validation should override the generic rule of the same kind");
+
+    assert_eq!(loaded.users[0].name, "ok");
 }
 
 #[test]
@@ -3636,6 +3831,78 @@ fn duplicate_explicit_env_names_are_rejected_even_without_env_sources() {
 }
 
 #[test]
+fn explicit_env_names_that_runtime_canonicalize_to_the_same_array_path_are_rejected() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("users.0.password").env("APP_PASSWORD"),
+        FieldMetadata::new("users.00.password").env("APP_LEGACY_PASSWORD"),
+    ]);
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .env(EnvSource::from_pairs(std::iter::empty::<(&str, &str)>()))
+        .load()
+        .expect_err("canonical duplicate explicit env targets should fail fast");
+
+    let ConfigError::MetadataConflict {
+        kind,
+        name,
+        first_path,
+        second_path,
+    } = error
+    else {
+        panic!("expected metadata conflict error");
+    };
+
+    assert_eq!(kind, "environment override target");
+    assert_eq!(name, "users.0.password");
+    assert!(
+        [first_path.as_str(), second_path.as_str()].contains(&"APP_PASSWORD"),
+        "conflict should mention APP_PASSWORD"
+    );
+    assert!(
+        [first_path.as_str(), second_path.as_str()].contains(&"APP_LEGACY_PASSWORD"),
+        "conflict should mention APP_LEGACY_PASSWORD"
+    );
+}
+
+#[test]
+fn explicit_env_names_that_runtime_canonicalize_to_the_same_array_path_are_rejected_without_env_sources()
+ {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("users.0.password").env("APP_PASSWORD"),
+        FieldMetadata::new("users.00.password").env("APP_LEGACY_PASSWORD"),
+    ]);
+
+    let error = ConfigLoader::new(UserArrayConfig::default())
+        .metadata(metadata)
+        .load()
+        .expect_err(
+            "canonical duplicate explicit env targets should fail even without env sources",
+        );
+
+    let ConfigError::MetadataConflict {
+        kind,
+        name,
+        first_path,
+        second_path,
+    } = error
+    else {
+        panic!("expected metadata conflict error");
+    };
+
+    assert_eq!(kind, "environment override target");
+    assert_eq!(name, "users.0.password");
+    assert!(
+        [first_path.as_str(), second_path.as_str()].contains(&"APP_PASSWORD"),
+        "conflict should mention APP_PASSWORD"
+    );
+    assert!(
+        [first_path.as_str(), second_path.as_str()].contains(&"APP_LEGACY_PASSWORD"),
+        "conflict should mention APP_LEGACY_PASSWORD"
+    );
+}
+
+#[test]
 fn wildcard_explicit_env_names_are_rejected() {
     let env = EnvSource::from_pairs([("APP_USER_PASSWORD", "secret")]);
     let metadata = ConfigMetadata::from_fields([
@@ -3798,6 +4065,81 @@ fn wildcard_merge_strategies_apply_to_concrete_paths() {
         loaded.headers.get("svc"),
         Some(&BTreeMap::from([("b".to_owned(), "2".to_owned())]))
     );
+}
+
+#[test]
+fn exact_metadata_without_merge_does_not_clear_generic_wildcard_merge_strategy() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("headers.*").merge_strategy(MergeStrategy::Replace),
+        FieldMetadata::new("headers.svc").doc("service-specific docs"),
+    ]);
+
+    assert_eq!(
+        metadata.merge_strategy_for("headers.svc"),
+        Some(MergeStrategy::Replace)
+    );
+}
+
+#[test]
+fn exact_non_default_merge_strategies_override_generic_wildcard_merge_strategies() {
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("headers.*").merge_strategy(MergeStrategy::Replace),
+        FieldMetadata::new("headers.svc").merge_strategy(MergeStrategy::Append),
+    ]);
+
+    assert_eq!(
+        metadata.merge_strategy_for("headers.svc"),
+        Some(MergeStrategy::Append)
+    );
+}
+
+#[test]
+fn exact_explicit_default_merge_strategies_override_generic_wildcard_merge_strategies() {
+    let overlay = Layer::custom(
+        "overlay",
+        serde_json::json!({
+            "headers": {
+                "svc": { "b": "2" }
+            }
+        }),
+    )
+    .expect("custom layer");
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("headers.*").merge_strategy(MergeStrategy::Replace),
+        FieldMetadata::new("headers.svc").merge_strategy(MergeStrategy::Merge),
+    ]);
+
+    assert_eq!(
+        metadata.merge_strategy_for("headers.svc"),
+        Some(MergeStrategy::Merge)
+    );
+
+    let loaded = ConfigLoader::new(WildcardMergeConfig::default())
+        .layer(overlay)
+        .metadata(metadata)
+        .load()
+        .expect("config loads");
+
+    assert_eq!(
+        loaded.headers.get("svc"),
+        Some(&BTreeMap::from([
+            ("a".to_owned(), "1".to_owned()),
+            ("b".to_owned(), "2".to_owned()),
+        ]))
+    );
+
+    let merge_strategies = ConfigMetadata::from_fields([
+        FieldMetadata::new("headers.*").merge_strategy(MergeStrategy::Replace),
+        FieldMetadata::new("headers.svc").merge_strategy(MergeStrategy::Merge),
+        FieldMetadata::new("headers.api").doc("docs only"),
+    ])
+    .merge_strategies();
+
+    assert_eq!(
+        merge_strategies.get("headers.svc"),
+        Some(&MergeStrategy::Merge)
+    );
+    assert!(!merge_strategies.contains_key("headers.api"));
 }
 
 #[test]
@@ -4175,6 +4517,87 @@ fn field_source_policies_allow_configured_sources() {
         .expect("environment source should be allowed");
 
     assert_eq!(loaded.token.as_deref(), Some("env-secret"));
+}
+
+#[test]
+fn wildcard_source_policies_still_apply_when_exact_metadata_only_adds_docs() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct ServicePolicyConfig {
+        services: BTreeMap<String, ServicePolicyEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct ServicePolicyEntry {
+        token: Option<String>,
+    }
+
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("services.*.token").allow_sources([SourceKind::Environment]),
+        FieldMetadata::new("services.api.token").doc("API token"),
+    ]);
+
+    let error = ConfigLoader::new(ServicePolicyConfig::default())
+        .metadata(metadata)
+        .layer(
+            Layer::custom(
+                "manual",
+                serde_json::json!({ "services": { "api": { "token": "shadow" } } }),
+            )
+            .expect("layer"),
+        )
+        .load()
+        .expect_err("custom layer should still be rejected by wildcard source policy");
+
+    assert!(matches!(
+        error,
+        ConfigError::SourcePolicyViolation {
+            path,
+            trace,
+            allowed_sources,
+            ..
+        } if path == "services.api.token"
+            && trace.kind == SourceKind::Custom
+            && trace.name == "manual"
+            && allowed_sources.as_ref() == [SourceKind::Environment]
+    ));
+}
+
+#[test]
+fn exact_source_policies_override_generic_wildcard_policies_when_explicitly_set() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct ServicePolicyConfig {
+        services: BTreeMap<String, ServicePolicyEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct ServicePolicyEntry {
+        token: Option<String>,
+    }
+
+    let metadata = ConfigMetadata::from_fields([
+        FieldMetadata::new("services.*.token").allow_sources([SourceKind::Environment]),
+        FieldMetadata::new("services.api.token").allow_sources([SourceKind::Custom]),
+    ]);
+
+    let loaded = ConfigLoader::new(ServicePolicyConfig::default())
+        .metadata(metadata)
+        .layer(
+            Layer::custom(
+                "manual",
+                serde_json::json!({ "services": { "api": { "token": "shadow" } } }),
+            )
+            .expect("layer"),
+        )
+        .load()
+        .expect("exact source policy should override the generic wildcard policy");
+
+    assert_eq!(
+        loaded
+            .services
+            .get("api")
+            .and_then(|entry| entry.token.as_deref()),
+        Some("shadow")
+    );
 }
 
 #[test]

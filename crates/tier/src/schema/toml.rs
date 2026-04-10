@@ -144,11 +144,16 @@ pub(super) fn render_toml_table(
 #[cfg(feature = "toml")]
 pub(super) fn render_toml_comments(path: &str, metadata: &ConfigMetadata, output: &mut String) {
     for field in toml_comment_fields(path, metadata) {
-        for line in toml_comment_lines(field) {
+        for line in toml_comment_doc_lines(field) {
             output.push_str("# ");
             output.push_str(&line);
             output.push('\n');
         }
+    }
+    for line in toml_effective_comment_lines(path, metadata) {
+        output.push_str("# ");
+        output.push_str(&line);
+        output.push('\n');
     }
 }
 
@@ -159,11 +164,16 @@ pub(super) fn render_toml_array_table_item_comments(
     output: &mut String,
 ) {
     for field in toml_comment_fields(path, metadata) {
-        for line in toml_comment_lines(field) {
+        for line in toml_comment_doc_lines(field) {
             output.push_str("# ");
             output.push_str(&line);
             output.push('\n');
         }
+    }
+    for line in toml_effective_comment_lines(path, metadata) {
+        output.push_str("# ");
+        output.push_str(&line);
+        output.push('\n');
     }
 }
 
@@ -220,7 +230,12 @@ pub(super) fn render_toml_inline_array_item_comments(
                 TomlArrayCommentSegment::Index(index) => format!("[{index}]"),
             })
             .collect::<String>();
-        for line in toml_comment_lines(field) {
+        let mut lines = toml_comment_doc_lines(field);
+        let effective = metadata
+            .effective_field_for(&field.path)
+            .unwrap_or_else(|| field.clone());
+        lines.extend(toml_non_doc_comment_lines(&effective));
+        for line in lines {
             output.push_str("# ");
             output.push_str(&marker);
             output.push(' ');
@@ -284,14 +299,29 @@ pub(super) fn toml_comment_fields<'a>(
 #[cfg(feature = "toml")]
 pub(super) fn toml_comment_lines(field: &FieldMetadata) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(doc) = &field.doc {
-        lines.extend(
+    lines.extend(toml_comment_doc_lines(field));
+    lines.extend(toml_non_doc_comment_lines(field));
+    lines
+}
+
+#[cfg(feature = "toml")]
+fn toml_comment_doc_lines(field: &FieldMetadata) -> Vec<String> {
+    field
+        .doc
+        .as_ref()
+        .map(|doc| {
             doc.lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned),
-        );
-    }
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "toml")]
+fn toml_non_doc_comment_lines(field: &FieldMetadata) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(env) = &field.env {
         lines.push(format!("env: {env}"));
     }
@@ -301,7 +331,7 @@ pub(super) fn toml_comment_lines(field: &FieldMetadata) -> Vec<String> {
     if field.has_default {
         lines.push("default: provided by serde".to_owned());
     }
-    if field.merge != crate::MergeStrategy::Merge {
+    if field.merge_explicit || field.merge != crate::MergeStrategy::Merge {
         lines.push(format!("merge: {}", field.merge));
     }
     if !field.validations.is_empty() {
@@ -322,6 +352,14 @@ pub(super) fn toml_comment_lines(field: &FieldMetadata) -> Vec<String> {
         lines.push(format!("deprecated: {note}"));
     }
     lines
+}
+
+#[cfg(feature = "toml")]
+fn toml_effective_comment_lines(path: &str, metadata: &ConfigMetadata) -> Vec<String> {
+    metadata
+        .effective_field_for(path)
+        .map(|field| toml_non_doc_comment_lines(&field))
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "toml")]

@@ -87,6 +87,8 @@ pub struct FieldMetadata {
     pub has_default: bool,
     /// Strategy used when merging layered values into this field.
     pub merge: MergeStrategy,
+    /// Whether the merge strategy was explicitly declared for this field.
+    pub merge_explicit: bool,
     /// Source kinds allowed to override this field.
     ///
     /// When unset, the field accepts values from any source kind.
@@ -99,6 +101,17 @@ pub struct FieldMetadata {
     pub validations: Vec<ValidationRule>,
     /// Per-rule configuration such as custom messages, warning levels, and tags.
     pub validation_configs: BTreeMap<String, ValidationRuleConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EffectiveSourcePolicy {
+    pub(crate) allowed_sources: Option<BTreeSet<SourceKind>>,
+    pub(crate) denied_sources: Option<BTreeSet<SourceKind>>,
+}
+
+pub(crate) struct EffectiveValidation {
+    pub(crate) field: FieldMetadata,
+    pub(crate) rule: ValidationRule,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

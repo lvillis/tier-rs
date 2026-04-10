@@ -57,6 +57,70 @@ impl ConfigMetadata {
         best.map(|(_, field)| field)
     }
 
+    pub(crate) fn matching_fields_for_path(&self, path: &str) -> Vec<&FieldMetadata> {
+        let normalized = match try_normalize_metadata_path(path) {
+            Ok(normalized) => normalized,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut matches = self
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let best = std::iter::once(field.path.as_str())
+                    .chain(field.aliases.iter().map(String::as_str))
+                    .filter_map(|candidate| metadata_match_score(&normalized, candidate))
+                    .max();
+                best.map(|score| (score, field))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.path.cmp(&right.1.path))
+        });
+        matches.into_iter().map(|(_, field)| field).collect()
+    }
+
+    pub(crate) fn effective_source_policy_for(&self, path: &str) -> Option<EffectiveSourcePolicy> {
+        let mut policy = EffectiveSourcePolicy::default();
+        let mut has_policy = false;
+
+        for field in self.matching_fields_for_path(path) {
+            if field.allowed_sources.is_some() || field.denied_sources.is_some() {
+                has_policy = true;
+                policy.apply_field(field);
+            }
+        }
+
+        has_policy.then_some(policy)
+    }
+
+    pub(crate) fn effective_validations_for(&self, path: &str) -> Vec<EffectiveValidation> {
+        let Some(field) = self.effective_field_for(path) else {
+            return Vec::new();
+        };
+
+        field
+            .validations
+            .iter()
+            .cloned()
+            .map(|rule| EffectiveValidation {
+                field: field.clone(),
+                rule,
+            })
+            .collect()
+    }
+
+    pub(crate) fn effective_field_for(&self, path: &str) -> Option<FieldMetadata> {
+        let mut matches = self.matching_fields_for_path(path).into_iter();
+        let mut effective = matches.next()?.clone();
+        for field in matches {
+            effective.merge_from(field.clone());
+        }
+        Some(effective)
+    }
+
     /// Returns metadata entries keyed by normalized path.
     #[must_use]
     pub fn fields_by_path(&self) -> BTreeMap<String, FieldMetadata> {
@@ -230,7 +294,9 @@ impl ConfigMetadata {
 
     /// Returns explicit environment variable name overrides keyed by env name.
     pub fn env_overrides(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let aliases = self.alias_overrides()?;
         let mut envs = BTreeMap::new();
+        let mut canonical_targets = BTreeMap::<String, String>::new();
         for field in &self.fields {
             let Some(env) = &field.env else {
                 continue;
@@ -254,6 +320,17 @@ impl ConfigMetadata {
                     path: field.path.clone(),
                     message: "explicit environment variable names cannot target wildcard paths"
                         .to_owned(),
+                });
+            }
+            let canonical = canonicalize_path_with_aliases(&field.path, &aliases);
+            if let Some(first_env) = canonical_targets.insert(canonical.clone(), env.clone())
+                && first_env != *env
+            {
+                return Err(ConfigError::MetadataConflict {
+                    kind: "environment override target",
+                    name: canonical,
+                    first_path: first_env,
+                    second_path: env.clone(),
                 });
             }
             if let Some(first_path) = envs.insert(env.clone(), field.path.clone())
@@ -351,11 +428,12 @@ impl ConfigMetadata {
         Ok(aliases)
     }
 
-    /// Returns field merge strategies keyed by normalized path.
+    /// Returns explicitly declared field merge strategies keyed by normalized path.
     #[must_use]
     pub fn merge_strategies(&self) -> BTreeMap<String, MergeStrategy> {
         self.fields
             .iter()
+            .filter(|field| field.merge_explicit)
             .map(|field| (field.path.clone(), field.merge))
             .collect()
     }
@@ -363,32 +441,7 @@ impl ConfigMetadata {
     /// Resolves the effective merge strategy for a concrete configuration path.
     #[must_use]
     pub fn merge_strategy_for(&self, path: &str) -> Option<MergeStrategy> {
-        let normalized = try_normalize_metadata_path(path).ok()?;
-        if normalized.is_empty() {
-            return None;
-        }
-
-        let mut best = None::<(MetadataMatchScore, MergeStrategy)>;
-        for field in &self.fields {
-            for candidate in
-                std::iter::once(field.path.as_str()).chain(field.aliases.iter().map(String::as_str))
-            {
-                let Some(score) = metadata_match_score(&normalized, candidate) else {
-                    continue;
-                };
-
-                match &mut best {
-                    Some((best_score, best_merge)) if score > *best_score => {
-                        *best_score = score;
-                        *best_merge = field.merge;
-                    }
-                    None => best = Some((score, field.merge)),
-                    _ => {}
-                }
-            }
-        }
-
-        best.map(|(_, merge)| merge)
+        self.effective_field_for(path).map(|field| field.merge)
     }
 
     pub(crate) fn validate_paths(&self) -> Result<(), ConfigError> {
@@ -403,7 +456,7 @@ impl ConfigMetadata {
                     message: "aliases cannot rewrite the root path".to_owned(),
                 });
             }
-            if field.path.is_empty() && field.merge != MergeStrategy::Merge {
+            if field.path.is_empty() && field.merge_explicit {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
                     message: "merge strategies cannot target the root path".to_owned(),
@@ -460,6 +513,12 @@ impl ConfigMetadata {
                 return Err(ConfigError::MetadataInvalid {
                     path: field.path.clone(),
                     message: "validation rules cannot target the root path".to_owned(),
+                });
+            }
+            if field.path.is_empty() && field.secret {
+                return Err(ConfigError::MetadataInvalid {
+                    path: field.path.clone(),
+                    message: "secret metadata cannot target the root path".to_owned(),
                 });
             }
             let declared_rule_codes = field
