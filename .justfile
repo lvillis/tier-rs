@@ -1,5 +1,11 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+patch:
+  cargo release patch --no-publish --execute
+
+publish:
+  cargo publish --workspace
+
 ci:
   cargo fmt --all --check
   cargo check --workspace --all-features
@@ -25,9 +31,3 @@ ci:
 bench:
   cargo bench -p tier --bench core
   cargo bench -p tier --bench core --all-features
-
-patch:
-  cargo release patch --no-publish --execute
-
-publish:
-  cargo publish --workspace

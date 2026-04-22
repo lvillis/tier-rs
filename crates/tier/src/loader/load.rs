@@ -578,8 +578,8 @@ fn validate_indexed_array_paths(base: &Value, layer: &Layer) -> Result<(), Confi
 
         let mut explicit_indices = layer
             .entries
-            .iter()
-            .filter_map(|(entry_path, _)| direct_child_array_index(path, entry_path))
+            .keys()
+            .filter_map(|entry_path| direct_child_array_index(path, entry_path))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
