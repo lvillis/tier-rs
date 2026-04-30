@@ -2924,6 +2924,33 @@ fn exact_declared_validations_override_duplicate_wildcard_rules_without_double_r
 }
 
 #[test]
+fn exact_validation_configs_can_override_inherited_wildcard_rules() {
+    let error = ConfigLoader::new(UserArrayConfig {
+        users: vec![UserRecord {
+            name: String::new(),
+            password: "present".to_owned(),
+        }],
+    })
+    .metadata(ConfigMetadata::from_fields([
+        FieldMetadata::new("users.*.name").non_empty(),
+        FieldMetadata::new("users.0.name")
+            .validation_message("non_empty", "exact inherited name rule"),
+    ]))
+    .load()
+    .expect_err("exact validation config should apply to inherited wildcard rule");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    let name_error = errors
+        .iter()
+        .find(|error| error.path == "users.0.name")
+        .expect("users.0.name validation error");
+    assert_eq!(name_error.message, "exact inherited name rule");
+}
+
+#[test]
 fn exact_declared_validations_override_generic_rule_kinds() {
     let loaded = ConfigLoader::new(UserArrayConfig {
         users: vec![UserRecord {
@@ -3061,6 +3088,54 @@ fn invalid_declarative_numeric_bounds_return_structured_errors() {
     assert_eq!(
         error.expected.as_ref().and_then(|value| value.as_str()),
         Some("NaN")
+    );
+}
+
+#[test]
+fn declared_numeric_validation_preserves_large_integer_precision() {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct LargeIntegerValidationConfig {
+        odd_not_multiple: u64,
+        below_min: u64,
+        above_max: u64,
+    }
+
+    impl Default for LargeIntegerValidationConfig {
+        fn default() -> Self {
+            Self {
+                odd_not_multiple: 9_007_199_254_740_993,
+                below_min: 9_007_199_254_740_992,
+                above_max: 9_007_199_254_740_993,
+            }
+        }
+    }
+
+    let error = ConfigLoader::new(LargeIntegerValidationConfig::default())
+        .metadata(ConfigMetadata::from_fields([
+            FieldMetadata::new("odd_not_multiple").multiple_of(2u64),
+            FieldMetadata::new("below_min").min(9_007_199_254_740_993u64),
+            FieldMetadata::new("above_max").max(9_007_199_254_740_992u64),
+        ]))
+        .load()
+        .expect_err("large integer validation must not round through f64");
+
+    let ConfigError::DeclaredValidation { errors } = error else {
+        panic!("expected declared validation error");
+    };
+
+    assert_eq!(errors.len(), 3);
+    assert!(errors.iter().any(|error| {
+        error.path == "odd_not_multiple" && error.rule.as_deref() == Some("multiple_of")
+    }));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.path == "below_min" && error.rule.as_deref() == Some("min"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.path == "above_max" && error.rule.as_deref() == Some("max"))
     );
 }
 

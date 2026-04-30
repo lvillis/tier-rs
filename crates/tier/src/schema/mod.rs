@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use crate::{
@@ -5,7 +6,7 @@ use crate::{
     export::{json_pretty, json_value},
 };
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Number, Value};
 #[cfg(feature = "toml")]
 mod toml;
 
@@ -559,9 +560,11 @@ fn annotate_schema_segments(
         {
             matched |= annotate_schema_segments(additional, root, remaining, field);
         }
-        if let Some(additional) = object
-            .get_mut("additionalItems")
-            .filter(|value| value.is_object())
+        let has_legacy_tuple_items = object.get("items").is_some_and(Value::is_array);
+        if has_legacy_tuple_items
+            && let Some(additional) = object
+                .get_mut("additionalItems")
+                .filter(|value| value.is_object())
         {
             matched |= annotate_schema_segments(additional, root, remaining, field);
         }
@@ -825,9 +828,8 @@ fn build_example_value(
         }
     }
 
-    if let Some(additional) = object
-        .get("additionalItems")
-        .filter(|value| !value.is_array())
+    if let Some(additional) =
+        legacy_additional_items_for_schema(object).filter(|value| !value.is_array())
     {
         let existing_len = merged
             .as_ref()
@@ -855,6 +857,8 @@ fn build_example_value(
             }
         }
     }
+
+    uniquify_merged_array_example(&mut merged, object, root);
 
     if let Some(contains) = object.get("contains") {
         let required_matches = required_contains_item_count(object);
@@ -958,11 +962,7 @@ fn build_example_value(
     }
 
     if let Some(mut merged) = merged {
-        if let Value::Array(items) = &mut merged
-            && array_requires_unique_items(object)
-        {
-            uniquify_array_example_items(items, object, root);
-        }
+        uniquify_example_value_in_place(&mut merged, object, root);
         return Some(if is_secret {
             redact_example_value(&merged)
         } else {
@@ -972,7 +972,7 @@ fn build_example_value(
 
     let fallback = match schema_type(object).as_str() {
         "string" => Some(Value::String(fallback_string_example(object))),
-        "integer" => Some(Value::Number(fallback_integer_example(object).into())),
+        "integer" => fallback_integer_example(object).map(Value::Number),
         "number" => Some(
             serde_json::Number::from_f64(fallback_number_example(object))
                 .map_or(Value::Null, Value::Number),
@@ -1023,35 +1023,15 @@ fn fallback_string_example(object: &serde_json::Map<String, Value>) -> String {
     value
 }
 
-fn fallback_integer_example(object: &serde_json::Map<String, Value>) -> i64 {
-    let lower = object
-        .get("exclusiveMinimum")
-        .and_then(Value::as_f64)
-        .map_or_else(
-            || {
-                object
-                    .get("minimum")
-                    .and_then(Value::as_f64)
-                    .map(|minimum| minimum.ceil() as i64)
-            },
-            |minimum| Some(minimum.floor() as i64 + 1),
-        );
-    let upper = object
-        .get("exclusiveMaximum")
-        .and_then(Value::as_f64)
-        .map_or_else(
-            || {
-                object
-                    .get("maximum")
-                    .and_then(Value::as_f64)
-                    .map(|maximum| maximum.floor() as i64)
-            },
-            |maximum| Some(maximum.ceil() as i64 - 1),
-        );
+fn fallback_integer_example(object: &serde_json::Map<String, Value>) -> Option<Number> {
+    let lower = integer_lower_bound(object).unwrap_or(0);
+    let upper = integer_upper_bound(object);
+    let candidate = integer_candidate_in_range(lower, upper, object)
+        .or_else(|| upper.filter(|upper| integer_value_matches_constraints(*upper, object)))
+        .or_else(|| integer_value_matches_constraints(lower, object).then_some(lower))
+        .or_else(|| integer_value_matches_constraints(0, object).then_some(0))?;
 
-    integer_candidate_in_range(lower.unwrap_or(0), upper, object)
-        .or(upper)
-        .unwrap_or(lower.unwrap_or(0))
+    number_from_i128(candidate)
 }
 
 fn fallback_number_example(object: &serde_json::Map<String, Value>) -> f64 {
@@ -1101,13 +1081,23 @@ fn fallback_number_example(object: &serde_json::Map<String, Value>) -> f64 {
 }
 
 fn integer_candidate_in_range(
-    lower: i64,
-    upper: Option<i64>,
+    lower: i128,
+    upper: Option<i128>,
     object: &serde_json::Map<String, Value>,
-) -> Option<i64> {
+) -> Option<i128> {
+    if let Some(step) = integer_multiple_step_constraint(object)
+        && let Some(candidate) = first_integer_multiple_at_or_above(lower, step)
+        && upper.is_none_or(|upper| candidate <= upper)
+        && integer_value_matches_constraints(candidate, object)
+    {
+        return Some(candidate);
+    }
+
     let mut candidate = lower;
     let max_iterations = upper
-        .map(|upper| upper.saturating_sub(lower).saturating_add(1) as usize)
+        .and_then(|upper| upper.checked_sub(lower))
+        .and_then(|span| span.checked_add(1))
+        .and_then(|span| usize::try_from(span).ok())
         .unwrap_or(10_000);
 
     for _ in 0..max_iterations {
@@ -1123,49 +1113,204 @@ fn integer_candidate_in_range(
     None
 }
 
-fn integer_value_matches_constraints(value: i64, object: &serde_json::Map<String, Value>) -> bool {
-    let as_f64 = value as f64;
+fn integer_multiple_step_constraint(object: &serde_json::Map<String, Value>) -> Option<i128> {
+    object
+        .get("multipleOf")
+        .and_then(Value::as_number)
+        .and_then(integer_multiple_step_from_number)
+}
 
-    if object
-        .get("minimum")
-        .and_then(Value::as_f64)
-        .is_some_and(|minimum| as_f64 < minimum)
-    {
-        return false;
+fn integer_multiple_step_from_number(number: &Number) -> Option<i128> {
+    if let Some(integer) = number_as_integral_i128(number) {
+        return (integer > 0).then_some(integer);
     }
-    if object
-        .get("maximum")
-        .and_then(Value::as_f64)
-        .is_some_and(|maximum| as_f64 > maximum)
-    {
-        return false;
+
+    positive_decimal_rational_from_number(number).and_then(|(numerator, denominator)| {
+        let divisor = gcd_i128(numerator, denominator);
+        numerator.checked_div(divisor).filter(|step| *step > 0)
+    })
+}
+
+fn first_integer_multiple_at_or_above(lower: i128, factor: i128) -> Option<i128> {
+    if factor <= 0 {
+        return None;
     }
-    if object
+
+    let quotient = lower.div_euclid(factor);
+    let candidate = quotient.checked_mul(factor)?;
+    if candidate >= lower {
+        Some(candidate)
+    } else {
+        candidate.checked_add(factor)
+    }
+}
+
+fn last_integer_multiple_at_or_below(upper: i128, factor: i128) -> Option<i128> {
+    if factor <= 0 {
+        return None;
+    }
+
+    upper.div_euclid(factor).checked_mul(factor)
+}
+
+fn integer_lower_bound(object: &serde_json::Map<String, Value>) -> Option<i128> {
+    object
         .get("exclusiveMinimum")
-        .and_then(Value::as_f64)
-        .is_some_and(|minimum| as_f64 <= minimum)
-    {
-        return false;
-    }
-    if object
+        .and_then(schema_number_floor)
+        .and_then(|minimum| minimum.checked_add(1))
+        .or_else(|| object.get("minimum").and_then(schema_number_ceil))
+}
+
+fn integer_upper_bound(object: &serde_json::Map<String, Value>) -> Option<i128> {
+    object
         .get("exclusiveMaximum")
-        .and_then(Value::as_f64)
-        .is_some_and(|maximum| as_f64 >= maximum)
+        .and_then(schema_number_ceil)
+        .and_then(|maximum| maximum.checked_sub(1))
+        .or_else(|| object.get("maximum").and_then(schema_number_floor))
+}
+
+fn schema_number_floor(value: &Value) -> Option<i128> {
+    let number = value.as_number()?;
+    number_as_integral_i128(number).or_else(|| finite_f64_to_i128(number.as_f64()?.floor()))
+}
+
+fn schema_number_ceil(value: &Value) -> Option<i128> {
+    let number = value.as_number()?;
+    number_as_integral_i128(number).or_else(|| finite_f64_to_i128(number.as_f64()?.ceil()))
+}
+
+fn integer_value_matches_constraints(value: i128, object: &serde_json::Map<String, Value>) -> bool {
+    number_from_i128(value).is_some_and(|number| number_matches_numeric_schema(&number, object))
+}
+
+fn number_matches_numeric_schema(number: &Number, object: &serde_json::Map<String, Value>) -> bool {
+    if let Some(minimum) = object.get("minimum").and_then(Value::as_number)
+        && compare_numbers(number, minimum).is_some_and(|ordering| ordering == Ordering::Less)
+    {
+        return false;
+    }
+    if let Some(maximum) = object.get("maximum").and_then(Value::as_number)
+        && compare_numbers(number, maximum).is_some_and(|ordering| ordering == Ordering::Greater)
+    {
+        return false;
+    }
+    if let Some(minimum) = object.get("exclusiveMinimum").and_then(Value::as_number)
+        && compare_numbers(number, minimum).is_some_and(|ordering| ordering != Ordering::Greater)
+    {
+        return false;
+    }
+    if let Some(maximum) = object.get("exclusiveMaximum").and_then(Value::as_number)
+        && compare_numbers(number, maximum).is_some_and(|ordering| ordering != Ordering::Less)
     {
         return false;
     }
 
-    if let Some(multiple_of) = object.get("multipleOf").and_then(Value::as_f64)
-        && multiple_of.is_normal()
-        && multiple_of > 0.0
-    {
-        let quotient = as_f64 / multiple_of;
-        if (quotient - quotient.round()).abs() > f64::EPSILON * 8.0 {
-            return false;
-        }
+    number_matches_multiple_of(number, object)
+}
+
+fn number_matches_multiple_of(number: &Number, object: &serde_json::Map<String, Value>) -> bool {
+    let Some(multiple_of) = object.get("multipleOf").and_then(Value::as_number) else {
+        return true;
+    };
+
+    if let (Some(number), Some(multiple_of)) = (
+        number_as_integral_i128(number),
+        number_as_integral_i128(multiple_of),
+    ) {
+        return multiple_of <= 0 || number % multiple_of == 0;
     }
 
-    true
+    let Some(number) = number.as_f64() else {
+        return true;
+    };
+    let Some(multiple_of) = multiple_of.as_f64() else {
+        return true;
+    };
+    if !multiple_of.is_normal() || multiple_of <= 0.0 {
+        return true;
+    }
+
+    let quotient = number / multiple_of;
+    (quotient - quotient.round()).abs() <= f64::EPSILON * 8.0
+}
+
+fn compare_numbers(left: &Number, right: &Number) -> Option<Ordering> {
+    if let (Some(left), Some(right)) = (
+        number_as_integral_i128(left),
+        number_as_integral_i128(right),
+    ) {
+        return Some(left.cmp(&right));
+    }
+
+    let left = left.as_f64()?;
+    let right = right.as_f64()?;
+    if !left.is_finite() || !right.is_finite() {
+        return None;
+    }
+    left.partial_cmp(&right)
+}
+
+fn number_as_integral_i128(value: &Number) -> Option<i128> {
+    if let Some(value) = value.as_i64() {
+        Some(i128::from(value))
+    } else {
+        value.as_u64().map(i128::from)
+    }
+}
+
+fn number_from_i128(value: i128) -> Option<Number> {
+    i64::try_from(value)
+        .map(Number::from)
+        .or_else(|_| u64::try_from(value).map(Number::from))
+        .ok()
+}
+
+fn finite_f64_to_i128(value: f64) -> Option<i128> {
+    value.is_finite().then_some(value as i128)
+}
+
+fn positive_decimal_rational_from_number(number: &Number) -> Option<(i128, i128)> {
+    let text = number.to_string();
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (text.as_str(), 0),
+    };
+    if mantissa.starts_with('-') {
+        return None;
+    }
+
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let numerator = digits.parse::<i128>().ok()?;
+    if numerator <= 0 {
+        return None;
+    }
+
+    let fraction_digits = i32::try_from(fraction.len()).ok()?;
+    let scale = fraction_digits.checked_sub(exponent).unwrap_or(i32::MAX);
+    if scale <= 0 {
+        let multiplier = pow10_i128(scale.unsigned_abs())?;
+        numerator.checked_mul(multiplier).map(|value| (value, 1))
+    } else {
+        pow10_i128(scale as u32).map(|denominator| (numerator, denominator))
+    }
+}
+
+fn pow10_i128(exponent: u32) -> Option<i128> {
+    let mut value = 1i128;
+    for _ in 0..exponent {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
+fn gcd_i128(mut left: i128, mut right: i128) -> i128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.abs().max(1)
 }
 
 fn merge_example_value(target: &mut Option<Value>, overlay: Value) {
@@ -1478,16 +1623,46 @@ fn allows_additional_array_items(
     object: &serde_json::Map<String, Value>,
     fixed_item_count: usize,
 ) -> bool {
+    allows_additional_array_items_for_schema(object, fixed_item_count)
+}
+
+pub(crate) fn allows_additional_array_items_for_schema(
+    object: &serde_json::Map<String, Value>,
+    fixed_item_count: usize,
+) -> bool {
+    if additional_array_items_forbidden(object) {
+        return false;
+    }
+
     object
         .get("maxItems")
         .and_then(Value::as_u64)
         .is_none_or(|max_items| fixed_item_count < max_items as usize)
 }
 
+fn additional_array_items_forbidden(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("items")
+        .is_some_and(|value| matches!(value, Value::Bool(false)))
+        || legacy_additional_items_for_schema(object)
+            .is_some_and(|value| matches!(value, Value::Bool(false)))
+}
+
+pub(crate) fn legacy_additional_items_for_schema(
+    object: &serde_json::Map<String, Value>,
+) -> Option<&Value> {
+    object.get("items").filter(|value| value.is_array())?;
+    object.get("additionalItems")
+}
+
 fn available_additional_array_slots(
     object: &serde_json::Map<String, Value>,
     existing_len: usize,
 ) -> usize {
+    if !allows_additional_array_items(object, existing_len) {
+        return 0;
+    }
+
     object
         .get("maxItems")
         .and_then(Value::as_u64)
@@ -1500,6 +1675,28 @@ fn array_requires_unique_items(object: &serde_json::Map<String, Value>) -> bool 
         .get("uniqueItems")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn uniquify_merged_array_example(
+    merged: &mut Option<Value>,
+    object: &serde_json::Map<String, Value>,
+    root: &Value,
+) {
+    if let Some(value) = merged {
+        uniquify_example_value_in_place(value, object, root);
+    }
+}
+
+fn uniquify_example_value_in_place(
+    value: &mut Value,
+    object: &serde_json::Map<String, Value>,
+    root: &Value,
+) {
+    if let Value::Array(items) = value
+        && array_requires_unique_items(object)
+    {
+        uniquify_array_example_items(items, object, root);
+    }
 }
 
 fn array_item_schema(object: &serde_json::Map<String, Value>, index: usize) -> Option<&Value> {
@@ -1519,8 +1716,7 @@ fn array_item_schema(object: &serde_json::Map<String, Value>, index: usize) -> O
         .get("items")
         .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
         .or_else(|| {
-            object
-                .get("additionalItems")
+            legacy_additional_items_for_schema(object)
                 .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
         })
 }
@@ -1531,12 +1727,20 @@ fn uniquify_array_example_items(
     root: &Value,
 ) {
     let mut seen = Vec::<Value>::new();
-    for (index, item) in items.iter_mut().enumerate() {
+    for index in 0..items.len() {
+        let Some((item, future)) = items[index..].split_first_mut() else {
+            break;
+        };
         if seen.contains(item)
             && let Some(schema) = array_item_schema(object, index)
-            && let Some(unique) = uniquify_example_value(item.clone(), schema, root, &seen)
         {
-            *item = unique;
+            let mut reserved = seen.clone();
+            reserved.extend(future.iter().cloned());
+            let unique = uniquify_example_value(item.clone(), schema, root, &reserved)
+                .or_else(|| uniquify_example_value(item.clone(), schema, root, &seen));
+            if let Some(unique) = unique {
+                *item = unique;
+            }
         }
         seen.push(item.clone());
     }
@@ -1583,7 +1787,10 @@ pub(crate) fn required_contains_additional_items_for_docs(
         return 0;
     }
 
-    let fixed_examples = merged_fixed_example_items(object, root);
+    let mut fixed_examples = merged_fixed_example_items(object, root);
+    if array_requires_unique_items(object) {
+        uniquify_array_example_items(&mut fixed_examples, object, root);
+    }
     let existing_matches = count_matching_example_items(
         &fixed_examples,
         contains,
@@ -1679,7 +1886,7 @@ fn uniquify_example_value(
         return Some(value);
     }
 
-    match value {
+    let specialized = match value {
         Value::String(text) => uniquify_string_example(text, schema, root, existing),
         Value::Number(number) => uniquify_number_example(number, schema, root, existing),
         Value::Bool(flag) => {
@@ -1689,7 +1896,37 @@ fn uniquify_example_value(
             .then_some(candidate)
         }
         _ => None,
-    }
+    };
+
+    specialized.or_else(|| uniquify_generic_example_value(schema, root, existing))
+}
+
+fn uniquify_generic_example_value(
+    schema: &Value,
+    root: &Value,
+    existing: &[Value],
+) -> Option<Value> {
+    let mut object = serde_json::Map::new();
+    object.insert("example".to_owned(), Value::Bool(true));
+
+    let candidates = [
+        Value::Null,
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Number(0.into()),
+        Value::Number(1.into()),
+        Value::String("example".to_owned()),
+        Value::String("value".to_owned()),
+        Value::Array(Vec::new()),
+        Value::Array(vec![Value::Null]),
+        Value::Object(serde_json::Map::new()),
+        Value::Object(object),
+    ];
+
+    candidates.into_iter().find(|candidate| {
+        !existing.contains(candidate)
+            && example_matches_schema(candidate, schema, root, &mut BTreeSet::new())
+    })
 }
 
 fn uniquify_string_example(
@@ -1706,6 +1943,14 @@ fn uniquify_string_example(
             {
                 return Some(candidate);
             }
+        }
+    }
+
+    for candidate in constrained_string_unique_candidates(&text, schema) {
+        if !existing.contains(&candidate)
+            && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
+        {
+            return Some(candidate);
         }
     }
 
@@ -1727,6 +1972,47 @@ fn uniquify_string_example(
     None
 }
 
+fn constrained_string_unique_candidates(text: &str, schema: &Value) -> Vec<Value> {
+    let min_length = schema
+        .get("minLength")
+        .and_then(Value::as_u64)
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0);
+    let max_length = schema
+        .get("maxLength")
+        .and_then(Value::as_u64)
+        .and_then(|length| usize::try_from(length).ok());
+
+    let mut lengths = BTreeSet::new();
+    let text_length = text.chars().count();
+    if text_length > 0 {
+        lengths.insert(text_length);
+    }
+    if min_length > 0 {
+        lengths.insert(min_length);
+    }
+    if let Some(max_length) = max_length
+        && max_length > 0
+    {
+        lengths.insert(max_length);
+    }
+
+    let mut candidates = Vec::new();
+    for length in lengths.into_iter().take(8) {
+        if max_length.is_some_and(|max_length| length > max_length) || length < min_length {
+            continue;
+        }
+        for seed in ['a', 'b', 'c', 'x', 'y', 'z', '0', '1', '2', 'A', 'B', 'C'] {
+            let candidate = std::iter::repeat_n(seed, length).collect::<String>();
+            if candidate != text {
+                candidates.push(Value::String(candidate));
+            }
+        }
+    }
+
+    candidates
+}
+
 fn uniquify_number_example(
     number: serde_json::Number,
     schema: &Value,
@@ -1734,27 +2020,11 @@ fn uniquify_number_example(
     existing: &[Value],
 ) -> Option<Value> {
     if let Some(integer) = number.as_i64() {
-        for attempt in 1..=1024i64 {
-            let candidate = Value::Number((integer.saturating_add(attempt)).into());
-            if !existing.contains(&candidate)
-                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
-            {
-                return Some(candidate);
-            }
-        }
-        return None;
+        return uniquify_integer_number_example(i128::from(integer), schema, root, existing);
     }
 
     if let Some(integer) = number.as_u64() {
-        for attempt in 1..=1024u64 {
-            let candidate = Value::Number((integer.saturating_add(attempt)).into());
-            if !existing.contains(&candidate)
-                && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
-            {
-                return Some(candidate);
-            }
-        }
-        return None;
+        return uniquify_integer_number_example(i128::from(integer), schema, root, existing);
     }
 
     let base = number.as_f64()?;
@@ -1770,6 +2040,81 @@ fn uniquify_number_example(
             && example_matches_schema(&candidate, schema, root, &mut BTreeSet::new())
         {
             return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn uniquify_integer_number_example(
+    integer: i128,
+    schema: &Value,
+    root: &Value,
+    existing: &[Value],
+) -> Option<Value> {
+    if let Some(object) = schema.as_object()
+        && let Some(step) = integer_multiple_step_constraint(object)
+    {
+        let mut next = integer
+            .checked_add(1)
+            .and_then(|lower| first_integer_multiple_at_or_above(lower, step));
+        let mut previous = integer
+            .checked_sub(1)
+            .and_then(|upper| last_integer_multiple_at_or_below(upper, step));
+
+        for _ in 0..1024 {
+            if let Some(value) =
+                next.and_then(number_from_i128)
+                    .map(Value::Number)
+                    .filter(|value| {
+                        !existing.contains(value)
+                            && example_matches_schema(value, schema, root, &mut BTreeSet::new())
+                    })
+            {
+                return Some(value);
+            }
+            if let Some(value) = previous
+                .and_then(number_from_i128)
+                .map(Value::Number)
+                .filter(|value| {
+                    !existing.contains(value)
+                        && example_matches_schema(value, schema, root, &mut BTreeSet::new())
+                })
+            {
+                return Some(value);
+            }
+
+            next = next.and_then(|candidate| candidate.checked_add(step));
+            previous = previous.and_then(|candidate| candidate.checked_sub(step));
+        }
+        return None;
+    }
+
+    let mut candidate = integer;
+    for _ in 0..1024 {
+        let Some(next) = candidate.checked_add(1) else {
+            break;
+        };
+        candidate = next;
+        if let Some(value) = number_from_i128(candidate).map(Value::Number)
+            && !existing.contains(&value)
+            && example_matches_schema(&value, schema, root, &mut BTreeSet::new())
+        {
+            return Some(value);
+        }
+    }
+
+    let mut candidate = integer;
+    for _ in 0..1024 {
+        let Some(previous) = candidate.checked_sub(1) else {
+            break;
+        };
+        candidate = previous;
+        if let Some(value) = number_from_i128(candidate).map(Value::Number)
+            && !existing.contains(&value)
+            && example_matches_schema(&value, schema, root, &mut BTreeSet::new())
+        {
+            return Some(value);
         }
     }
 
@@ -1843,14 +2188,10 @@ fn example_matches_schema(
         return false;
     }
 
-    if let Some(multiple_of) = object.get("multipleOf").and_then(Value::as_f64)
-        && let Some(number) = value.as_f64()
-        && multiple_of.is_normal()
+    if let Value::Number(number) = value
+        && !number_matches_numeric_schema(number, object)
     {
-        let quotient = number / multiple_of;
-        if (quotient - quotient.round()).abs() > f64::EPSILON * 8.0 {
-            return false;
-        }
+        return false;
     }
 
     match value {
@@ -1875,38 +2216,7 @@ fn example_matches_schema(
                 return false;
             }
         }
-        Value::Number(number) => {
-            if let Some(number) = number.as_f64() {
-                if object
-                    .get("minimum")
-                    .and_then(Value::as_f64)
-                    .is_some_and(|minimum| number < minimum)
-                {
-                    return false;
-                }
-                if object
-                    .get("maximum")
-                    .and_then(Value::as_f64)
-                    .is_some_and(|maximum| number > maximum)
-                {
-                    return false;
-                }
-                if object
-                    .get("exclusiveMinimum")
-                    .and_then(Value::as_f64)
-                    .is_some_and(|minimum| number <= minimum)
-                {
-                    return false;
-                }
-                if object
-                    .get("exclusiveMaximum")
-                    .and_then(Value::as_f64)
-                    .is_some_and(|maximum| number >= maximum)
-                {
-                    return false;
-                }
-            }
-        }
+        Value::Number(_) => {}
         Value::Object(map) => {
             if object
                 .get("minProperties")
@@ -2057,9 +2367,8 @@ fn example_matches_schema(
                 }
             }
 
-            if let Some(additional_schema) = object
-                .get("additionalItems")
-                .filter(|value| !value.is_array())
+            if let Some(additional_schema) =
+                legacy_additional_items_for_schema(object).filter(|value| !value.is_array())
             {
                 for child_value in items.iter().skip(fixed_item_count) {
                     if !example_matches_schema(child_value, additional_schema, root, visited_refs) {

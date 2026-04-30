@@ -6,7 +6,11 @@ use crate::{
     ConfigMetadata, JsonSchema, MergeStrategy, SourceKind, TierMetadata, ValidationRule,
     export::{json_pretty, json_value},
     json_schema_for,
-    schema::{dynamic_object_placeholder_for_schema, required_contains_additional_items_for_docs},
+    schema::{
+        allows_additional_array_items_for_schema as allows_additional_array_items,
+        dynamic_object_placeholder_for_schema, legacy_additional_items_for_schema,
+        required_contains_additional_items_for_docs,
+    },
 };
 
 mod collect;

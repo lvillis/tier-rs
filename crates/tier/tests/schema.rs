@@ -145,6 +145,18 @@ struct ContainsArraySchemaConfig;
 struct BooleanContainsArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContainsWithItemsFalseSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContainsWithAdditionalItemsFalseSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HomogeneousItemsWithAdditionalItemsFalseSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PropertyNamesContainsArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +167,18 @@ struct PatternPropertiesContainsArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UniqueFixedArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UniqueShortStringArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UniqueFixedAndContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContainsSatisfiedAfterUniqueRepairSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CascadingUniqueArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PatternPropertiesDynamicMapSchemaConfig;
@@ -303,6 +327,12 @@ struct PatternContainsArraySchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultipleOfContainsArraySchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LargeIntegerExampleSchemaConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FractionalMultipleOfIntegerExampleSchemaConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdditionalPropertiesFalseContainsArraySchemaConfig;
@@ -534,7 +564,8 @@ impl JsonSchema for BooleanContainsArraySchemaConfig {
                 "ports": {
                     "type": "array",
                     "contains": true,
-                    "minContains": 1
+                    "minContains": 3,
+                    "uniqueItems": true
                 }
             },
             "required": ["ports"]
@@ -546,6 +577,175 @@ impl JsonSchema for BooleanContainsArraySchemaConfig {
 impl TierMetadata for BooleanContainsArraySchemaConfig {
     fn metadata() -> ConfigMetadata {
         ConfigMetadata::from_fields([FieldMetadata::new("ports.*").doc("Any matching value")])
+    }
+}
+
+impl JsonSchema for ContainsWithItemsFalseSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ContainsWithItemsFalseSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::ContainsWithItemsFalseSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "integer",
+                            "example": 0
+                        }
+                    ],
+                    "items": false,
+                    "contains": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "minContains": 1
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid items=false contains array schema")
+    }
+}
+
+impl TierMetadata for ContainsWithItemsFalseSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("ports.*").doc("Forbidden extra port")])
+    }
+}
+
+impl JsonSchema for ContainsWithAdditionalItemsFalseSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ContainsWithAdditionalItemsFalseSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::ContainsWithAdditionalItemsFalseSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pair": {
+                    "type": "array",
+                    "items": [
+                        {
+                            "type": "string",
+                            "example": "edge"
+                        }
+                    ],
+                    "additionalItems": false,
+                    "contains": {
+                        "type": "integer",
+                        "example": 8080
+                    },
+                    "minContains": 1
+                }
+            },
+            "required": ["pair"]
+        }))
+        .expect("valid additionalItems=false contains array schema")
+    }
+}
+
+impl TierMetadata for ContainsWithAdditionalItemsFalseSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("pair.*").doc("Forbidden trailing item")])
+    }
+}
+
+impl JsonSchema for HomogeneousItemsWithAdditionalItemsFalseSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("HomogeneousItemsWithAdditionalItemsFalseSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::HomogeneousItemsWithAdditionalItemsFalseSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer",
+                        "example": 8080
+                    },
+                    "additionalItems": false,
+                    "minItems": 2
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid homogeneous items schema with ignored additionalItems=false")
+    }
+}
+
+impl TierMetadata for HomogeneousItemsWithAdditionalItemsFalseSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("ports.*").doc("Allowed port")])
+    }
+}
+
+impl JsonSchema for ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed(
+            "tier::tests::ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig",
+        )
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "integer",
+                                "example": 8080
+                            },
+                            "additionalItems": false,
+                            "minItems": 1
+                        }
+                    ],
+                    "contains": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer",
+                            "example": 8080
+                        },
+                        "additionalItems": false,
+                        "minItems": 1
+                    },
+                    "minContains": 1
+                }
+            },
+            "required": ["groups"]
+        }))
+        .expect("valid nested homogeneous additionalItems=false contains schema")
+    }
+}
+
+impl TierMetadata for ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("groups.*").doc("Additional group")])
     }
 }
 
@@ -615,11 +815,16 @@ impl JsonSchema for UniqueContainsArraySchemaConfig {
                 "ports": {
                     "type": "array",
                     "prefixItems": [
-                        { "type": "integer", "example": 8080 }
+                        {
+                            "type": "integer",
+                            "example": 2_000,
+                            "multipleOf": 2_000
+                        }
                     ],
                     "contains": {
                         "type": "integer",
-                        "example": 8080
+                        "example": 2_000,
+                        "multipleOf": 2_000
                     },
                     "minContains": 2,
                     "uniqueItems": true
@@ -712,8 +917,20 @@ impl JsonSchema for UniqueFixedArraySchemaConfig {
                 "ports": {
                     "type": "array",
                     "prefixItems": [
-                        { "type": "integer", "example": 8080 },
-                        { "type": "integer", "example": 8080 }
+                        {
+                            "type": "integer",
+                            "example": 2_000,
+                            "minimum": 0,
+                            "maximum": 2_000,
+                            "multipleOf": 2_000
+                        },
+                        {
+                            "type": "integer",
+                            "example": 2_000,
+                            "minimum": 0,
+                            "maximum": 2_000,
+                            "multipleOf": 2_000
+                        }
                     ],
                     "minItems": 2,
                     "maxItems": 2,
@@ -732,6 +949,190 @@ impl TierMetadata for UniqueFixedArraySchemaConfig {
             .doc("Unique fixed port")
             .min(1)
             .max(65_535)])
+    }
+}
+
+impl JsonSchema for UniqueShortStringArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("UniqueShortStringArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::UniqueShortStringArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "codes": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "string",
+                            "example": "a",
+                            "minLength": 1,
+                            "maxLength": 1
+                        },
+                        {
+                            "type": "string",
+                            "example": "a",
+                            "minLength": 1,
+                            "maxLength": 1
+                        }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "uniqueItems": true
+                }
+            },
+            "required": ["codes"]
+        }))
+        .expect("valid unique short string array schema")
+    }
+}
+
+impl TierMetadata for UniqueShortStringArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::new()
+    }
+}
+
+impl JsonSchema for UniqueFixedAndContainsArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("UniqueFixedAndContainsArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::UniqueFixedAndContainsArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "integer",
+                            "example": 0,
+                            "maximum": 0
+                        },
+                        {
+                            "type": "integer",
+                            "example": 0,
+                            "maximum": 0
+                        }
+                    ],
+                    "contains": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "minContains": 1,
+                    "uniqueItems": true
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid unique fixed and contains array schema")
+    }
+}
+
+impl TierMetadata for UniqueFixedAndContainsArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::new()
+    }
+}
+
+impl JsonSchema for ContainsSatisfiedAfterUniqueRepairSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ContainsSatisfiedAfterUniqueRepairSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::ContainsSatisfiedAfterUniqueRepairSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "integer",
+                            "enum": [1]
+                        },
+                        {
+                            "type": "integer",
+                            "enum": [1, 2]
+                        }
+                    ],
+                    "contains": {
+                        "type": "integer",
+                        "enum": [1, 2]
+                    },
+                    "minContains": 2,
+                    "uniqueItems": true
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid contains satisfied after unique repair schema")
+    }
+}
+
+impl TierMetadata for ContainsSatisfiedAfterUniqueRepairSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::from_fields([FieldMetadata::new("ports.*").doc("Additional port")])
+    }
+}
+
+impl JsonSchema for CascadingUniqueArraySchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("CascadingUniqueArraySchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::CascadingUniqueArraySchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "integer",
+                            "enum": [1]
+                        },
+                        {
+                            "type": "integer",
+                            "enum": [1, 2]
+                        },
+                        {
+                            "type": "integer",
+                            "enum": [2, 3]
+                        }
+                    ],
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "uniqueItems": true
+                }
+            },
+            "required": ["ports"]
+        }))
+        .expect("valid cascading unique array schema")
+    }
+}
+
+impl TierMetadata for CascadingUniqueArraySchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::new()
     }
 }
 
@@ -1977,6 +2378,74 @@ impl TierMetadata for MultipleOfContainsArraySchemaConfig {
     }
 }
 
+impl JsonSchema for LargeIntegerExampleSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("LargeIntegerExampleSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::LargeIntegerExampleSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "minimum": 9_007_199_254_740_993u64,
+                    "multipleOf": 2
+                },
+                "sparse_multiple": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "multipleOf": 20_000
+                }
+            },
+            "required": ["id", "sparse_multiple"]
+        }))
+        .expect("valid large integer schema")
+    }
+}
+
+impl TierMetadata for LargeIntegerExampleSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::new()
+    }
+}
+
+impl JsonSchema for FractionalMultipleOfIntegerExampleSchemaConfig {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("FractionalMultipleOfIntegerExampleSchemaConfig")
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed("tier::tests::FractionalMultipleOfIntegerExampleSchemaConfig")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "batch_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50_000,
+                    "multipleOf": 20_000.5
+                }
+            },
+            "required": ["batch_size"]
+        }))
+        .expect("valid fractional multipleOf integer schema")
+    }
+}
+
+impl TierMetadata for FractionalMultipleOfIntegerExampleSchemaConfig {
+    fn metadata() -> ConfigMetadata {
+        ConfigMetadata::new()
+    }
+}
+
 impl JsonSchema for AdditionalPropertiesFalseContainsArraySchemaConfig {
     fn schema_name() -> Cow<'static, str> {
         Cow::Borrowed("AdditionalPropertiesFalseContainsArraySchemaConfig")
@@ -2525,6 +2994,42 @@ fn exact_validation_rules_override_generic_rule_kinds_in_exports() {
 }
 
 #[test]
+fn exact_validation_configs_override_inherited_wildcard_rules_in_exports() {
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    struct ValidationConfigOverrideTupleSchemaConfig {
+        pair: (u16, u16),
+    }
+
+    impl TierMetadata for ValidationConfigOverrideTupleSchemaConfig {
+        fn metadata() -> ConfigMetadata {
+            ConfigMetadata::from_fields([
+                FieldMetadata::new("pair.*").min(10),
+                FieldMetadata::new("pair.1")
+                    .validation_message("min", "exact inherited minimum rule"),
+            ])
+        }
+    }
+
+    let schema = annotated_json_schema_for::<ValidationConfigOverrideTupleSchemaConfig>();
+    let item = &schema["properties"]["pair"]["prefixItems"][1];
+    let docs =
+        env_docs_for::<ValidationConfigOverrideTupleSchemaConfig>(&EnvDocOptions::prefixed("APP"));
+    let entry = docs
+        .iter()
+        .find(|entry| entry.path == "pair.1")
+        .expect("pair.1 env doc entry");
+
+    assert_eq!(
+        item["x-tier-validation-config"]["min"]["message"].as_str(),
+        Some("exact inherited minimum rule")
+    );
+    assert_eq!(
+        entry.validation_messages.get("min").map(String::as_str),
+        Some("exact inherited minimum rule")
+    );
+}
+
+#[test]
 fn annotated_schema_does_not_project_exact_indices_onto_homogeneous_array_items() {
     let schema = annotated_json_schema_for::<IndexedPrimitiveArraySchemaConfig>();
     let item_schema = &schema["properties"]["ports"]["items"];
@@ -2920,6 +3425,55 @@ fn env_docs_include_boolean_contains_array_items() {
 }
 
 #[test]
+fn env_docs_omit_contains_wildcards_when_items_false_forbids_extra_items() {
+    let docs = env_docs_for::<ContainsWithItemsFalseSchemaConfig>(&EnvDocOptions::prefixed("APP"));
+
+    assert!(!docs.iter().any(|entry| entry.path == "ports.*"));
+}
+
+#[test]
+fn env_docs_omit_contains_wildcards_when_additional_items_false_forbids_extra_items() {
+    let docs = env_docs_for::<ContainsWithAdditionalItemsFalseSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    assert!(!docs.iter().any(|entry| entry.path == "pair.*"));
+}
+
+#[test]
+fn env_docs_keep_homogeneous_items_when_additional_items_false_is_irrelevant() {
+    let docs = env_docs_for::<HomogeneousItemsWithAdditionalItemsFalseSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "ports.*")
+        .expect("ports.* env doc entry");
+
+    assert_eq!(wildcard.env, "APP__PORTS__{item}");
+    assert_eq!(wildcard.ty, "integer");
+    assert!(wildcard.required);
+    assert_eq!(wildcard.description.as_deref(), Some("Allowed port"));
+}
+
+#[test]
+fn env_docs_do_not_require_contains_when_homogeneous_additional_items_false_already_matches() {
+    let docs = env_docs_for::<
+        ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig,
+    >(&EnvDocOptions::prefixed("APP"));
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "groups.*.*")
+        .expect("groups.*.* env doc entry");
+
+    assert_eq!(wildcard.env, "APP__GROUPS__{item}__{item}");
+    assert_eq!(wildcard.ty, "integer");
+    assert!(!wildcard.required);
+}
+
+#[test]
 fn env_docs_mark_property_names_contains_wildcards_required_when_fixed_items_use_invalid_keys() {
     let docs =
         env_docs_for::<PropertyNamesContainsArraySchemaConfig>(&EnvDocOptions::prefixed("APP"));
@@ -2958,6 +3512,23 @@ fn env_docs_do_not_mark_contains_wildcards_required_when_fixed_items_already_sat
         .expect("pair.* env doc entry");
 
     assert_eq!(wildcard.env, "APP__PAIR__{item}");
+    assert_eq!(wildcard.ty, "integer");
+    assert!(!wildcard.required);
+    assert_eq!(wildcard.description.as_deref(), Some("Additional port"));
+}
+
+#[test]
+fn env_docs_do_not_require_contains_wildcards_after_unique_fixed_item_repair() {
+    let docs = env_docs_for::<ContainsSatisfiedAfterUniqueRepairSchemaConfig>(
+        &EnvDocOptions::prefixed("APP"),
+    );
+
+    let wildcard = docs
+        .iter()
+        .find(|entry| entry.path == "ports.*")
+        .expect("ports.* env doc entry");
+
+    assert_eq!(wildcard.env, "APP__PORTS__{item}");
     assert_eq!(wildcard.ty, "integer");
     assert!(!wildcard.required);
     assert_eq!(wildcard.description.as_deref(), Some("Additional port"));
@@ -3647,8 +4218,8 @@ fn example_generation_respects_unique_items_for_contains_arrays() {
     let ports = example["ports"].as_array().expect("ports array");
 
     assert_eq!(ports.len(), 2);
-    assert_eq!(ports[0].as_i64(), Some(8080));
-    assert_eq!(ports[1].as_i64(), Some(8081));
+    assert_eq!(ports[0].as_i64(), Some(2_000));
+    assert_eq!(ports[1].as_i64(), Some(4_000));
 }
 
 #[test]
@@ -3657,16 +4228,99 @@ fn example_generation_respects_unique_items_for_fixed_arrays() {
     let ports = example["ports"].as_array().expect("ports array");
 
     assert_eq!(ports.len(), 2);
-    assert_eq!(ports[0].as_i64(), Some(8080));
-    assert_eq!(ports[1].as_i64(), Some(8081));
+    assert_eq!(ports[0].as_i64(), Some(2_000));
+    assert_eq!(ports[1].as_i64(), Some(0));
+}
+
+#[test]
+fn example_generation_respects_unique_items_for_length_limited_strings() {
+    let example = config_example_for::<UniqueShortStringArraySchemaConfig>();
+    let codes = example["codes"].as_array().expect("codes array");
+
+    assert_eq!(codes.len(), 2);
+    assert_eq!(codes[0].as_str(), Some("a"));
+    assert_eq!(codes[1].as_str(), Some("b"));
+}
+
+#[test]
+fn example_generation_preserves_unique_items_after_contains_additions() {
+    let example = config_example_for::<UniqueFixedAndContainsArraySchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 3);
+    assert_eq!(ports[0].as_i64(), Some(0));
+    assert_eq!(ports[1].as_i64(), Some(-1));
+    assert_eq!(ports[2].as_i64(), Some(1));
+}
+
+#[test]
+fn example_generation_counts_unique_repaired_fixed_items_before_contains_additions() {
+    let example = config_example_for::<ContainsSatisfiedAfterUniqueRepairSchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 2);
+    assert_eq!(ports[0].as_i64(), Some(1));
+    assert_eq!(ports[1].as_i64(), Some(2));
+}
+
+#[test]
+fn example_generation_repairs_cascading_unique_array_duplicates() {
+    let example = config_example_for::<CascadingUniqueArraySchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 3);
+    assert_eq!(ports[0].as_i64(), Some(1));
+    assert_eq!(ports[1].as_i64(), Some(2));
+    assert_eq!(ports[2].as_i64(), Some(3));
 }
 
 #[test]
 fn example_generation_satisfies_boolean_contains_constraints() {
     let example = config_example_for::<BooleanContainsArraySchemaConfig>();
 
-    assert_eq!(example["ports"].as_array().map(Vec::len), Some(1));
+    assert_eq!(example["ports"].as_array().map(Vec::len), Some(3));
     assert!(example["ports"][0].is_null());
+    assert_eq!(example["ports"][1].as_bool(), Some(false));
+    assert_eq!(example["ports"][2].as_bool(), Some(true));
+}
+
+#[test]
+fn example_generation_does_not_add_contains_items_when_items_false_forbids_them() {
+    let example = config_example_for::<ContainsWithItemsFalseSchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 1);
+    assert_eq!(ports[0].as_i64(), Some(0));
+}
+
+#[test]
+fn example_generation_does_not_add_contains_items_when_additional_items_false_forbids_them() {
+    let example = config_example_for::<ContainsWithAdditionalItemsFalseSchemaConfig>();
+    let pair = example["pair"].as_array().expect("pair array");
+
+    assert_eq!(pair.len(), 1);
+    assert_eq!(pair[0].as_str(), Some("edge"));
+}
+
+#[test]
+fn example_generation_keeps_homogeneous_items_when_additional_items_false_is_irrelevant() {
+    let example = config_example_for::<HomogeneousItemsWithAdditionalItemsFalseSchemaConfig>();
+    let ports = example["ports"].as_array().expect("ports array");
+
+    assert_eq!(ports.len(), 2);
+    assert_eq!(ports[0].as_i64(), Some(8080));
+    assert_eq!(ports[1].as_i64(), Some(8080));
+}
+
+#[test]
+fn example_generation_counts_homogeneous_additional_items_false_contains_matches() {
+    let example = config_example_for::<
+        ContainsSatisfiedByHomogeneousArrayWithAdditionalItemsFalseSchemaConfig,
+    >();
+    let groups = example["groups"].as_array().expect("groups array");
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0][0].as_i64(), Some(8080));
 }
 
 #[test]
@@ -3694,6 +4348,21 @@ fn example_generation_respects_contains_multiple_of_constraints() {
     assert_eq!(example["ports"][0].as_i64(), Some(1));
     assert_eq!(example["ports"][1].as_i64(), Some(2));
     assert!(example["ports"].get(2).is_none());
+}
+
+#[test]
+fn example_generation_preserves_large_integer_numeric_precision() {
+    let example = config_example_for::<LargeIntegerExampleSchemaConfig>();
+
+    assert_eq!(example["id"].as_u64(), Some(9_007_199_254_740_994));
+    assert_eq!(example["sparse_multiple"].as_u64(), Some(20_000));
+}
+
+#[test]
+fn example_generation_respects_fractional_multiple_of_for_integer_values() {
+    let example = config_example_for::<FractionalMultipleOfIntegerExampleSchemaConfig>();
+
+    assert_eq!(example["batch_size"].as_u64(), Some(40_001));
 }
 
 #[test]

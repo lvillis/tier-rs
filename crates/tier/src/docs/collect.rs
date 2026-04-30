@@ -315,8 +315,7 @@ pub(super) fn collect_env_docs(
         }
     }
 
-    if let Some(additional) = object
-        .get("additionalItems")
+    if let Some(additional) = legacy_additional_items_for_schema(object)
         .filter(|value| !value.is_array() && !matches!(value, Value::Bool(false)))
     {
         let fixed_item_count = object
@@ -362,7 +361,7 @@ pub(super) fn collect_env_docs(
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len),
             );
-        if fixed_item_count == 0 || allows_additional_array_items(object, fixed_item_count) {
+        if allows_additional_array_items(object, fixed_item_count) {
             traversed_children = true;
             let next = if path.is_empty() {
                 "*".to_owned()
@@ -446,16 +445,6 @@ pub(super) fn array_item_is_required(
         .get("minItems")
         .and_then(Value::as_u64)
         .is_some_and(|min_items| index < min_items as usize)
-}
-
-pub(super) fn allows_additional_array_items(
-    object: &serde_json::Map<String, Value>,
-    fixed_item_count: usize,
-) -> bool {
-    object
-        .get("maxItems")
-        .and_then(Value::as_u64)
-        .is_none_or(|max_items| fixed_item_count < max_items as usize)
 }
 
 pub(super) fn required_additional_array_items(

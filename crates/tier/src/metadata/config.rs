@@ -521,13 +521,18 @@ impl ConfigMetadata {
                     message: "secret metadata cannot target the root path".to_owned(),
                 });
             }
-            let declared_rule_codes = field
-                .validations
-                .iter()
-                .map(ValidationRule::code)
-                .collect::<BTreeSet<_>>();
+            let effective_rule_codes = self
+                .effective_field_for(&field.path)
+                .map(|field| {
+                    field
+                        .validations
+                        .iter()
+                        .map(ValidationRule::code)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
             for rule_code in field.validation_configs.keys() {
-                if !declared_rule_codes.contains(rule_code.as_str()) {
+                if !effective_rule_codes.contains(rule_code.as_str()) {
                     return Err(ConfigError::MetadataInvalid {
                         path: field.path.clone(),
                         message: format!(

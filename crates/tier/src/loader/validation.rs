@@ -1,12 +1,13 @@
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Number, Value};
 
 use crate::error::{ValidationError, ValidationErrors};
-use crate::metadata::{ConfigMetadata, ValidationCheck, ValidationRule};
+use crate::metadata::{ConfigMetadata, ValidationCheck, ValidationNumber, ValidationRule};
 use crate::report::{ConfigReport, ConfigWarning, get_value_at_path, join_path, normalize_path};
 
 use super::{is_secret_path, is_valid_email, is_valid_hostname, is_valid_url};
@@ -188,9 +189,9 @@ fn validate_declared_rule(
             &format!("declared minimum must be finite, got {min}"),
             Some(min.as_json_value()),
         )),
-        ValidationRule::Min(min) => match actual.as_f64() {
-            Some(value) if value >= min.as_f64().unwrap_or(f64::INFINITY) => None,
-            Some(_) => Some(validation_error(
+        ValidationRule::Min(min) => match compare_value_to_bound(actual, min) {
+            Some(Ordering::Greater | Ordering::Equal) => None,
+            Some(Ordering::Less) => Some(validation_error(
                 path,
                 actual,
                 rule,
@@ -215,9 +216,9 @@ fn validate_declared_rule(
             &format!("declared maximum must be finite, got {max}"),
             Some(max.as_json_value()),
         )),
-        ValidationRule::Max(max) => match actual.as_f64() {
-            Some(value) if value <= max.as_f64().unwrap_or(f64::NEG_INFINITY) => None,
-            Some(_) => Some(validation_error(
+        ValidationRule::Max(max) => match compare_value_to_bound(actual, max) {
+            Some(Ordering::Less | Ordering::Equal) => None,
+            Some(Ordering::Greater) => Some(validation_error(
                 path,
                 actual,
                 rule,
@@ -384,8 +385,8 @@ fn validate_declared_rule(
                 ));
             }
 
-            match actual.as_f64() {
-                Some(value) if is_multiple_of(value, divisor) => None,
+            match actual.as_number() {
+                Some(value) if number_is_multiple_of(value, factor) => None,
                 Some(_) => Some(validation_error(
                     path,
                     actual,
@@ -649,6 +650,62 @@ fn is_multiple_of(value: f64, factor: f64) -> bool {
     let nearest = quotient.round();
     let tolerance = f64::EPSILON * 16.0 * quotient.abs().max(1.0);
     (quotient - nearest).abs() <= tolerance
+}
+
+fn compare_value_to_bound(value: &Value, bound: &ValidationNumber) -> Option<Ordering> {
+    compare_numbers(value.as_number()?, validation_number(bound)?)
+}
+
+fn compare_numbers(left: &Number, right: &Number) -> Option<Ordering> {
+    if let (Some(left), Some(right)) = (
+        number_as_integral_i128(left),
+        number_as_integral_i128(right),
+    ) {
+        return Some(left.cmp(&right));
+    }
+
+    let left = left.as_f64()?;
+    let right = right.as_f64()?;
+    if !left.is_finite() || !right.is_finite() {
+        return None;
+    }
+    left.partial_cmp(&right)
+}
+
+fn number_is_multiple_of(value: &Number, factor: &ValidationNumber) -> bool {
+    let Some(factor_number) = validation_number(factor) else {
+        return false;
+    };
+
+    if let (Some(value), Some(factor)) = (
+        number_as_integral_i128(value),
+        number_as_integral_i128(factor_number),
+    ) {
+        return factor > 0 && value % factor == 0;
+    }
+
+    let Some(value) = value.as_f64() else {
+        return false;
+    };
+    let Some(factor) = factor_number.as_f64() else {
+        return false;
+    };
+    is_multiple_of(value, factor)
+}
+
+fn validation_number(value: &ValidationNumber) -> Option<&Number> {
+    match value {
+        ValidationNumber::Finite(value) => Some(value),
+        ValidationNumber::Invalid(_) => None,
+    }
+}
+
+fn number_as_integral_i128(value: &Number) -> Option<i128> {
+    if let Some(value) = value.as_i64() {
+        Some(i128::from(value))
+    } else {
+        value.as_u64().map(i128::from)
+    }
 }
 
 fn validation_error(
